@@ -1,11 +1,10 @@
 """
-Silero TTS Studio - Профессиональная среда для генерации аудиокни, которая использует API от Silero.
+Silero TTS Studio - Профессиональная среда для для генерации аудиокниг, подкастов и озвучки текста, которая использует API от Silero.
 Поддерживает кэширование, постобработку (FFmpeg), работу с глоссариями,
 импорт электронных книг (EPUB, FB2, DOCX) и пакетную сборку аудиофайлов.
 """
 
 import os
-import sys
 import re
 import io
 import json
@@ -21,11 +20,7 @@ import atexit
 import tempfile
 import platform
 import subprocess
-
-if getattr(sys, 'frozen', False):
-    # Если приложение запущено из собранного пакета (.app)
-    # Переключаем рабочую директорию на папку, где лежит сам исполняемый файл
-    os.chdir(os.path.dirname(sys.executable))
+import sys
 
 # Попытка импорта библиотек для работы с электронными книгами
 try:
@@ -51,8 +46,28 @@ if platform.system() == "Windows":
     import winsound
 
 # ================= ИНИЦИАЛИЗАЦИЯ ПАПКИ ДАННЫХ =================
-APP_DATA_DIR = Path("SileroTTS_Studio_data")
-APP_DATA_DIR.mkdir(exist_ok=True)
+if sys.platform == "darwin":
+    # macOS: Корневая папка в Документах
+    BASE_DIR = Path.home() / "Documents" / "SileroTTS_Studio"
+    APP_DATA_DIR = BASE_DIR / "SileroTTS_Studio_data" # Служебные файлы внутри подпапки
+    DEFAULT_INPUT_DIR = str(BASE_DIR / "input_texts")
+    DEFAULT_OUTPUT_DIR = str(BASE_DIR / "output_audio")
+    DEFAULT_CACHE_DIR = str(BASE_DIR / "cache_audio")
+else:
+    # Windows/Linux: Всё лежит рядом с программой
+    if getattr(sys, 'frozen', False):
+        base_path = Path(sys.executable).parent
+    else:
+        base_path = Path(__file__).parent
+    BASE_DIR = base_path
+    APP_DATA_DIR = BASE_DIR / "SileroTTS_Studio_data"
+    DEFAULT_INPUT_DIR = "input_texts"
+    DEFAULT_OUTPUT_DIR = "output_audio"
+    DEFAULT_CACHE_DIR = "cache_audio"
+
+# Создаем системную папку для настроек и логов
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+os.chdir(APP_DATA_DIR)
 
 SETTINGS_FILE = APP_DATA_DIR / "settings.json"
 LOG_FILE = APP_DATA_DIR / "tts_processor.log"
@@ -85,9 +100,9 @@ DEFAULT_CONFIG = {
     "api_token": "",
     "api_url": "http://iq3g.silero.ai/enhanced_voice",
     "speaker": "arthas",
-    "input_dir": "input_texts",
-    "output_dir": "output_audio",
-    "cache_dir": "cache_audio",
+    "input_dir": DEFAULT_INPUT_DIR,  
+    "output_dir": DEFAULT_OUTPUT_DIR,
+    "cache_dir": DEFAULT_CACHE_DIR,
     
     "output_format": "mp3",
     "output_bitrate": "128k",
