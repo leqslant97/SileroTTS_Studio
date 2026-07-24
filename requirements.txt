@@ -1,0 +1,8 @@
+requests
+pydub
+razdel
+ru-normalizr
+EbookLib
+beautifulsoup4
+python-docx
+lxml
