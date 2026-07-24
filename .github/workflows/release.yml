@@ -1,0 +1,72 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' # Используем стабильную версию для PyInstaller
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install -r requirements.txt
+
+      - name: Build Windows (.exe)
+        if: runner.os == 'Windows'
+        run: pyinstaller --noconsole --onefile --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
+
+      - name: Build Linux (Binary)
+        if: runner.os == 'Linux'
+        run: pyinstaller --noconsole --onefile --name "SileroTTS_Studio_Linux" SileroTTS_Studio.py
+
+      - name: Build macOS (.app)
+        if: runner.os == 'macOS'
+        run: pyinstaller --windowed --onefile --name "SileroTTS_Studio" SileroTTS_Studio.py
+
+      - name: Package macOS App into ZIP
+        # macOS .app - это папка. Чтобы она не сломалась при загрузке, её нужно заархивировать
+        if: runner.os == 'macOS'
+        run: |
+          cd dist
+          zip -r SileroTTS_Studio_macOS.zip SileroTTS_Studio.app
+
+      - name: Upload Windows Asset
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SileroTTS_Studio_Windows.exe
+
+      - name: Upload Linux Asset
+        if: runner.os == 'Linux'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SileroTTS_Studio_Linux
+
+      - name: Upload macOS Asset
+        if: runner.os == 'macOS'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/SileroTTS_Studio_macOS.zip
