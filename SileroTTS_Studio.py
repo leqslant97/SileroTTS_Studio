@@ -46,28 +46,30 @@ if platform.system() == "Windows":
     import winsound
 
 # ================= ИНИЦИАЛИЗАЦИЯ ПАПКИ ДАННЫХ =================
-if sys.platform == "darwin":
-    # macOS: Корневая папка в Документах
-    BASE_DIR = Path.home() / "Documents" / "SileroTTS_Studio"
-    APP_DATA_DIR = BASE_DIR / "SileroTTS_Studio_data" # Служебные файлы внутри подпапки
-    DEFAULT_INPUT_DIR = str(BASE_DIR / "input_texts")
-    DEFAULT_OUTPUT_DIR = str(BASE_DIR / "output_audio")
-    DEFAULT_CACHE_DIR = str(BASE_DIR / "cache_audio")
-else:
-    # Windows/Linux: Всё лежит рядом с программой
-    if getattr(sys, 'frozen', False):
-        base_path = Path(sys.executable).parent
-    else:
-        base_path = Path(__file__).parent
-    BASE_DIR = base_path
-    APP_DATA_DIR = BASE_DIR / "SileroTTS_Studio_data"
-    DEFAULT_INPUT_DIR = "input_texts"
-    DEFAULT_OUTPUT_DIR = "output_audio"
-    DEFAULT_CACHE_DIR = "cache_audio"
+# Проверяем, запущены ли мы как скомпилированное приложение (.app) на macOS
+is_frozen_mac = (sys.platform == "darwin") and getattr(sys, 'frozen', False)
 
-# Создаем системную папку для настроек и логов
+if is_frozen_mac:
+    # Режим .app на macOS -> корень в Документах
+    BASE_DIR = Path.home() / "Documents" / "SileroTTS_Studio"
+else:
+    # Режим консоли (python3) или Portable .exe на Windows -> корень в папке со скриптом
+    if getattr(sys, 'frozen', False):
+        BASE_DIR = Path(sys.executable).parent
+    else:
+        BASE_DIR = Path(__file__).parent.resolve()
+
+# Служебная папка ТОЛЬКО для настроек и логов
+APP_DATA_DIR = BASE_DIR / "SileroTTS_Studio_data"
+
+# Рабочие папки создаются в BASE_DIR РЯДОМ с SileroTTS_Studio_data, а не ВНУТРИ неё
+DEFAULT_INPUT_DIR = str(BASE_DIR / "input_texts")
+DEFAULT_OUTPUT_DIR = str(BASE_DIR / "output_audio")
+DEFAULT_CACHE_DIR = str(BASE_DIR / "cache_audio")
+
+# Создаем служебную папку и переходим в корень проекта
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-os.chdir(APP_DATA_DIR)
+os.chdir(BASE_DIR) # Рабочей директорией делаем BASE_DIR!
 
 SETTINGS_FILE = APP_DATA_DIR / "settings.json"
 LOG_FILE = APP_DATA_DIR / "tts_processor.log"

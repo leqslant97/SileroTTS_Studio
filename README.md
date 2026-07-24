@@ -41,21 +41,3 @@ pip install requests pydub razdel ru-normalizr EbookLib beautifulsoup4 python-do
 ```bash
 python3 SileroTTS_Studio.py
 ```
-
-## 📦 Сборка в исполняемый файл (.exe / .app)
-Если вы хотите собрать программу в один файл, чтобы запускать её без консоли и Python на других компьютерах, используйте `PyInstaller`.
-
-1. Установите PyInstaller:
-   ```bash
-   pip install pyinstaller
-   ```
-2. **Для Windows (.exe):**
-   ```bash
-   pyinstaller --noconsole --onefile SileroTTS_Studio.py
-   ```
-3. **Для macOS (.app):**
-   ```bash
-   pyinstaller --windowed --onefile SileroTTS_Studio.py
-   ```
-
-*Примечание:* Скомпилированный файл появится в папке `dist`. Для его работы на другом компьютере также потребуется установленный в системе FFmpeg.
