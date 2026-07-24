@@ -5,6 +5,7 @@ Silero TTS Studio - Профессиональная среда для гене�
 """
 
 import os
+import sys
 import re
 import io
 import json
@@ -20,6 +21,11 @@ import atexit
 import tempfile
 import platform
 import subprocess
+
+if getattr(sys, 'frozen', False):
+    # Если приложение запущено из собранного пакета (.app)
+    # Переключаем рабочую директорию на папку, где лежит сам исполняемый файл
+    os.chdir(os.path.dirname(sys.executable))
 
 # Попытка импорта библиотек для работы с электронными книгами
 try:
