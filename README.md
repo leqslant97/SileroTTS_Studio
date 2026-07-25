@@ -55,4 +55,3 @@ python3 SileroTTS_Studio.py
 
 ## 📥 Готовые сборки
 Скачать готовые исполняемые файлы для Windows (`.exe`), macOS (`.app.zip`) и Linux (`x86_64` / `arm64`) можно во вкладке **[Releases](../../releases)**.
-```
