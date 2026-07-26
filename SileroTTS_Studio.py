@@ -368,17 +368,45 @@ class TTSProcessor:
 
     def load_glossary_file(self):
         if not os.path.exists(self.glossary_path): return
-        with open(self.glossary_path, 'r', encoding='utf-8') as f: data = json.load(f)
-        for w in data.get("accents_ignore_case", []): self.glossary_ignore_case[w.replace("+", "").lower()] = w
-        for w in data.get("accents_strict_case", []): self.glossary_strict_case[w.replace("+", "")] = w
-        for k, v in data.get("terms_ignore_case", {}).items(): self.glossary_ignore_case[k.lower()] = v
-        for k, v in data.get("terms_strict_case", {}).items(): self.glossary_strict_case[k] = v
+        try:
+            with open(self.glossary_path, 'r', encoding='utf-8') as f: data = json.load(f)
+        except Exception as e:
+            logging.error(f"Ошибка чтения файла глоссария: {e}")
+            return
+
+        for w in data.get("accents_ignore_case", []): 
+            if isinstance(w, str) and w.strip():
+                self.glossary_ignore_case[w.replace("+", "").lower()] = w
+                
+        for w in data.get("accents_strict_case", []): 
+            if isinstance(w, str) and w.strip():
+                self.glossary_strict_case[w.replace("+", "")] = w
+                
+        for k, v in data.get("terms_ignore_case", {}).items(): 
+            if isinstance(k, str) and k.strip():
+                self.glossary_ignore_case[k.lower()] = v
+                
+        for k, v in data.get("terms_strict_case", {}).items(): 
+            if isinstance(k, str) and k.strip():
+                self.glossary_strict_case[k] = v
+                
         self.glossary_regex = data.get("regex_rules", [])
 
     def apply_regex_rules(self, text):
         for rule in self.glossary_regex:
-            try: text = re.sub(rule["pattern"], rule["repl"], text)
-            except Exception as e: logging.error(f"Ошибка в RegEx {rule['pattern']}: {e}")
+            if not isinstance(rule, dict): 
+                continue
+            pattern = rule.get("pattern") or rule.get("regex")
+            repl = rule.get("repl", "")
+            
+            if not pattern: 
+                continue
+                
+            try: 
+                # ИСПРАВЛЕНИЕ: Добавлен flags=re.MULTILINE для работы ^ и $ на каждой строке файла
+                text = re.sub(pattern, repl, text, flags=re.MULTILINE)
+            except Exception as e: 
+                logging.error(f"Ошибка в RegEx '{pattern}': {e}")
         return text
 
     def apply_glossary(self, text):
@@ -466,7 +494,8 @@ class TTSProcessor:
         silence_dir.mkdir(exist_ok=True)
         filepath = silence_dir / f"silence_{duration_ms}.ogg"
         if not filepath.exists():
-            AudioSegment.silent(duration=duration_ms).export(filepath, format="ogg")
+            # ИСПРАВЛЕНИЕ: Строго 48000Hz, чтобы FFmpeg не вырезал паузы при склейке!
+            AudioSegment.silent(duration=duration_ms, frame_rate=48000).export(filepath, format="ogg")
         return filepath
 
     def _run_ffmpeg_concat(self, audio_files):
@@ -2548,23 +2577,25 @@ class TTSApp:
 
     def add_glossary_rule(self):
         w1 = self.glos_word1.get().strip()
-        w2 = self.glos_word2.get().strip()
+        w2 = self.glos_word2.get() # Разрешаем пустоту
         strict = self.glos_strict.get()
         gtype = self.glos_type.get()
-        if not w1: return
+        
+        if not w1: return 
+        
         try:
             content = self.txt_glossary.get(1.0, tk.END).strip()
             data = json.loads(content) if content else {"accents_ignore_case": [], "accents_strict_case": [], "terms_ignore_case": {}, "terms_strict_case": {}, "regex_rules": []}
+            
             if gtype == "accent":
                 if strict: data.setdefault("accents_strict_case", []).append(w1)
                 else: data.setdefault("accents_ignore_case", []).append(w1)
             elif gtype == "term":
-                if not w2: return
                 if strict: data.setdefault("terms_strict_case", {})[w1] = w2
                 else: data.setdefault("terms_ignore_case", {})[w1] = w2
             elif gtype == "regex":
-                if not w2: return
                 data.setdefault("regex_rules", []).append({"pattern": w1, "repl": w2})
+                
             self.txt_glossary.delete(1.0, tk.END)
             self.txt_glossary.insert(tk.END, json.dumps(data, indent=4, ensure_ascii=False))
             self.glos_word1.set("")
@@ -3228,55 +3259,63 @@ class TTSApp:
             messagebox.showinfo("Готово", "Все выбранные файлы обработаны!")
 
     def process_queue(self, items_to_process):
-        total_files = len(items_to_process)
-        
-        status_file = APP_DATA_DIR / "processing_statuses.json"
-        statuses = {}
-        if status_file.exists():
-            try:
-                with open(status_file, 'r', encoding='utf-8') as f: statuses = json.load(f)
-            except: pass
+        try:
+            total_files = len(items_to_process)
+            
+            status_file = APP_DATA_DIR / "processing_statuses.json"
+            statuses = {}
+            if status_file.exists():
+                try:
+                    with open(status_file, 'r', encoding='utf-8') as f: statuses = json.load(f)
+                except: pass
 
-        skip_existing = self.settings_vars["skip_existing"].get()
-        input_dir = Path(self.config["input_dir"])
-        
-        for idx, item_id in enumerate(items_to_process):
-            if self.processor.is_stopped: break
+            skip_existing = self.settings_vars["skip_existing"].get()
+            input_dir = Path(self.config["input_dir"])
             
-            # item_id - это имя файла (например, "01_Глава.txt"), берем его из таблицы
-            filepath = input_dir / item_id
-            
-            if not filepath.exists():
-                self.root.after(0, self.update_file_status, item_id, "error")
-                continue
-            
-            out_filename = filepath.with_suffix(f'.{self.config["output_format"]}').name
-            out_filepath = Path(self.config["output_dir"]) / out_filename
-            
-            if skip_existing and out_filepath.exists():
-                file_status = statuses.get(str(out_filepath.resolve()), "success")
-                if file_status == "success":
-                    self.root.after(0, self.update_file_status, filepath.name, "success")
-                    self.root.after(0, self.update_total_ui, idx + 1, total_files)
-                    continue 
-            
-            self.root.after(0, self.update_file_status, filepath.name, "processing")
-            
-            def on_progress(current, total, text):
-                pct = int((current / total) * 100) if total > 0 else 0
-                self.root.after(0, self.update_progress_ui, pct, text)
+            for idx, item_id in enumerate(items_to_process):
+                if self.processor.is_stopped: break
                 
-            def on_complete(filename, status):
-                self.root.after(0, self.update_file_status, filename, status)
-                self.root.after(0, self.update_total_ui, idx + 1, total_files)
+                filepath = input_dir / item_id
+                
+                if not filepath.exists():
+                    self.root.after(0, self.update_file_status, item_id, "error")
+                    continue
+                
+                out_filename = filepath.with_suffix(f'.{self.config["output_format"]}').name
+                out_filepath = Path(self.config["output_dir"]) / out_filename
+                
+                if skip_existing and out_filepath.exists():
+                    file_status = statuses.get(str(out_filepath.resolve()), "success")
+                    if file_status == "success":
+                        self.root.after(0, self.update_file_status, filepath.name, "success")
+                        self.root.after(0, self.update_total_ui, idx + 1, total_files)
+                        continue 
+                
+                self.root.after(0, self.update_file_status, filepath.name, "processing")
+                
+                def on_progress(current, total, text):
+                    pct = int((current / total) * 100) if total > 0 else 0
+                    self.root.after(0, self.update_progress_ui, pct, text)
+                    
+                def on_complete(filename, status):
+                    self.root.after(0, self.update_file_status, filename, status)
+                    self.root.after(0, self.update_total_ui, idx + 1, total_files)
 
-            self.processor.process_text_file(filepath, progress_callback=on_progress, completion_callback=on_complete)
+                try:
+                    self.processor.process_text_file(filepath, progress_callback=on_progress, completion_callback=on_complete)
+                except Exception as e:
+                    logging.error(f"Ошибка при обработке файла {filepath.name}: {e}")
+                    self.root.after(0, self.update_file_status, filepath.name, "error")
 
-            if not self.processor.is_stopped:
-                self.root.after(0, self.update_file_status, filepath.name, "encoding")
+                if not self.processor.is_stopped:
+                    self.root.after(0, self.update_file_status, filepath.name, "encoding")
 
-        for t in self.processor.active_threads: t.join()
-        self.root.after(0, self.finish_processing)
+            for t in self.processor.active_threads: t.join()
+            
+        except Exception as e:
+            logging.error(f"Критическая ошибка в очереди синтеза: {e}")
+        finally:
+            self.root.after(0, self.finish_processing)
 
     def start_direct_processing(self):
         self.save_settings()
