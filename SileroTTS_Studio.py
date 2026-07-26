@@ -2405,11 +2405,11 @@ class TTSApp:
         add_entry(tab_pauses, "Между абзацами (мс):", "pause_paragraph", 3, tk.IntVar)
         add_entry(tab_pauses, "Перед диалогом (мс):", "pause_speech", 4, tk.IntVar)
         add_entry(tab_pauses, "Перед двоеточием (мс):", "pause_colon", 5, tk.IntVar)
-        ttk.Separator(tab_pauses, orient=tk.HORIZONTAL).grid(row=6, column=0, columnspan=2, sticky="ew", pady=10)
-        ttk.Label(tab_pauses, text="Символы-разделители\n(каждый с новой строки):").grid(row=7, column=0, sticky=tk.NW, pady=2, padx=5)
+        add_entry(tab_pauses, "Пауза разделителя (мс):", "pause_separator", 6, tk.IntVar)
+        ttk.Separator(tab_pauses, orient=tk.HORIZONTAL).grid(row=7, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Label(tab_pauses, text="Символы-разделители\n(каждый с новой строки):").grid(row=8, column=0, sticky=tk.NW, pady=2, padx=5)
         self.txt_separators = tk.Text(tab_pauses, height=6, width=30)
-        # --- ИЗМЕНЕНИЕ: sticky="ew" заставляет поле растягиваться ---
-        self.txt_separators.grid(row=7, column=1, sticky="ew", pady=2, padx=5)
+        self.txt_separators.grid(row=8, column=1, sticky="ew", pady=2, padx=5)
 
         add_check(tab_cache, "Авто-исправление аббревиатур (И.И. -> И-И)", "auto_abbreviations", 0)
         add_check(tab_cache, "Авто-сокращения (г., ул., ур. -> г, ул, ур)", "auto_short_words", 1)
