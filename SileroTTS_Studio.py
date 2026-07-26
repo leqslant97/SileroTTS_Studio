@@ -779,6 +779,7 @@ class TTSProcessor:
             if title: cmd.extend(["-metadata", f"title={title}"])
             if self.cfg.get("tag_artist"): cmd.extend(["-metadata", f"artist={self.cfg.get('tag_artist')}"])
             if self.cfg.get("tag_album"): cmd.extend(["-metadata", f"album={self.cfg.get('tag_album')}"])
+            if self.cfg.get("tag_composer"): cmd.extend(["-metadata", f"composer={self.cfg.get('tag_composer')}"])
             if self.cfg.get("tag_year"): cmd.extend(["-metadata", f"date={self.cfg.get('tag_year')}"])
 
             cmd.append(str(out_filepath))
@@ -2235,6 +2236,12 @@ class TTSApp:
                         pause_ms = g_set["pause"]
                         if apply_fx and scale_p and sp != 1.0: pause_ms = int(pause_ms / sp)
                         pause_seg = AudioSegment.silent(duration=pause_ms)
+
+                        if files:
+                            first_f_set = self.export_files.get(files[0], {})
+                            for key in ["artist", "album", "composer", "year", "cover"]:
+                                if not g_set.get(key) and first_f_set.get(key):
+                                    g_set[key] = first_f_set[key]
                         
                         for i, f_id in enumerate(files):
                             if self.is_export_stopped: break # Проверка остановки внутри склейки
