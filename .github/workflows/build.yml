@@ -120,8 +120,8 @@ jobs:
           plutil -replace NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist"
           
           codesign --force --sign - "$APP_PATH"
-
-            - name: Package Artifacts into ZIP
+          
+      - name: Package Artifacts into ZIP
         run: |
           cd dist
           if [ -d "SileroTTS_Studio_Windows" ]; then
