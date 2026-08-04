@@ -1409,11 +1409,6 @@ class TTSApp:
         for widget_cls in ("Text", "Entry", "TEntry"):
             self.root.bind_class(widget_cls, "<Command-Key>", self._dispatch_mac_cmd)
 
-        # 💡 Патч первого клика: Нужен СТРОГО для автономного .app пакета!
-        if is_frozen_mac:
-            self.root.bind("<Enter>", lambda e: self.root.focus_set(), add="+")
-            self.root.bind("<Button-1>", lambda e: self.root.focus_force(), add="+")
-
 
     def _dispatch_mac_cmd(self, event):
         """Нативная обработка горячих клавиш macOS с декодированием путей Finder (unquote + NFC)"""
