@@ -4481,5 +4481,12 @@ class TTSApp:
 
 if __name__ == "__main__":
     root = tk.Tk()
+    if not sys.platform.startswith('darwin'):
+        try:
+            scale_factor = root.winfo_fpixels('1i') / 72.0
+            if scale_factor > 1.0:
+                root.tk.call('tk', 'scaling', scale_factor)
+        except Exception:
+            pass
     app = TTSApp(root)
     root.mainloop()
