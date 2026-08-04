@@ -39,8 +39,11 @@ if platform.system() == "Windows":
     subprocess.Popen = _patched_popen
 # --------------------------
 
-# === ГЛОБАЛЬНЫЙ ПАТЧ ДЛЯ macOS: ЛЕЧЕНИЕ БАГА PyInstaller #1804 (КЛИКАБЕЛЬНОСТЬ .app) ===
-if sys.platform == "darwin" and getattr(sys, 'frozen', False):
+is_frozen_mac = (sys.platform == "darwin") and getattr(sys, 'frozen', False)
+
+# === ПАТЧИ ДЛЯ macOS (.app) ===
+if is_frozen_mac:
+    # 1. Лечение бага PyInstaller #1804 (Кликабельность и фокус окна)
     try:
         import ctypes
         import ctypes.util
@@ -51,14 +54,18 @@ if sys.platform == "darwin" and getattr(sys, 'frozen', False):
             shared_app_sel = appkit.sel_registerName('sharedApplication')
             activate_sel = appkit.sel_registerName('activateIgnoringOtherApps:')
             
-            # Принудительно заставляем macOS передать 100% фокус ввода нашему .app
             shared_app = appkit.objc_msgSend(app_class, shared_app_sel)
             appkit.objc_msgSend(shared_app, activate_sel, True)
             logging.info("macOS NSApp успешно активирован на переднем плане.")
     except Exception as e:
         logging.debug(f"Не удалось принудительно активировать NSApp на Mac: {e}")
-# ----------------------------------------------------------------------------------------
 
+    # 2. Защита от сброса FPS в PyInstaller --windowed
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
+# ------------------------------
 # Попытка импорта библиотек для работы с электронными книгами
 try:
     import ebooklib
@@ -84,8 +91,6 @@ if platform.system() == "Windows":
 
 # ================= ИНИЦИАЛИЗАЦИЯ ПАПКИ ДАННЫХ =================
 # Проверяем, запущены ли мы как скомпилированное приложение (.app) на macOS
-is_frozen_mac = (sys.platform == "darwin") and getattr(sys, 'frozen', False)
-
 if is_frozen_mac:
     # Режим .app на macOS -> корень в Документах
     BASE_DIR = Path.home() / "Documents" / "SileroTTS_Studio"
