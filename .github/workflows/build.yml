@@ -94,14 +94,26 @@ jobs:
       - name: Build Windows (Folder)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --noconsole --onedir --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
-
+          pyinstaller --noconsole --onedir \
+            --add-binary "ffmpeg.exe;." \
+            --add-binary "ffprobe.exe;." \
+            --exclude-module numpy \
+            --exclude-module matplotlib \
+            --name "SileroTTS_Studio_Windows" \
+            SileroTTS_Studio.py
+      
       # Сборка для Linux (ИСПРАВЛЕНО: убрали вызов через python -m, вызываем pyinstaller напрямую)
       - name: Build Linux (Folder)
         if: runner.os == 'Linux'
         run: |
-          pyinstaller --noconsole --onedir --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" SileroTTS_Studio.py
-
+          pyinstaller --noconsole --onedir \
+            --add-binary "ffmpeg:." \
+            --add-binary "ffprobe:." \
+            --exclude-module numpy \
+            --exclude-module matplotlib \
+            --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" \
+            SileroTTS_Studio.py
+      
       # Сборка для macOS
       - name: Build macOS (.app)
         if: runner.os == 'macOS'
