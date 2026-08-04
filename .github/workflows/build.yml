@@ -86,20 +86,21 @@ jobs:
           cp $(which ffprobe) ./ffprobe
           chmod +x ffmpeg ffprobe
 
-      - name: Build Windows (Folder)
+            - name: Build Windows (Folder)
         if: runner.os == 'Windows'
         run: |
-          python -O -m pyinstaller --noconsole --onedir --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
+          & "$env:pythonLocation\python.exe" -O -m pyinstaller --noconsole --onedir --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
 
       - name: Build Linux (Folder)
         if: runner.os == 'Linux'
         run: |
-          python -O -m pyinstaller --noconsole --onedir --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" SileroTTS_Studio.py
+          "$pythonLocation/python" -O -m pyinstaller --noconsole --onedir --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" SileroTTS_Studio.py
 
       - name: Build macOS (.app)
         if: runner.os == 'macOS'
         run: |
-          python -O -m pyinstaller --windowed --onedir \
+          # Используем точный путь к изолированному Python 3.10
+          "$pythonLocation/python" -O -m pyinstaller --windowed --onedir \
             --add-binary "ffmpeg:." \
             --add-binary "ffprobe:." \
             --target-architecture=${{ matrix.target_arch }} \
@@ -109,6 +110,7 @@ jobs:
           APP_PATH="dist/SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
           plutil -replace NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist"
           codesign --force --sign - "$APP_PATH"
+
 
       - name: Package Artifacts into ZIP
         run: |
