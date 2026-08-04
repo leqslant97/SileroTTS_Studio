@@ -21,6 +21,7 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
+            target_arch: x64
             artifact_name: SileroTTS_Studio_Windows.zip
             
           - name: Linux-x86_64
@@ -52,11 +53,11 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Linux dependencies
+      - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk ffmpeg
+          sudo apt-get install -y python3-tk
 
       - name: Install Python dependencies
         run: |
@@ -65,34 +66,23 @@ jobs:
           pip install --upgrade setuptools wheel
           pip install -r requirements.txt
 
-      - name: Download FFmpeg for Windows
+      # НАДЕЖНЫЙ ШАГ: Автоматическая установка FFmpeg для любой ОС
+      - name: Setup FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+        id: setup-ffmpeg
+
+      # Копируем бинарники в корень проекта, чтобы PyInstaller их увидел
+      - name: Prepare FFmpeg Binaries (Windows)
         if: runner.os == 'Windows'
         run: |
-          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "ffmpeg.zip"
-          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg_extracted"
-          $ffmpegExe = Get-ChildItem -Path "ffmpeg_extracted" -Filter "ffmpeg.exe" -Recurse | Select-Object -ExpandProperty FullName
-          $ffprobeExe = Get-ChildItem -Path "ffmpeg_extracted" -Filter "ffprobe.exe" -Recurse | Select-Object -ExpandProperty FullName
-          Copy-Item $ffmpegExe -Destination "ffmpeg.exe"
-          Copy-Item $ffprobeExe -Destination "ffprobe.exe"
+          copy "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}" .\ffmpeg.exe
+          copy "${{ steps.setup-ffmpeg.outputs.ffprobe-path }}" .\ffprobe.exe
 
-      - name: Copy FFmpeg for Linux
-        if: runner.os == 'Linux'
+      - name: Prepare FFmpeg Binaries (Linux / macOS)
+        if: runner.os != 'Windows'
         run: |
-          cp /usr/bin/ffmpeg ./ffmpeg
-          cp /usr/bin/ffprobe ./ffprobe
-
-      - name: Download FFmpeg for macOS
-        if: runner.os == 'macOS'
-        run: |
-          if [ "${{ matrix.target_arch }}" = "arm64" ]; then
-            curl -L https://evermeet.cx -o ffmpeg.zip
-            curl -L https://evermeet.cx -o ffprobe.zip
-          else
-            curl -L https://evermeet.cx -o ffmpeg.zip
-            curl -L https://evermeet.cx -o ffprobe.zip
-          fi
-          unzip -o ffmpeg.zip ffmpeg
-          unzip -o ffprobe.zip ffprobe
+          cp "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}" ./ffmpeg
+          cp "${{ steps.setup-ffmpeg.outputs.ffprobe-path }}" ./ffprobe
           chmod +x ffmpeg ffprobe
 
       - name: Build Windows (Folder)
@@ -103,7 +93,7 @@ jobs:
       - name: Build Linux (Folder)
         if: runner.os == 'Linux'
         run: |
-          python -O -m pyinstaller --noconsole --onedir --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch || 'x86_64' }}" SileroTTS_Studio.py
+          python -O -m pyinstaller --noconsole --onedir --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" SileroTTS_Studio.py
 
       - name: Build macOS (.app)
         if: runner.os == 'macOS'
@@ -116,11 +106,9 @@ jobs:
             SileroTTS_Studio.py
           
           APP_PATH="dist/SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
-          
           plutil -replace NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist"
-          
           codesign --force --sign - "$APP_PATH"
-          
+
       - name: Package Artifacts into ZIP
         run: |
           cd dist
@@ -134,7 +122,6 @@ jobs:
             zip -r -y "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
           fi
         shell: bash
-
     
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
