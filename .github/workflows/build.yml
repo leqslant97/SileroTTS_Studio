@@ -86,7 +86,7 @@ jobs:
           cp $(which ffprobe) ./ffprobe
           chmod +x ffmpeg ffprobe
 
-            - name: Build Windows (Folder)
+      - name: Build Windows (Folder)
         if: runner.os == 'Windows'
         run: |
           & "$env:pythonLocation\python.exe" -O -m pyinstaller --noconsole --onedir --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
