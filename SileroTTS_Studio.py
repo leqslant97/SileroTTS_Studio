@@ -21,6 +21,8 @@ import tempfile
 import platform
 import subprocess
 import sys
+import urllib.parse
+import unicodedata
 
 try:
     import sv_ttk
@@ -1338,20 +1340,17 @@ class TTSApp:
             self.root.bind_class(widget_cls, "<Command-Key>", self._dispatch_mac_cmd)
 
     def _dispatch_mac_cmd(self, event):
-        """Нативная обработка горячих клавиш macOS с прямой интеграцией в NSPasteboard (pbpaste/pbcopy)"""
+        """Нативная обработка горячих клавиш macOS с декодированием путей Finder (unquote + NFC)"""
         w = event.widget
         kc = event.keycode
         char = str(event.char).lower()
 
-        # Если фокус стоит на контейнере вкладки — находим активное текстовое поле
         if not isinstance(w, (tk.Text, tk.Entry, ttk.Entry)):
             w = self.root.focus_get()
             if not isinstance(w, (tk.Text, tk.Entry, ttk.Entry)):
                 return
 
-        # 8=C, 9=V, 7=X, 0=A, 6=Z (Аппаратные keycode на клавиатуре Mac)
-        
-        # --- ВСТАВКА (⌘V) ---
+        # --- ВСТАВКА (⌘V) С АВТО-ДЕКОДИРОВАНИЕМ КИРИЛЛИЦЫ И ПУТЕЙ FINDER ---
         if kc == 9 or char in ('v', 'м', '\x16'):
             clip = ""
             try:
@@ -1359,7 +1358,6 @@ class TTSApp:
             except Exception:
                 pass
             
-            # Если Tcl/Tk на Mac "потерял" буфер обмена — читаем напрямую через системный pbpaste!
             if not clip:
                 try:
                     clip = subprocess.check_output(["pbpaste"], text=True, stderr=subprocess.DEVNULL)
@@ -1368,6 +1366,16 @@ class TTSApp:
 
             if clip:
                 try:
+                    # 💡 АВТО-ОЧИСТКА И ДЕКОДИРОВАНИЕ ПУТЕЙ FINDER (unquote + NFC)
+                    clip = clip.strip()
+                    if clip.startswith("file://"):
+                        clip = clip[7:]
+                    if "%" in clip:
+                        try:
+                            clip = urllib.parse.unquote(clip)
+                        except Exception: pass
+                    clip = unicodedata.normalize('NFC', clip).strip('"\'')
+
                     if isinstance(w, tk.Text):
                         if w.tag_ranges(tk.SEL):
                             w.delete(tk.SEL_FIRST, tk.SEL_LAST)
@@ -1392,7 +1400,6 @@ class TTSApp:
                 if text_to_copy:
                     self.root.clipboard_clear()
                     self.root.clipboard_append(text_to_copy)
-                    # Дублируем в системный буфер обмена macOS через pbcopy
                     try:
                         p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE, text=True)
                         p.communicate(input=text_to_copy)
@@ -1439,7 +1446,6 @@ class TTSApp:
         elif kc == 6 or char in ('z', 'я', '\x1a'):
             try:
                 if isinstance(w, tk.Text):
-                    # Если зажат Shift (⌘Shift+Z) — делаем Повтор (Redo)
                     if event.state & 1:
                         w.edit_redo()
                     else:
@@ -2354,6 +2360,7 @@ class TTSApp:
         
         self.group_settings_frame = ttk.LabelFrame(top_pane, text="Настройки", padding=5)
         top_pane.add(self.group_settings_frame, weight=2)
+        self.group_settings_frame.pack_propagate(False)
         
         tmpl_frame = ttk.Frame(self.group_settings_frame)
         tmpl_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
@@ -3212,6 +3219,7 @@ class TTSApp:
         
         set_notebook = ttk.Notebook(self.tab_settings)
         set_notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.tab_settings.pack_propagate(False)
         
         tab_api = ttk.Frame(set_notebook, padding=10)
         tab_folders = ttk.Frame(set_notebook, padding=10)
