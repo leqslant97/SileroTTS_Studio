@@ -14,7 +14,6 @@ permissions:
 env:
   PYTHONOPTIMIZE: "1"
 
-
 jobs:
   build:
     name: Build (${{ matrix.name }})
@@ -63,18 +62,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-tk
 
-      - name: Install Python dependencies
+      # ИСПРАВЛЕНО: Создаем venv индивидуально для каждого раннера
+      - name: Install Python dependencies in venv
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
+          python -m venv .venv
+          
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            source .venv/Scripts/activate
+          else
+            source .venv/bin/activate
+          fi
+          
           pip install --upgrade setuptools wheel
+          pip install pyinstaller
           pip install -r requirements.txt
+        shell: bash
 
-      # НАДЕЖНЫЙ ШАГ: Используем официальный экшен с полной поддержкой ARM64 и x64 на всех ОС
       - name: Setup FFmpeg
         uses: AnimMouse/setup-ffmpeg@v1
 
-      # Находим, куда экшен сохранил бинарники, и копируем их в корень проекта
       - name: Prepare FFmpeg Binaries (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -90,27 +97,23 @@ jobs:
           cp $(which ffprobe) ./ffprobe
           chmod +x ffmpeg ffprobe
 
+      # ИСПРАВЛЕНО: Сборка Windows через PyInstaller из venv
       - name: Build Windows (Folder)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --noconsole --onedir --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --exclude-module numpy --exclude-module matplotlib --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
+          .\.venv\Scripts\pyinstaller --noconsole --onedir --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
 
-      
+      # ИСПРАВЛЕНО: Сборка Linux через PyInstaller из venv
       - name: Build Linux (Folder)
         if: runner.os == 'Linux'
         run: |
-          pyinstaller --noconsole --onedir \
-            --add-binary "ffmpeg:." \
-            --add-binary "ffprobe:." \
-            --exclude-module numpy \
-            --exclude-module matplotlib \
-            --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" \
-            SileroTTS_Studio.py
-      
+          ./.venv/bin/pyinstaller --noconsole --onedir --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" SileroTTS_Studio.py
+
+      # ИСПРАВЛЕНО: Сборка macOS через PyInstaller из venv
       - name: Build macOS (.app)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --windowed --onedir \
+          ./.venv/bin/pyinstaller --windowed --onedir \
             --add-binary "ffmpeg:." \
             --add-binary "ffprobe:." \
             --target-architecture=${{ matrix.target_arch }} \
@@ -121,24 +124,19 @@ jobs:
           plutil -replace NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist"
           codesign --force --sign - "$APP_PATH"
 
-
       - name: Package Artifacts into ZIP
         run: |
           cd dist
-          # Упаковываем Windows через универсальный tar
           if [ -d "SileroTTS_Studio_Windows" ]; then
             tar -a -c -f SileroTTS_Studio_Windows.zip SileroTTS_Studio_Windows
           fi
-          # Упаковываем Linux
           if [ -d "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" ]; then
             tar -a -c -f "SileroTTS_Studio_Linux_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_Linux_${{ matrix.target_arch }}"
           fi
-          # Упаковываем macOS
           if [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
             tar -a -c -f "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
           fi
         shell: bash
-
     
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
