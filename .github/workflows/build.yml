@@ -118,20 +118,23 @@ jobs:
           codesign --force --sign - "$APP_PATH"
 
 
-
       - name: Package Artifacts into ZIP
         run: |
           cd dist
+          # Упаковываем Windows через универсальный tar
           if [ -d "SileroTTS_Studio_Windows" ]; then
-            zip -r -y SileroTTS_Studio_Windows.zip SileroTTS_Studio_Windows
+            tar -a -c -f SileroTTS_Studio_Windows.zip SileroTTS_Studio_Windows
           fi
+          # Упаковываем Linux
           if [ -d "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" ]; then
-            zip -r -y "SileroTTS_Studio_Linux_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_Linux_${{ matrix.target_arch }}"
+            tar -a -c -f "SileroTTS_Studio_Linux_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_Linux_${{ matrix.target_arch }}"
           fi
+          # Упаковываем macOS
           if [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
-            zip -r -y "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
+            tar -a -c -f "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
           fi
         shell: bash
+
     
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
