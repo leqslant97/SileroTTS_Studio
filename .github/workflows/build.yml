@@ -30,10 +30,12 @@ jobs:
 
           - name: macOS-AppleSilicon-ARM64
             os: macos-latest
+            target_arch: arm64
             artifact_name: SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip
-            
+
           - name: macOS-Intel-x86_64
-            os: macos-13
+            os: macos-latest
+            target_arch: x86_64
             artifact_name: SileroTTS_Studio_macOS_Intel_x86_64.zip
 
     steps:
@@ -69,7 +71,7 @@ jobs:
       - name: Build macOS (.app)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --windowed --name "SileroTTS_Studio_macOS" SileroTTS_Studio.py
+          pyinstaller --windowed --target-architecture=${{ matrix.target_arch }} --name "SileroTTS_Studio_macOS" SileroTTS_Studio.py
           plutil -replace NSHighResolutionCapable -bool true dist/SileroTTS_Studio_macOS.app/Contents/Info.plist || plutil -insert NSHighResolutionCapable -bool true dist/SileroTTS_Studio_macOS.app/Contents/Info.plist
 
       - name: Package macOS App into ZIP
@@ -78,6 +80,7 @@ jobs:
           cd dist
           zip -r -y ${{ matrix.artifact_name }} SileroTTS_Studio_macOS.app
 
+      # 📤 Выгрузка в GitHub Releases
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
