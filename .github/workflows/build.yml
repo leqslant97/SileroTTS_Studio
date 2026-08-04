@@ -18,15 +18,15 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
-            artifact_name: SileroTTS_Studio_Windows.exe
+            artifact_name: SileroTTS_Studio_Windows.zip
             
           - name: Linux-x86_64
             os: ubuntu-latest
-            artifact_name: SileroTTS_Studio_Linux_x86_64
+            artifact_name: SileroTTS_Studio_Linux_x86_64.zip
             
           - name: Linux-ARM64
             os: ubuntu-24.04-arm
-            artifact_name: SileroTTS_Studio_Linux_arm64
+            artifact_name: SileroTTS_Studio_Linux_arm64.zip
 
           - name: macOS-AppleSilicon-ARM64
             os: macos-latest
@@ -51,7 +51,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk
+          sudo apt-get install -y python3-tk ffmpeg
 
       - name: Install Python dependencies
         run: |
@@ -60,38 +60,81 @@ jobs:
           pip install --upgrade setuptools wheel
           pip install -r requirements.txt
 
-      - name: Build Windows (.exe)
+      - name: Download FFmpeg for Windows
         if: runner.os == 'Windows'
-        run: pyinstaller --noconsole --onefile --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "ffmpeg.zip"
+          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg_extracted"
+          $ffmpegExe = Get-ChildItem -Path "ffmpeg_extracted" -Filter "ffmpeg.exe" -Recurse | Select-Object -ExpandProperty FullName
+          $ffprobeExe = Get-ChildItem -Path "ffmpeg_extracted" -Filter "ffprobe.exe" -Recurse | Select-Object -ExpandProperty FullName
+          Copy-Item $ffmpegExe -Destination "ffmpeg.exe"
+          Copy-Item $ffprobeExe -Destination "ffprobe.exe"
 
-      - name: Build Linux (Binary)
+      - name: Copy FFmpeg for Linux
         if: runner.os == 'Linux'
-        run: pyinstaller --noconsole --onefile --name "${{ matrix.artifact_name }}" SileroTTS_Studio.py
+        run: |
+          cp /usr/bin/ffmpeg ./ffmpeg
+          cp /usr/bin/ffprobe ./ffprobe
+
+      - name: Download FFmpeg for macOS
+        if: runner.os == 'macOS'
+        run: |
+          if [ "${{ matrix.target_arch }}" = "arm64" ]; then
+            curl -L https://evermeet.cx -o ffmpeg.zip
+            curl -L https://evermeet.cx -o ffprobe.zip
+          else
+            curl -L https://evermeet.cx -o ffmpeg.zip
+            curl -L https://evermeet.cx -o ffprobe.zip
+          fi
+          unzip -o ffmpeg.zip ffmpeg
+          unzip -o ffprobe.zip ffprobe
+          chmod +x ffmpeg ffprobe
+
+      - name: Build Windows (Folder)
+        if: runner.os == 'Windows'
+        run: |
+          python -O -m pyinstaller --noconsole --onedir --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
+
+      - name: Build Linux (Folder)
+        if: runner.os == 'Linux'
+        run: |
+          python -O -m pyinstaller --noconsole --onedir --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch || 'x86_64' }}" SileroTTS_Studio.py
 
       - name: Build macOS (.app)
         if: runner.os == 'macOS'
         run: |
-          cp /opt/homebrew/bin/ffmpeg ./ffmpeg || true
-          cp /opt/homebrew/bin/ffprobe ./ffprobe || true
-
-          pyinstaller --windowed \
+          python -O -m pyinstaller --windowed --onedir \
             --add-binary "ffmpeg:." \
             --add-binary "ffprobe:." \
             --target-architecture=${{ matrix.target_arch }} \
-            --name "SileroTTS_Studio_macOS" SileroTTS_Studio.py
+            --name "SileroTTS_Studio_macOS_${{ matrix.target_arch }}" \
+            SileroTTS_Studio.py
+          
+          APP_PATH="dist/SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
+          
+          plutil -replace NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist"
+          
+          codesign --force --sign - "$APP_PATH"
 
-          plutil -replace NSHighResolutionCapable -bool true dist/SileroTTS_Studio_macOS.app/Contents/Info.plist || plutil -insert NSHighResolutionCapable -bool true dist/SileroTTS_Studio_macOS.app/Contents/Info.plist
-          codesign --force --deep --sign - dist/SileroTTS_Studio_macOS.app
-
-      - name: Package macOS App into ZIP
-        if: runner.os == 'macOS'
+      - name: Package Artifacts into ZIP
         run: |
           cd dist
-          zip -r -y ${{ matrix.artifact_name }} SileroTTS_Studio_macOS.app
-
-      # 📤 Выгрузка в GitHub Releases
+          if [ -d "SileroTTS_Studio_Windows" ]; then
+            zip -r -y SileroTTS_Studio_Windows.zip SileroTTS_Studio_Windows
+          fi
+          if [ -d "SileroTTS_Studio_Linux_x86_64" ]; then
+            zip -r -y SileroTTS_Studio_Linux_x86_64.zip SileroTTS_Studio_Linux_x86_64
+          fi
+          if [ -d "SileroTTS_Studio_Linux_arm64" ]; then
+            zip -r -y SileroTTS_Studio_Linux_arm64.zip SileroTTS_Studio_Linux_arm64
+          fi
+          if [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
+            zip -r -y "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
+          fi
+        shell: bash
+    
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/${{ matrix.artifact_name }}
+            dist/*.zip
