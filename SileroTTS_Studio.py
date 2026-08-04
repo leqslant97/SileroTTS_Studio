@@ -68,6 +68,7 @@ if is_frozen_mac:
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
 # ------------------------------
+        
 # Попытка импорта библиотек для работы с электронными книгами
 try:
     import ebooklib
@@ -119,6 +120,28 @@ SETTINGS_FILE = APP_DATA_DIR / "settings.json"
 LOG_FILE = APP_DATA_DIR / "tts_processor.log"
 
 SAFE_LIMIT = 30000 # Лимит символов для авто-разрыва в режиме full
+
+# === ПАТЧ ПУТЕЙ FFMPEG ДЛЯ macOS FINDER (.app) ===
+if is_frozen_mac:
+    extra_paths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    os.environ["PATH"] = ":".join(extra_paths) + ":" + os.environ.get("PATH", "")
+    try:
+        from pydub import AudioSegment
+        if os.path.exists("/opt/homebrew/bin/ffmpeg"):
+            AudioSegment.converter = "/opt/homebrew/bin/ffmpeg"
+            AudioSegment.ffprobe = "/opt/homebrew/bin/ffprobe"
+    except Exception:
+        pass
+
+if is_frozen_mac:
+    # Режим .app на macOS -> корень в Документах
+    BASE_DIR = Path.home() / "Documents" / "SileroTTS_Studio"
+else:
+    # Режим консоли (python3) или Portable .exe на Windows -> корень в папке со скриптом
+    if getattr(sys, 'frozen', False):
+        BASE_DIR = Path(sys.executable).parent
+    else:
+        BASE_DIR = Path(__file__).parent.resolve()
 
 # ================= НАСТРОЙКА ЛОГИРОВАНИЯ =================
 file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
@@ -1360,6 +1383,11 @@ class TTSApp:
         """Обработка горячих клавиш macOS без привязки к кириллическим keysym, чтобы избежать ошибок"""
         for widget_cls in ("Text", "Entry", "TEntry"):
             self.root.bind_class(widget_cls, "<Command-Key>", self._dispatch_mac_cmd)
+
+        # 💡 Патч первого клика: Нужен СТРОГО для автономного .app пакета!
+        if is_frozen_mac:
+            self.root.bind("<Enter>", lambda e: self.root.focus_set(), add="+")
+            self.root.bind("<Button-1>", lambda e: self.root.focus_force(), add="+")
 
 
     def _dispatch_mac_cmd(self, event):
