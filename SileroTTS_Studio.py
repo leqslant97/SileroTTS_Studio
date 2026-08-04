@@ -24,6 +24,14 @@ import sys
 import urllib.parse
 import unicodedata
 
+def get_ffmpeg_path():
+    """Возвращает 100% абсолютный путь к FFmpeg"""
+    return shutil.which("ffmpeg") or ("/opt/homebrew/bin/ffmpeg" if os.path.exists("/opt/homebrew/bin/ffmpeg") else "ffmpeg")
+
+def get_ffprobe_path():
+    """Возвращает 100% абсолютный путь к FFprobe"""
+    return shutil.which("ffprobe") or ("/opt/homebrew/bin/ffprobe" if os.path.exists("/opt/homebrew/bin/ffprobe") else "ffprobe")
+
 try:
     import sv_ttk
 except ImportError:
@@ -273,7 +281,7 @@ class AudioEffects:
 
             audio_segment.export(in_path, format="wav")
 
-            command = ["ffmpeg", "-y", "-i", in_path, "-af", filter_str, out_path]
+            command = [get_ffmpeg_path(), "-y", "-i", in_path, "-af", filter_str, out_path]
             
             startupinfo = None
             if platform.system() == "Windows":
@@ -582,7 +590,7 @@ class TTSProcessor:
                 f.write(f"file '{safe_path}'\n")
         
         # Перекодируем в чистый OGG через -c:a libvorbis
-        cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path), "-c:a", "libvorbis", str(temp_out)]
+        cmd = [get_ffmpeg_path(), "-y", "-f", "concat", "-safe", "0", "-i", str(list_path), "-c:a", "libvorbis", str(temp_out)]
         
         startupinfo = None
         if platform.system() == "Windows":
@@ -806,7 +814,7 @@ class TTSProcessor:
                     safe_path = p.resolve().as_posix().replace("'", "'\\''")
                     f.write(f"file '{safe_path}'\n")
 
-            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path)]
+            cmd = [get_ffmpeg_path(), "-y", "-f", "concat", "-safe", "0", "-i", str(list_path)]
             
             has_cover = False
             cover_path = self.cfg.get("tag_cover", "")
@@ -2878,7 +2886,7 @@ class TTSApp:
 
     def get_audio_metadata(self, filepath):
         """Читает длительность, теги и извлекает обложку через ffprobe/ffmpeg"""
-        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filepath]
+        cmd = [get_ffprobe_path(), "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filepath]
         try:
             startupinfo = None
             if platform.system() == "Windows":
@@ -2899,7 +2907,7 @@ class TTSApp:
                 cover_file = covers_dir / f"cover_{uuid.uuid4().hex[:8]}.jpg"
                 
                 # Извлекаем 1 кадр обложки
-                ffmpeg_cmd = ["ffmpeg", "-y", "-i", filepath, "-an", "-vframes", "1", str(cover_file)]
+                ffmpeg_cmd = [get_ffmpeg_path(), "-y", "-i", filepath, "-an", "-vframes", "1", str(cover_file)]
                 subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startupinfo)
                 
                 if cover_file.exists():
