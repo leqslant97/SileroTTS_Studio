@@ -1213,6 +1213,34 @@ class TTSApp:
     def get_fg_color(self):
         """Возвращает контрастный цвет текста в зависимости от текущей темы"""
         return "#ffffff" if self.config.get("ui_theme") == "dark" else "#000000"
+
+    def get_status_color(self, status="info"):
+        """Финальная палитра высокой контрастности (WCAG AAA)"""
+        if "ui_theme" in self.settings_vars:
+            theme = self.settings_vars["ui_theme"].get()
+        else:
+            theme = self.config.get("ui_theme", "light")
+            
+        # 🛡 ЗАЩИТА: Если sv_ttk не установлен, системный Tkinter физически остается светлым!
+        if not sv_ttk:
+            theme = "light"
+            
+        if theme == "dark":
+            colors = {
+                "info": "#38BDF8",     # Мягкий небесно-голубой (для ТЕМНОЙ темы)
+                "success": "#4ADE80",  # Пастельно-зеленый
+                "warning": "#FACC15",  # Сочный янтарный
+                "error": "#F87171"     # Кораллово-красный
+            }
+        else:
+            colors = {
+                "info": "#003366",     # Глубокий ТЕМНО-САПФИРОВЫЙ (для СВЕТЛОЙ темы — 100% контраст!)
+                "success": "#15803D",  # Темно-зеленый
+                "warning": "#C2410C",  # Темно-оранжевый
+                "error": "#B91C1C"     # Темно-красный
+            }
+            
+        return colors.get(status, self.get_fg_color())
         
     def reset_global_fx(self):
         """Сброс эффектов во вкладке Настройки к дефолтным значениям"""
@@ -1486,13 +1514,17 @@ class TTSApp:
         if hasattr(self, 'lbl_exp_decay'): self.lbl_exp_decay.config(text="0.3")
 
     def apply_theme(self, *args):
-        """Применяет тему ко всем TTK и стандартным tk.Text виджетам мгновенно"""
-        # Защита: считываем тему из переменной UI или конфига
+        """Применяет тему ко всем TTK, tk.Text виджетам, холсту root и статусным меткам мгновенно"""
         if "ui_theme" in self.settings_vars:
             theme = self.settings_vars["ui_theme"].get()
             self.config["ui_theme"] = theme
         else:
             theme = self.config.get("ui_theme", "default")
+        
+        # Восстанавливаем чистый заголовок окна
+        try:
+            self.root.title("Silero TTS Studio")
+        except: pass
         
         # 1. Применяем тему TTK
         if theme == "dark" and sv_ttk:
@@ -1506,7 +1538,6 @@ class TTSApp:
             text_fg = "#000000"
             insert_bg = "#000000"
         else:
-            # Возврат к стандартной теме ОС
             style = ttk.Style()
             os_name = platform.system()
             default_theme = 'vista' if os_name == "Windows" else 'aqua' if os_name == "Darwin" else 'clam'
@@ -1519,7 +1550,12 @@ class TTSApp:
             text_fg = "#000000"
             insert_bg = "#000000"
 
-        # 2. Мгновенно перекрашиваем все текстовые поля tk.Text
+        # Перекрашиваем задний холст самого главного окна
+        try:
+            self.root.config(bg=text_bg)
+        except: pass
+
+        # 2. Перекрашиваем tk.Text
         text_widgets = [
             getattr(self, 'direct_text', None),
             getattr(self, 'txt_separators', None),
@@ -1539,10 +1575,29 @@ class TTSApp:
                     )
                 except Exception as e:
                     logging.debug(f"Ошибка обновления темы для виджета: {e}")
-                    
-        proc_fg = "#ffffff" if theme == "dark" else "#000000"
+
+        # 3. Обновляем цвета тегов в таблицах
         if hasattr(self, 'tree'):
-            self.tree.tag_configure('processing', foreground=proc_fg, font=('', 10, 'bold'))
+            self.tree.tag_configure('success', foreground=self.get_status_color("success"))
+            self.tree.tag_configure('warning', foreground=self.get_status_color("warning"))
+            self.tree.tag_configure('error', foreground=self.get_status_color("error"))
+            self.tree.tag_configure('processing', foreground=self.get_fg_color(), font=('', 10, 'bold'))
+
+        # 4. Мгновенно перекрашиваем статусные надписи
+        status_labels = [
+            getattr(self, 'lbl_current_text', None),
+            getattr(self, 'lbl_direct_status', None),
+            getattr(self, 'lbl_import_status', None),
+            getattr(self, 'lbl_export_status', None),
+            getattr(self, 'lbl_cache_count', None)
+        ]
+        
+        for lbl in status_labels:
+            if lbl and lbl.winfo_exists():
+                try:
+                    lbl.config(foreground=self.get_status_color("info"))
+                except Exception as e:
+                    logging.debug(f"Ошибка перекраски статусной метки: {e}")
 
 
     def full_ui_refresh(self):
@@ -1824,7 +1879,7 @@ class TTSApp:
         prog_frame = ttk.Frame(self.tab_main, padding=10)
         prog_frame.pack(fill=tk.X)
         
-        self.lbl_current_text = ttk.Label(prog_frame, text="Ожидание...", font=('', 10, 'italic'), foreground="blue", width=110)
+        self.lbl_current_text = ttk.Label(prog_frame, text="Ожидание...", font=('', 10, 'italic'), foreground=self.get_status_color("info"), width=110)
         self.lbl_current_text.grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
         
         ttk.Label(prog_frame, text="Файл:").grid(row=1, column=0, sticky=tk.W)
@@ -1950,7 +2005,7 @@ class TTSApp:
         ttk.Button(bot_fx, text="🔄 Сбросить эффекты", command=self.reset_direct_fx).pack(side=tk.RIGHT, padx=5)
         # ------------------------------------------------
         
-        self.lbl_direct_status = ttk.Label(frame, text="", foreground="blue")
+        self.lbl_direct_status = ttk.Label(frame, text="", foreground=self.get_status_color("info"))
         self.lbl_direct_status.pack(anchor=tk.W)
         
         btn_frame = ttk.Frame(frame)
@@ -2013,7 +2068,7 @@ class TTSApp:
         frame.pack(fill=tk.BOTH, expand=True)
         
         if not IMPORT_LIBS_AVAILABLE:
-            ttk.Label(frame, text="⚠️ Для работы импорта установите библиотеки:\npip install EbookLib beautifulsoup4 python-docx lxml", foreground="red").pack(pady=10)
+            ttk.Label(frame, text="⚠️ Для работы импорта установите библиотеки:\npip install EbookLib beautifulsoup4 python-docx lxml", foreground=self.get_status_color("error")).pack(pady=10)
             return
 
         # Выбор файла
@@ -2055,7 +2110,7 @@ class TTSApp:
         ttk.Checkbutton(split_frame, text="Не делить на главы (сохранить как один файл)", variable=self.settings_vars["import_single_file"]).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=5)
         
         # Кнопка и статус
-        self.lbl_import_status = ttk.Label(frame, text="", foreground="blue")
+        self.lbl_import_status = ttk.Label(frame, text="", foreground=self.get_status_color("info"))
         self.lbl_import_status.pack(pady=5)
         
         self.btn_import_start = ttk.Button(frame, text="⚡ Извлечь и Нарезать", command=self.start_import)
@@ -2102,19 +2157,19 @@ class TTSApp:
                 if not chapters:
                     raise ValueError("Не удалось найти текст или главы в файле.")
                     
-                self.root.after(0, lambda: self.lbl_import_status.config(text=f"Найдено глав: {len(chapters)}. Сохранение...", foreground="orange"))
+                self.root.after(0, lambda: self.lbl_import_status.config(text=f"Найдено глав: {len(chapters)}. Сохранение...", foreground=self.get_status_color("warning")))
                 
                 # Передаем автора в сохранение
                 saved_files = BookExtractor.save_chapters(chapters, out_dir, filepath, template, author=author)
                 
                 msg = f"Успешно извлечено и сохранено файлов: {len(saved_files)}\nПапка: {out_dir}"
-                self.root.after(0, lambda: self.lbl_import_status.config(text="Готово!", foreground="green"))
+                self.root.after(0, lambda: self.lbl_import_status.config(text="Готово!", foreground=self.get_status_color("success")))
                 self.root.after(0, lambda: messagebox.showinfo("Успех", msg))
                 self.root.after(0, self.load_files)
                 
             except Exception as e:
                 logging.error(f"Ошибка импорта: {e}")
-                self.root.after(0, lambda: self.lbl_import_status.config(text="Ошибка!", foreground="red"))
+                self.root.after(0, lambda: self.lbl_import_status.config(text="Ошибка!", foreground=self.get_status_color("error")))
                 self.root.after(0, lambda: messagebox.showerror("Ошибка", f"Не удалось обработать файл:\n{e}"))
             finally:
                 self.root.after(0, lambda: self.btn_import_start.config(state=tk.NORMAL))
@@ -2133,7 +2188,7 @@ class TTSApp:
         # === 1. ПРОГРЕСС-БАР (Пакуем в самый низ, чтобы не пропадал) ===
         prog_frame = ttk.Frame(frame)
         prog_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
-        self.lbl_export_status = ttk.Label(prog_frame, text="Ожидание...", foreground="blue")
+        self.lbl_export_status = ttk.Label(prog_frame, text="Ожидание...", foreground=self.get_status_color("info"))
         self.lbl_export_status.pack(side=tk.LEFT)
         self.export_progress = ttk.Progressbar(prog_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
         self.export_progress.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(10, 0))
@@ -2640,7 +2695,7 @@ class TTSApp:
                 if child in self.export_files:
                     existing_paths.add(self.export_files[child]["path"])
 
-            self.lbl_export_status.config(text="Чтение тегов и извлечение обложек...", foreground="orange")
+            self.lbl_export_status.config(text="Чтение тегов и извлечение обложек...", foreground=self.get_status_color("warning"))
             
             # === ФОНОВЫЙ ПОТОК ===
             def run_import():
@@ -2670,7 +2725,7 @@ class TTSApp:
                                     }
                                     self.export_tree.insert(target_group, tk.END, iid=fid, text=m["title"], values=(self.format_duration(m["duration"]),))
                                 
-                                self.lbl_export_status.config(text=f"Добавлено {curr}/{total_files}...", foreground="orange")
+                                self.lbl_export_status.config(text=f"Добавлено {curr}/{total_files}...", foreground=self.get_status_color("warning"))
                             
                             self.root.after(0, update_ui)
                             batch_data.clear() # Очищаем накопитель для следующей пачки
@@ -2681,9 +2736,9 @@ class TTSApp:
                             self.update_group_duration(target_group)
                         
                         if added_count == 0:
-                            self.lbl_export_status.config(text="Файлы уже присутствуют.", foreground="blue")
+                            self.lbl_export_status.config(text="Файлы уже присутствуют.", foreground=self.get_status_color("info"))
                         else:
-                            self.lbl_export_status.config(text="Ожидание...", foreground="blue")
+                            self.lbl_export_status.config(text="Ожидание...", foreground=self.get_status_color("info"))
                             
                         self._export_lock = False
                         self._set_export_ui_state(tk.NORMAL)
@@ -2693,7 +2748,7 @@ class TTSApp:
                 except Exception as e:
                     logging.error(f"Ошибка при добавлении файлов: {e}")
                     def fail_ui():
-                        self.lbl_export_status.config(text="Ошибка при добавлении!", foreground="red")
+                        self.lbl_export_status.config(text="Ошибка при добавлении!", foreground=self.get_status_color("error"))
                         self._export_lock = False
                         self._set_export_ui_state(tk.NORMAL)
                     self.root.after(0, fail_ui)
@@ -2880,7 +2935,7 @@ class TTSApp:
     def stop_export_process(self):
         self.is_export_stopped = True
         self.btn_export_stop.config(state=tk.DISABLED)
-        self.lbl_export_status.config(text="Остановка сборки (ожидание завершения текущего файла)...", foreground="orange")
+        self.lbl_export_status.config(text="Остановка сборки (ожидание завершения текущего файла)...", foreground=self.get_status_color("warning"))
 
     def start_export_process(self):
         items = self.export_tree.get_children()
@@ -2984,10 +3039,10 @@ class TTSApp:
                             if self.is_export_stopped: break
                                 
                             if apply_fx:
-                                self.root.after(0, lambda: self.lbl_export_status.config(text=f"Применение эффектов и сохранение {g_name}...", foreground="orange"))
+                                self.root.after(0, lambda: self.lbl_export_status.config(text=f"Применение эффектов и сохранение {g_name}...", foreground=self.get_status_color("warning")))
                                 final_audio = AudioEffects.apply_effects(final_audio, speed=sp, pitch=pt, echo=ec, echo_delay=ed, echo_decay=ey)
                             else:
-                                self.root.after(0, lambda: self.lbl_export_status.config(text=f"Сохранение {g_name}...", foreground="orange"))
+                                self.root.after(0, lambda: self.lbl_export_status.config(text=f"Сохранение {g_name}...", foreground=self.get_status_color("warning")))
                             
                             export_kwargs = {"format": fmt}
                             if fmt == "mp3": export_kwargs["bitrate"] = bitrate
@@ -3010,7 +3065,7 @@ class TTSApp:
                                 f_set = self.export_files[f_id]
                                 fp = f_set["path"]
                                 
-                                self.root.after(0, lambda f=f_set['title']: self.lbl_export_status.config(text=f"Конвертация: {f}...", foreground="orange"))
+                                self.root.after(0, lambda f=f_set['title']: self.lbl_export_status.config(text=f"Конвертация: {f}...", foreground=self.get_status_color("warning")))
                                 audio = AudioSegment.from_file(fp)
                                 
                                 if apply_fx:
@@ -3063,15 +3118,15 @@ class TTSApp:
                     self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
                     
                 if self.is_export_stopped:
-                    self.root.after(0, lambda: self.lbl_export_status.config(text="Сборка прервана!", foreground="red"))
+                    self.root.after(0, lambda: self.lbl_export_status.config(text="Сборка прервана!", foreground=self.get_status_color("error")))
                     self.root.after(0, lambda: messagebox.showwarning("Остановлено", "Процесс сборки был прерван пользователем."))
                 else:
-                    self.root.after(0, lambda: self.lbl_export_status.config(text="Готово!", foreground="green"))
+                    self.root.after(0, lambda: self.lbl_export_status.config(text="Готово!", foreground=self.get_status_color("success")))
                     self.root.after(0, lambda: messagebox.showinfo("Успех", f"Сборка успешно завершена!\nСохранено в: {out_dir}"))
                 
             except Exception as e:
                 logging.error(f"Ошибка сборки: {e}")
-                self.root.after(0, lambda: self.lbl_export_status.config(text="Ошибка!", foreground="red"))
+                self.root.after(0, lambda: self.lbl_export_status.config(text="Ошибка!", foreground=self.get_status_color("error")))
                 self.root.after(0, lambda: messagebox.showerror("Ошибка", f"Произошла ошибка при сборке:\n{e}"))
             finally:
                 self.root.after(0, lambda: self.btn_export_start.config(state=tk.NORMAL))
@@ -3266,22 +3321,26 @@ class TTSApp:
         theme_cb = ttk.Combobox(tab_ui, textvariable=self.settings_vars["ui_theme"], values=["light", "dark"], state="readonly", width=15)
         theme_cb.grid(row=0, column=1, sticky=tk.W, pady=10, padx=5)
         
-        def on_theme_change(event):
-            self.config["ui_theme"] = self.settings_vars["ui_theme"].get()
-            self.full_ui_refresh()
+        def on_theme_change(event=None):
+            # 1. Запоминаем новую тему прямо из селектора
+            new_theme = self.settings_vars["ui_theme"].get()
+            self.config["ui_theme"] = new_theme
+            
+            # 2. Мгновенно применяем тему (без перебора вкладок!)
+            self.apply_theme()
             self.save_settings()
+            
+            # 3. Принудительно отрисовываем новый кадр ОС за 1 миллисекунду
+            self.root.update()
+        
         theme_cb.bind("<<ComboboxSelected>>", on_theme_change)
 
         ttk.Label(tab_ui, text="Размер шрифта:").grid(row=1, column=0, sticky=tk.W, pady=10, padx=5)
         font_cb = ttk.Combobox(tab_ui, textvariable=self.font_size_var, values=[10, 12, 14, 16, 18, 20, 24], state="readonly", width=15)
         font_cb.grid(row=1, column=1, sticky=tk.W, pady=10, padx=5)
         font_cb.bind("<<ComboboxSelected>>", self.update_fonts)
+        
         tab_ui.columnconfigure(1, weight=1)
-
-        for tab in (tab_api, tab_folders, tab_pauses, tab_cache, tab_effects, tab_output):
-            tab.columnconfigure(1, weight=1)
-
-        self.set_ui_from_config()
 
     # --- Вкладка "Глоссарий" ---
     def setup_glossary_tab(self):
@@ -3418,7 +3477,7 @@ class TTSApp:
         self.search_var.trace("w", lambda name, index, mode: self.filter_cache())
         ttk.Entry(search_frame, textvariable=self.search_var, width=50).pack(side=tk.LEFT, padx=5)
         
-        self.lbl_cache_count = ttk.Label(search_frame, text="Всего записей: 0", foreground="blue")
+        self.lbl_cache_count = ttk.Label(search_frame, text="Всего записей: 0", foreground=self.get_status_color("info"))
         self.lbl_cache_count.pack(side=tk.RIGHT, padx=5)
         
         # --- ИЗМЕНЕНИЕ: Системно-зависимая подсказка ---
@@ -4027,7 +4086,7 @@ class TTSApp:
     def stop_processing(self):
         if self.processor: self.processor.is_stopped = True
         self.btn_stop.config(state=tk.DISABLED)
-        self.lbl_current_text.config(text="Остановка (ожидание завершения текущего запроса)...", foreground="orange")
+        self.lbl_current_text.config(text="Остановка (ожидание завершения текущего запроса)...", foreground=self.get_status_color("warning"))
 
     def hard_stop_processing(self):
         if self.processor: 
@@ -4044,7 +4103,7 @@ class TTSApp:
         self.btn_refresh.config(state=tk.NORMAL)
         self.btn_remove_sel.config(state=tk.NORMAL)
         
-        self.lbl_current_text.config(text="Принудительно остановлено. Кэш сохранен.", foreground="red")
+        self.lbl_current_text.config(text="Принудительно остановлено. Кэш сохранен.", foreground=self.get_status_color("error"))
         messagebox.showwarning("Принудительная остановка", "Процесс прерван. Текущее предложение не завершено, но весь накопленный кэш записан на диск.")
 
     def finish_processing(self):
@@ -4151,10 +4210,10 @@ class TTSApp:
             
             def run_direct():
                 def on_progress(current, total, txt):
-                    self.root.after(0, lambda: self.lbl_direct_status.config(text=f"Синтез: {current}/{total}...", foreground="blue"))
+                    self.root.after(0, lambda: self.lbl_direct_status.config(text=f"Синтез: {current}/{total}...", foreground=self.get_status_color("info")))
                 def on_complete(fname, status, audio=None):
                     msg = f"Готово! Сохранено в {fname}" if save_file else "Готово! (Не сохранено)"
-                    self.root.after(0, lambda: self.lbl_direct_status.config(text=msg, foreground="green"))
+                    self.root.after(0, lambda: self.lbl_direct_status.config(text=msg, foreground=self.get_status_color("success")))
                     self.root.after(0, lambda: self.btn_direct_start.config(state=tk.NORMAL))
                     self.root.after(0, lambda: self.btn_direct_stop.config(state=tk.DISABLED))
                     self.root.after(0, lambda: self.btn_direct_hard_stop.config(state=tk.DISABLED))
@@ -4174,7 +4233,7 @@ class TTSApp:
     def stop_direct_processing(self):
         if self.processor: self.processor.is_stopped = True
         self.btn_direct_stop.config(state=tk.DISABLED)
-        self.lbl_direct_status.config(text="Остановка...", foreground="orange")
+        self.lbl_direct_status.config(text="Остановка...", foreground=self.get_status_color("warning"))
 
     def hard_stop_direct_processing(self):
         if self.processor: 
@@ -4187,7 +4246,7 @@ class TTSApp:
         self.btn_direct_stop.config(state=tk.DISABLED)
         self.btn_direct_hard_stop.config(state=tk.DISABLED)
         self.btn_direct_start.config(state=tk.NORMAL)
-        self.lbl_direct_status.config(text="Принудительно остановлено. Кэш сохранен.", foreground="red")
+        self.lbl_direct_status.config(text="Принудительно остановлено. Кэш сохранен.", foreground=self.get_status_color("error"))
     
     def update_progress_ui(self, pct, text):
         self.file_progress['value'] = pct
@@ -4199,7 +4258,7 @@ class TTSApp:
         else:
             display_text = display_text.ljust(90)
             
-        self.lbl_current_text.config(text=f"Синтез: {display_text}", foreground="blue")
+        self.lbl_current_text.config(text=f"Синтез: {display_text}", foreground=self.get_status_color("info"))
 
     def update_total_ui(self, current, total):
         pct = int((current / total) * 100) if total > 0 else 0
