@@ -1405,9 +1405,16 @@ class TTSApp:
         return "break"
 
     def _setup_mac_hotkeys(self):
-        """Обработка горячих клавиш macOS без привязки к кириллическим keysym, чтобы избежать ошибок"""
+        """Обработка горячих клавиш macOS и безопасный патч первого клика"""
+        # Универсальные хоткеи для работы с буфером обмена
         for widget_cls in ("Text", "Entry", "TEntry"):
             self.root.bind_class(widget_cls, "<Command-Key>", self._dispatch_mac_cmd)
+
+        # 💡 БЕЗОПАСНЫЙ ПАТЧ ПЕРВОГО КЛИКА (Только для macOS .app)
+        # Срабатывает ТОЛЬКО при клике по кнопке, не трогая текстовые поля!
+        # Параметр add="+" гарантирует, что кнопка нажмется штатно.
+        if is_frozen_mac:
+            self.root.bind_class("TButton", "<ButtonPress-1>", lambda e: e.widget.focus_set(), add="+")
 
 
     def _dispatch_mac_cmd(self, event):
@@ -4480,13 +4487,35 @@ class TTSApp:
             messagebox.showerror("Ошибка JSON", f"Исправьте ошибки в редакторе перед экспортом:\n{e}")
 
 if __name__ == "__main__":
+    # 1. Исправление HiDPI масштабирования для Windows (125%, 150%, 200% экраны)
+    if sys.platform.startswith('win'):
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
     root = tk.Tk()
-    if not sys.platform.startswith('darwin'):
+    
+    # 2. Исправление HiDPI для Linux Ubuntu (Wayland / X11)
+    if sys.platform.startswith('linux'):
         try:
             scale_factor = root.winfo_fpixels('1i') / 72.0
             if scale_factor > 1.0:
                 root.tk.call('tk', 'scaling', scale_factor)
+                
+                from tkinter import font
+                for font_name in font.names():
+                    try:
+                        f = font.nametofont(font_name)
+                        size = f.actual()['size']
+                        # Учитываем как положительный размер (пункты), так и отрицательный (пиксели)
+                        if size != 0:
+                            f.configure(size=int(size * scale_factor * 1.2))
+                    except Exception:
+                        pass
         except Exception:
             pass
+
     app = TTSApp(root)
     root.mainloop()
