@@ -1229,19 +1229,8 @@ class TTSApp:
 
         if sys.platform == "darwin":
             self._setup_mac_hotkeys()
-            
-        self.root.after(150, self._pre_render_tabs)
+        
 
-    def _pre_render_tabs(self):
-        """Безопасный прогрев всех вкладок в фоновом режиме ПОСЛЕ открытия окна"""
-        try:
-            current = self.notebook.select()
-            for tab in self.notebook.tabs():
-                self.notebook.select(tab)
-                self.root.update_idletasks()
-            self.notebook.select(current)
-        except Exception:
-            pass
 
     def get_fg_color(self):
         """Возвращает контрастный цвет текста в зависимости от текущей темы"""
