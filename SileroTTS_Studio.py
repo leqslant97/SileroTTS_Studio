@@ -25,11 +25,23 @@ import urllib.parse
 import unicodedata
 
 def get_ffmpeg_path():
-    """Возвращает 100% абсолютный путь к FFmpeg"""
+    """Сначала ищет FFmpeg зашитый внутри .app пакета, затем в системе"""
+    if getattr(sys, 'frozen', False):
+        bundle_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
+        local_bin = bundle_dir / "ffmpeg"
+        if local_bin.exists():
+            return str(local_bin)
+            
     return shutil.which("ffmpeg") or ("/opt/homebrew/bin/ffmpeg" if os.path.exists("/opt/homebrew/bin/ffmpeg") else "ffmpeg")
 
 def get_ffprobe_path():
-    """Возвращает 100% абсолютный путь к FFprobe"""
+    """Сначала ищет FFprobe зашитый внутри .app пакета, затем в системе"""
+    if getattr(sys, 'frozen', False):
+        bundle_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
+        local_bin = bundle_dir / "ffprobe"
+        if local_bin.exists():
+            return str(local_bin)
+            
     return shutil.which("ffprobe") or ("/opt/homebrew/bin/ffprobe" if os.path.exists("/opt/homebrew/bin/ffprobe") else "ffprobe")
 
 try:
@@ -3673,6 +3685,10 @@ class TTSApp:
         top = tk.Toplevel(self.root)
         top.title(f"Детали кэша: {hash_key}")
         top.geometry("750x500") # Чуть увеличил высоту для ползунков
+
+        top.transient(self.root)
+        top.lift()
+        top.focus_force()
         
         ttk.Label(top, text="Исходный текст:").pack(anchor=tk.W, padx=10, pady=(10,0))
         t1 = tk.Text(top, height=5, wrap=tk.WORD, font=("Arial", self.font_size_var.get()))
