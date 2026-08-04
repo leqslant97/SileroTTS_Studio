@@ -13,7 +13,8 @@ jobs:
   build:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    strategy:
+        strategy:
+      fail-fast: false
       matrix:
         include:
           - name: Windows
@@ -22,10 +23,12 @@ jobs:
             
           - name: Linux-x86_64
             os: ubuntu-latest
+            target_arch: x86_64
             artifact_name: SileroTTS_Studio_Linux_x86_64.zip
             
           - name: Linux-ARM64
             os: ubuntu-24.04-arm
+            target_arch: arm64
             artifact_name: SileroTTS_Studio_Linux_arm64.zip
 
           - name: macOS-AppleSilicon-ARM64
@@ -37,6 +40,7 @@ jobs:
             os: macos-latest
             target_arch: x86_64
             artifact_name: SileroTTS_Studio_macOS_Intel_x86_64.zip
+
 
     steps:
       - name: Checkout code
@@ -116,22 +120,20 @@ jobs:
           
           codesign --force --sign - "$APP_PATH"
 
-      - name: Package Artifacts into ZIP
+            - name: Package Artifacts into ZIP
         run: |
           cd dist
           if [ -d "SileroTTS_Studio_Windows" ]; then
             zip -r -y SileroTTS_Studio_Windows.zip SileroTTS_Studio_Windows
           fi
-          if [ -d "SileroTTS_Studio_Linux_x86_64" ]; then
-            zip -r -y SileroTTS_Studio_Linux_x86_64.zip SileroTTS_Studio_Linux_x86_64
-          fi
-          if [ -d "SileroTTS_Studio_Linux_arm64" ]; then
-            zip -r -y SileroTTS_Studio_Linux_arm64.zip SileroTTS_Studio_Linux_arm64
+          if [ -d "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" ]; then
+            zip -r -y "SileroTTS_Studio_Linux_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_Linux_${{ matrix.target_arch }}"
           fi
           if [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
             zip -r -y "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
           fi
         shell: bash
+
     
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
