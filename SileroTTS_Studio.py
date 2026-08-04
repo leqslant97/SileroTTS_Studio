@@ -39,6 +39,26 @@ if platform.system() == "Windows":
     subprocess.Popen = _patched_popen
 # --------------------------
 
+# === ГЛОБАЛЬНЫЙ ПАТЧ ДЛЯ macOS: ЛЕЧЕНИЕ БАГА PyInstaller #1804 (КЛИКАБЕЛЬНОСТЬ .app) ===
+if sys.platform == "darwin" and getattr(sys, 'frozen', False):
+    try:
+        import ctypes
+        import ctypes.util
+        appkit_path = ctypes.util.find_library('AppKit')
+        if appkit_path:
+            appkit = ctypes.cdll.LoadLibrary(appkit_path)
+            app_class = appkit.objc_getClass('NSApplication')
+            shared_app_sel = appkit.sel_registerName('sharedApplication')
+            activate_sel = appkit.sel_registerName('activateIgnoringOtherApps:')
+            
+            # Принудительно заставляем macOS передать 100% фокус ввода нашему .app
+            shared_app = appkit.objc_msgSend(app_class, shared_app_sel)
+            appkit.objc_msgSend(shared_app, activate_sel, True)
+            logging.info("macOS NSApp успешно активирован на переднем плане.")
+    except Exception as e:
+        logging.debug(f"Не удалось принудительно активировать NSApp на Mac: {e}")
+# ----------------------------------------------------------------------------------------
+
 # Попытка импорта библиотек для работы с электронными книгами
 try:
     import ebooklib
@@ -3360,23 +3380,24 @@ class TTSApp:
         theme_cb.grid(row=0, column=1, sticky=tk.W, pady=10, padx=5)
         
         def on_theme_change(event=None):
-            # 1. Запоминаем новую тему прямо из селектора
-            new_theme = self.settings_vars["ui_theme"].get()
-            self.config["ui_theme"] = new_theme
+            def _apply():
+                new_theme = self.settings_vars["ui_theme"].get()
+                self.config["ui_theme"] = new_theme
+                self.apply_theme()
+                self.save_settings()
             
-            # 2. Мгновенно применяем тему (без перебора вкладок!)
-            self.apply_theme()
-            self.save_settings()
-            
-            # 3. Принудительно отрисовываем новый кадр ОС за 1 миллисекунду
-            self.root.update()
-        
+            # 💡 ДАЕМ ВЫПАДАЮЩЕМУ СПИСКУ 10 МС СПОКОЙНО ЗАКРЫТЬСЯ (Защита от Deadlock на Mac)
+            self.root.after(10, _apply)
+
         theme_cb.bind("<<ComboboxSelected>>", on_theme_change)
 
+        # Выпадающий список размера шрифта
         ttk.Label(tab_ui, text="Размер шрифта:").grid(row=1, column=0, sticky=tk.W, pady=10, padx=5)
         font_cb = ttk.Combobox(tab_ui, textvariable=self.font_size_var, values=[10, 12, 14, 16, 18, 20, 24], state="readonly", width=15)
         font_cb.grid(row=1, column=1, sticky=tk.W, pady=10, padx=5)
-        font_cb.bind("<<ComboboxSelected>>", self.update_fonts)
+        
+        # 💡 Отложенный вызов обновления шрифтов (Защита от Deadlock на Mac)
+        font_cb.bind("<<ComboboxSelected>>", lambda e: self.root.after(10, self.update_fonts))
 
         for tab in (tab_api, tab_folders, tab_pauses, tab_cache, tab_effects, tab_output, tab_ui):
             tab.columnconfigure(1, weight=1)
@@ -3428,7 +3449,7 @@ class TTSApp:
         ttk.Label(lbl_frame, text="Шрифт:").pack(side=tk.RIGHT, padx=5)
         font_cb = ttk.Combobox(lbl_frame, textvariable=self.font_size_var, values=[10, 12, 14, 16, 18, 20, 24], state="readonly", width=5)
         font_cb.pack(side=tk.RIGHT)
-        font_cb.bind("<<ComboboxSelected>>", self.update_fonts)
+        font_cb.bind("<<ComboboxSelected>>", lambda e: self.root.after(10, self.update_fonts))
         
         # 3. В самом конце пакуем текстовое поле, чтобы оно сжималось/растягивалось
         self.txt_glossary = tk.Text(frame, wrap=tk.WORD, font=("Courier", self.font_size_var.get()), undo=True, maxundo=50)
@@ -3853,7 +3874,7 @@ class TTSApp:
         ttk.Label(ctrl_frame, text="Размер шрифта:").pack(side=tk.LEFT)
         font_cb = ttk.Combobox(ctrl_frame, textvariable=self.font_size_var, values=[10, 12, 14, 16, 18, 20, 24], state="readonly", width=5)
         font_cb.pack(side=tk.LEFT, padx=5)
-        font_cb.bind("<<ComboboxSelected>>", self.update_fonts)
+        font_cb.bind("<<ComboboxSelected>>", lambda e: self.root.after(10, self.update_fonts))
 
         # --- ИСПРАВЛЕНИЕ СКРОЛЛБАРА ---
         text_frame = ttk.Frame(self.tab_help)
