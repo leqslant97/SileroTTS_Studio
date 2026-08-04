@@ -66,22 +66,20 @@ jobs:
           pip install --upgrade setuptools wheel
           pip install -r requirements.txt
 
-      # НАДЕЖНЫЙ ШАГ: Автоматическая установка FFmpeg для любой ОС
       - name: Setup FFmpeg
-        uses: FedericoCarboni/setup-ffmpeg@v3
-        id: setup-ffmpeg
+        uses: IsisChalet/setup-ffmpeg@v1
 
       - name: Prepare FFmpeg Binaries (Windows)
         if: runner.os == 'Windows'
         run: |
-          copy "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}\ffmpeg.exe" .\ffmpeg.exe
-          copy "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}\ffprobe.exe" .\ffprobe.exe
+          copy "$env:FFMPEG_PATH\ffmpeg.exe" .\ffmpeg.exe
+          copy "$env:FFMPEG_PATH\ffprobe.exe" .\ffprobe.exe
 
       - name: Prepare FFmpeg Binaries (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
-          cp "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}/ffmpeg" ./ffmpeg
-          cp "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}/ffprobe" ./ffprobe
+          cp "$FFMPEG_PATH/ffmpeg" ./ffmpeg
+          cp "$FFMPEG_PATH/ffprobe" ./ffprobe
           chmod +x ffmpeg ffprobe
 
       - name: Build Windows (Folder)
