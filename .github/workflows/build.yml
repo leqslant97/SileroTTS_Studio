@@ -71,18 +71,17 @@ jobs:
         uses: FedericoCarboni/setup-ffmpeg@v3
         id: setup-ffmpeg
 
-      # Копируем бинарники в корень проекта, чтобы PyInstaller их увидел
       - name: Prepare FFmpeg Binaries (Windows)
         if: runner.os == 'Windows'
         run: |
-          copy "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}" .\ffmpeg.exe
-          copy "${{ steps.setup-ffmpeg.outputs.ffprobe-path }}" .\ffprobe.exe
+          copy "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}\ffmpeg.exe" .\ffmpeg.exe
+          copy "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}\ffprobe.exe" .\ffprobe.exe
 
       - name: Prepare FFmpeg Binaries (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
-          cp "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}" ./ffmpeg
-          cp "${{ steps.setup-ffmpeg.outputs.ffprobe-path }}" ./ffprobe
+          cp "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}/ffmpeg" ./ffmpeg
+          cp "${{ steps.setup-ffmpeg.outputs.ffmpeg-path }}/ffprobe" ./ffprobe
           chmod +x ffmpeg ffprobe
 
       - name: Build Windows (Folder)
