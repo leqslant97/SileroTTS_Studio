@@ -1159,6 +1159,15 @@ class TTSApp:
         self.root = root
         self.root.title("Silero TTS Studio")
         
+        self.settings_vars = {}
+        self.config = self.load_settings()
+        
+        # 🛡 Убираем микро-мигание при старте: предварительно окрашиваем главный холст в цвет темы до отрисовки виджетов!
+        initial_theme = self.config.get("ui_theme", "light")
+        try:
+            self.root.config(bg="#1c1c1c" if initial_theme == "dark" else "#ffffff")
+        except: pass
+
         # Динамический размер окна (70% от экрана по центру)
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
@@ -1168,8 +1177,6 @@ class TTSApp:
         y = int((screen_height - h) / 2)
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         
-        self.settings_vars = {}
-        self.config = self.load_settings()
         self.processor = None
         self.processing_thread = None
         self.last_direct_audio = None
@@ -1532,22 +1539,25 @@ class TTSApp:
         else:
             theme = self.config.get("ui_theme", "default")
         
-        # Восстанавливаем чистый заголовок окна
         try:
             self.root.title("Silero TTS Studio")
         except: pass
         
-        # 1. Применяем тему TTK
+        # 1. Применяем тему TTK и задаем параметры рамок для идеального контраста
         if theme == "dark" and sv_ttk:
             sv_ttk.set_theme("dark")
-            text_bg = "#1c1c1c"
+            root_bg = "#1c1c1c"
+            text_bg = "#2b2b2b"      # Объёмный серый инпут (выделяется на фоне #1c1c1c)
             text_fg = "#ffffff"
             insert_bg = "#ffffff"
+            text_border = {"bd": 0, "highlightthickness": 0, "relief": "flat"}
         elif theme == "light" and sv_ttk:
             sv_ttk.set_theme("light")
-            text_bg = "#ffffff"
+            root_bg = "#f3f3f3"      # Легкий светлый фон окна
+            text_bg = "#ffffff"      # Белый лист текста
             text_fg = "#000000"
             insert_bg = "#000000"
+            text_border = {"bd": 1, "highlightthickness": 1, "highlightbackground": "#cccccc", "highlightcolor": "#0078d7", "relief": "solid"} # 👈 Аккуратная рамка для светлой темы!
         else:
             style = ttk.Style()
             os_name = platform.system()
@@ -1557,16 +1567,18 @@ class TTSApp:
             except:
                 style.theme_use('default')
             
+            root_bg = "#ffffff"
             text_bg = "#ffffff"
             text_fg = "#000000"
             insert_bg = "#000000"
+            text_border = {"bd": 1, "highlightthickness": 1, "highlightbackground": "#cccccc", "highlightcolor": "#0078d7", "relief": "solid"}
 
         # Перекрашиваем задний холст самого главного окна
         try:
-            self.root.config(bg=text_bg)
+            self.root.config(bg=root_bg)
         except: pass
 
-        # 2. Перекрашиваем tk.Text
+        # 2. Мгновенно перекрашиваем все текстовые поля tk.Text
         text_widgets = [
             getattr(self, 'direct_text', None),
             getattr(self, 'txt_glossary', None),
@@ -1581,7 +1593,8 @@ class TTSApp:
                         fg=text_fg,
                         insertbackground=insert_bg,
                         selectbackground="#0078d7" if theme == "dark" else "#3399ff",
-                        selectforeground="#ffffff"
+                        selectforeground="#ffffff",
+                        **text_border # 👈 Применяем рамку для светлой темы / плоский стиль для темной!
                     )
                 except Exception as e:
                     logging.debug(f"Ошибка обновления темы для виджета: {e}")
@@ -1608,7 +1621,6 @@ class TTSApp:
                     lbl.config(foreground=self.get_status_color("info"))
                 except Exception as e:
                     logging.debug(f"Ошибка перекраски статусной метки: {e}")
-
 
     def full_ui_refresh(self):
         """Полный проход по всем вкладкам для 100% перерисовки шрифтов и тем"""
