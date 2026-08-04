@@ -2,6 +2,8 @@ name: Build and Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -13,7 +15,7 @@ jobs:
   build:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-        strategy:
+    strategy:
       fail-fast: false
       matrix:
         include:
@@ -40,7 +42,6 @@ jobs:
             os: macos-latest
             target_arch: x86_64
             artifact_name: SileroTTS_Studio_macOS_Intel_x86_64.zip
-
 
     steps:
       - name: Checkout code
