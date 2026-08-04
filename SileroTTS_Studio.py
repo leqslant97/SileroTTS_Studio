@@ -3784,8 +3784,8 @@ class TTSApp:
             except Exception as e:
                 logging.error(f"Ошибка чтения файла для плеера: {e}")
                 
-        btn_play = ttk.Button(top, text="🔊 Слушать с эффектами", command=play_cache_audio)
-        btn_play.pack(anchor=tk.W, padx=10, pady=5)
+        btn_play = ttk.Button(fx_frame, text="🔊 Слушать с эффектами", command=play_cache_audio)
+        btn_play.pack(side=tk.LEFT, padx=5, pady=2)
 
     def load_cache_ui(self):
         self.cache_data = {}
