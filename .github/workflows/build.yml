@@ -66,20 +66,24 @@ jobs:
           pip install --upgrade setuptools wheel
           pip install -r requirements.txt
 
+      # НАДЕЖНЫЙ ШАГ: Используем официальный экшен с полной поддержкой ARM64 и x64 на всех ОС
       - name: Setup FFmpeg
-        uses: IsisChalet/setup-ffmpeg@v1
+        uses: AnimMouse/setup-ffmpeg@v1
 
+      # Находим, куда экшен сохранил бинарники, и копируем их в корень проекта
       - name: Prepare FFmpeg Binaries (Windows)
         if: runner.os == 'Windows'
         run: |
-          copy "$env:FFMPEG_PATH\ffmpeg.exe" .\ffmpeg.exe
-          copy "$env:FFMPEG_PATH\ffprobe.exe" .\ffprobe.exe
+          $ffmpegPath = (Get-Command ffmpeg.exe).Source
+          $ffprobePath = (Get-Command ffprobe.exe).Source
+          copy $ffmpegPath .\ffmpeg.exe
+          copy $ffprobePath .\ffprobe.exe
 
       - name: Prepare FFmpeg Binaries (Linux / macOS)
         if: runner.os != 'Windows'
         run: |
-          cp "$FFMPEG_PATH/ffmpeg" ./ffmpeg
-          cp "$FFMPEG_PATH/ffprobe" ./ffprobe
+          cp $(which ffmpeg) ./ffmpeg
+          cp $(which ffprobe) ./ffprobe
           chmod +x ffmpeg ffprobe
 
       - name: Build Windows (Folder)
