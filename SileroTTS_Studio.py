@@ -1229,8 +1229,29 @@ class TTSApp:
 
         if sys.platform == "darwin":
             self._setup_mac_hotkeys()
+
+        self.root.after(300, self._silent_pre_warm_tabs)
         
 
+    def _silent_pre_warm_tabs(self):
+        """Тихий фоновый прогрев всех вкладок в памяти (БЕЗ переключения на экране)"""
+        def _step(tabs_list):
+            if not tabs_list:
+                return
+            tab_id = tabs_list.pop(0)
+            try:
+                # Заставляем Ткинтер просчитать геометрию под-вкладки в фоне
+                widget = self.notebook.nametowidget(tab_id)
+                widget.update_idletasks()
+            except Exception:
+                pass
+            # Переходим к следующей вкладке через 50 мс
+            if tabs_list:
+                self.root.after(50, lambda: _step(tabs_list))
+
+        # Запускаем поочередный тихий прогрев через 300 мс после старта окна
+        tabs = list(self.notebook.tabs())
+        self.root.after(300, lambda: _step(tabs))
 
     def get_fg_color(self):
         """Возвращает контрастный цвет текста в зависимости от текущей темы"""
@@ -1339,6 +1360,7 @@ class TTSApp:
         """Обработка горячих клавиш macOS без привязки к кириллическим keysym, чтобы избежать ошибок"""
         for widget_cls in ("Text", "Entry", "TEntry"):
             self.root.bind_class(widget_cls, "<Command-Key>", self._dispatch_mac_cmd)
+
 
     def _dispatch_mac_cmd(self, event):
         """Нативная обработка горячих клавиш macOS с декодированием путей Finder (unquote + NFC)"""
