@@ -1188,19 +1188,6 @@ class TTSApp:
         self.load_files()
         self.update_fonts()
 
-        # --- УНИВЕРСАЛЬНАЯ ПРЕД-ОТРИСОВКА ВСЕХ ВКЛАДОК ПРИ СТАРТЕ ---
-        # --- Скрываем окно на время пред-отрисовки ---
-        self.root.withdraw()
-        
-        # Пред-отрисовка всех вкладок в скрытом режиме
-        for tab in self.notebook.tabs():
-            self.notebook.select(tab)
-            self.root.update_idletasks()
-        self.notebook.select(self.tab_main)
-        
-        # --- Показываем уже полностью готовое окно БЕЗ анимаций и мельканий ---
-        self.root.deiconify()
-
         self.apply_theme()
         
         # Перехват закрытия окна
@@ -1215,26 +1202,26 @@ class TTSApp:
         return "#ffffff" if self.config.get("ui_theme") == "dark" else "#000000"
 
     def get_status_color(self, status="info"):
-        """Финальная палитра высокой контрастности (WCAG AAA)"""
+        """Финальная палитра высокой контрастности (0 мс, чистое чтение из памяти Python)"""
+        # Считываем тему прямо из памяти Python без тяжелых вызовов Tcl/Tk
         if "ui_theme" in self.settings_vars:
             theme = self.settings_vars["ui_theme"].get()
         else:
             theme = self.config.get("ui_theme", "light")
             
-        # 🛡 ЗАЩИТА: Если sv_ttk не установлен, системный Tkinter физически остается светлым!
         if not sv_ttk:
             theme = "light"
             
         if theme == "dark":
             colors = {
-                "info": "#38BDF8",     # Мягкий небесно-голубой (для ТЕМНОЙ темы)
+                "info": "#38BDF8",     # Мягкий небесно-голубой
                 "success": "#4ADE80",  # Пастельно-зеленый
-                "warning": "#FACC15",  # Сочный янтарный
-                "error": "#F87171"     # Кораллово-красный
+                "warning": "#FACC15",  # Янтарный
+                "error": "#F87171"     # Коралл
             }
         else:
             colors = {
-                "info": "#003366",     # Глубокий ТЕМНО-САПФИРОВЫЙ (для СВЕТЛОЙ темы — 100% контраст!)
+                "info": "#003366",     # Глубокий темно-сапфировый
                 "success": "#15803D",  # Темно-зеленый
                 "warning": "#C2410C",  # Темно-оранжевый
                 "error": "#B91C1C"     # Темно-красный
