@@ -25,24 +25,29 @@ import urllib.parse
 import unicodedata
 
 def get_ffmpeg_path():
-    """Сначала ищет FFmpeg зашитый внутри .app пакета, затем в системе"""
+    """Универсальный поиск FFmpeg (внутри собранного пакета или в системе)"""
     if getattr(sys, 'frozen', False):
+        # PyInstaller распаковывает --add-binary в _MEIPASS (для --onefile) или рядом с exe
         bundle_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
-        local_bin = bundle_dir / "ffmpeg"
+        bin_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
+        local_bin = bundle_dir / bin_name
         if local_bin.exists():
             return str(local_bin)
             
-    return shutil.which("ffmpeg") or ("/opt/homebrew/bin/ffmpeg" if os.path.exists("/opt/homebrew/bin/ffmpeg") else "ffmpeg")
+    sys_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
+    return shutil.which(sys_name) or sys_name
 
 def get_ffprobe_path():
-    """Сначала ищет FFprobe зашитый внутри .app пакета, затем в системе"""
+    """Универсальный поиск FFprobe (внутри собранного пакета или в системе)"""
     if getattr(sys, 'frozen', False):
         bundle_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
-        local_bin = bundle_dir / "ffprobe"
+        bin_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
+        local_bin = bundle_dir / bin_name
         if local_bin.exists():
             return str(local_bin)
             
-    return shutil.which("ffprobe") or ("/opt/homebrew/bin/ffprobe" if os.path.exists("/opt/homebrew/bin/ffprobe") else "ffprobe")
+    sys_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
+    return shutil.which(sys_name) or sys_name
 
 try:
     import sv_ttk
