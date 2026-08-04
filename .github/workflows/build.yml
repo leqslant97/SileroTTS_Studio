@@ -18,14 +18,23 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
-          - name: macOS
-            os: macos-latest
+            artifact_name: SileroTTS_Studio_Windows.exe
+            
           - name: Linux-x86_64
             os: ubuntu-latest
-            arch_name: SileroTTS_Studio_Linux_x86_64
+            artifact_name: SileroTTS_Studio_Linux_x86_64
+            
           - name: Linux-ARM64
             os: ubuntu-24.04-arm
-            arch_name: SileroTTS_Studio_Linux_arm64
+            artifact_name: SileroTTS_Studio_Linux_arm64
+
+          - name: macOS-AppleSilicon-ARM64
+            os: macos-latest
+            artifact_name: SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip
+            
+          - name: macOS-Intel-x86_64
+            os: macos-13
+            artifact_name: SileroTTS_Studio_macOS_Intel_x86_64.zip
 
     steps:
       - name: Checkout code
@@ -55,32 +64,22 @@ jobs:
 
       - name: Build Linux (Binary)
         if: runner.os == 'Linux'
-        run: pyinstaller --noconsole --onefile --name "${{ matrix.arch_name }}" SileroTTS_Studio.py
+        run: pyinstaller --noconsole --onefile --name "${{ matrix.artifact_name }}" SileroTTS_Studio.py
 
       - name: Build macOS (.app)
         if: runner.os == 'macOS'
-        run: pyinstaller --windowed --target-architecture=universal2 --name "SileroTTS_Studio_macOS" SileroTTS_Studio.py
+        run: |
+          pyinstaller --windowed --name "SileroTTS_Studio_macOS" SileroTTS_Studio.py
+          plutil -replace NSHighResolutionCapable -bool true dist/SileroTTS_Studio_macOS.app/Contents/Info.plist || plutil -insert NSHighResolutionCapable -bool true dist/SileroTTS_Studio_macOS.app/Contents/Info.plist
 
       - name: Package macOS App into ZIP
         if: runner.os == 'macOS'
         run: |
           cd dist
-          zip -r -y SileroTTS_Studio_macOS.zip SileroTTS_Studio_macOS.app
+          zip -r -y ${{ matrix.artifact_name }} SileroTTS_Studio_macOS.app
 
-      - name: Upload Windows Asset
-        if: runner.os == 'Windows'
+      - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/SileroTTS_Studio_Windows.exe
-
-      - name: Upload Linux Asset
-        if: runner.os == 'Linux'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/${{ matrix.arch_name }}
-
-      - name: Upload macOS Asset
-        if: runner.os == 'macOS'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/SileroTTS_Studio_macOS.zip
+          files: |
+            dist/${{ matrix.artifact_name }}
