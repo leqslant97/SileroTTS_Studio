@@ -1485,7 +1485,6 @@ class TTSApp:
         if hasattr(self, 'help_text_widget'): self.help_text_widget.config(font=("Arial", size))
         self.config["ui_font_size"] = size
         
-        # Сохраняем только если обновление вызвано пользователем, а не системным циклом
         if not getattr(self, '_is_updating_ui', False):
             self.save_settings()
 
@@ -1558,7 +1557,6 @@ class TTSApp:
         # 2. Перекрашиваем tk.Text
         text_widgets = [
             getattr(self, 'direct_text', None),
-            getattr(self, 'txt_separators', None),
             getattr(self, 'txt_glossary', None),
             getattr(self, 'help_text_widget', None)
         ]
@@ -1663,13 +1661,19 @@ class TTSApp:
 
 
     def update_config_from_ui(self):
-        for key, var in self.settings_vars.items():
-            self.config[key] = var.get()
-        if hasattr(self, 'txt_separators'):
-            self.config["separator_symbols"] = self.txt_separators.get(1.0, tk.END).strip()
+        for key, var in list(self.settings_vars.items()):
+            try:
+                self.config[key] = var.get()
+            except Exception:
+                pass
+                
+        # Собираем разделители из всех активных полей
+        if hasattr(self, 'separator_entries'):
+            seps = [ent.get().strip() for ent in self.separator_entries if ent.get().strip()]
+            self.config["separator_symbols"] = "\n".join(seps)
             
-    def save_settings(self, path=SETTINGS_FILE):
-        """Безопасное сохранение настроек с авто-созданием папки"""
+    def save_settings(self, path=SETTINGS_FILE, show_popup=False):
+        """Безопасное сохранение настроек с авто-созданием папки и уведомлением"""
         self.ensure_dirs()
         self.update_config_from_ui()
         path = Path(path)
@@ -1678,25 +1682,42 @@ class TTSApp:
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=4, ensure_ascii=False)
+            if show_popup:
+                messagebox.showinfo("Успех", "Настройки успешно сохранены!")
         except Exception as e:
             logging.error(f"Ошибка сохранения конфига {path}: {e}")
+            if show_popup:
+                messagebox.showerror("Ошибка", f"Не удалось сохранить настройки:\n{e}")
 
     def set_ui_from_config(self):
         """Заполнение полей UI из self.config с полной блокировкой trace-событий"""
-        self._is_updating_ui = True  # 🛡 БЛОКИРУЕМ TRACE-ТРИГГЕРЫ
+        self._is_updating_ui = True
         try:
             self.ensure_dirs()
     
-            # 1. Разделители символов
-            if hasattr(self, 'txt_separators'):
+            # 1. Загрузка динамических полей разделителей
+            if hasattr(self, 'separators_container') and self.separators_container.winfo_exists():
                 try:
-                    self.txt_separators.delete(1.0, tk.END)
-                    raw_seps = str(self.config.get("separator_symbols", ""))
-                    if "," in raw_seps and "\n" not in raw_seps: 
-                        raw_seps = raw_seps.replace(",", "\n")
-                    self.txt_separators.insert(tk.END, raw_seps)
+                    for child in self.separators_container.winfo_children():
+                        child.destroy()
+                    self.separator_entries.clear()
+                    
+                    raw_seps = str(self.config.get("separator_symbols", "")).strip()
+                    if not raw_seps:
+                        raw_seps = DEFAULT_CONFIG["separator_symbols"]
+                        self.config["separator_symbols"] = raw_seps
+                        
+                    raw_seps = raw_seps.replace("\\n", "\n").replace(",", "\n")
+                    seps_list = [s.strip() for s in raw_seps.split("\n") if s.strip()]
+                    
+                    for sep in seps_list:
+                        self.add_separator_row(sep)
+                        
+                    if not self.separator_entries:
+                        for default_sep in DEFAULT_CONFIG["separator_symbols"].split("\n"):
+                            self.add_separator_row(default_sep)
                 except Exception as e:
-                    logging.error(f"Ошибка разделителей: {e}")
+                    logging.error(f"Ошибка загрузки разделителей: {e}")
     
             # 2. Переменные настроек
             for key, var in list(self.settings_vars.items()):
@@ -1735,13 +1756,11 @@ class TTSApp:
                 ed = int(float(self.config.get("fx_echo_delay", 300)))
                 ey = float(self.config.get("fx_echo_decay", 0.3))
     
-                # Подписи в Настройках
                 if hasattr(self, 'lbl_speed_val'): self.lbl_speed_val.config(text=f"{sp:.1f}x")
                 if hasattr(self, 'lbl_pitch_val'): self.lbl_pitch_val.config(text=f"{pt:.2f}")
                 if hasattr(self, 'lbl_delay_val'): self.lbl_delay_val.config(text=f"{ed}мс")
                 if hasattr(self, 'lbl_decay_val'): self.lbl_decay_val.config(text=f"{ey:.1f}")
     
-                # Подписи в Прямом синтезе
                 if hasattr(self, 'dir_speed_var'):
                     self.dir_speed_var.set(sp)
                     self.dir_pitch_var.set(pt)
@@ -1753,7 +1772,6 @@ class TTSApp:
                     if hasattr(self, 'lbl_dir_delay'): self.lbl_dir_delay.config(text=f"{ed}мс")
                     if hasattr(self, 'lbl_dir_decay'): self.lbl_dir_decay.config(text=f"{ey:.1f}")
     
-                # Подписи в Экспорте и Сборке
                 if hasattr(self, 'exp_speed_var'):
                     self.exp_speed_var.set(sp)
                     self.exp_pitch_var.set(pt)
@@ -1774,7 +1792,7 @@ class TTSApp:
     
             self.apply_theme()
         finally:
-            self._is_updating_ui = False  # 🔓 РАЗБЛОКИРУЕМ TRACE-ОБРАБОТЧИКИ
+            self._is_updating_ui = False
 
     def import_config(self):
         """Импорт с сохранением текущей темы (если её нет в файле) и обновлением UI"""
@@ -3134,11 +3152,36 @@ class TTSApp:
 
         threading.Thread(target=run_export, daemon=True).start()
 
+    def add_separator_row(self, initial_value=""):
+        """Добавляет новую строчку с ttk.Entry для разделителя с прямой записью текста"""
+        if not hasattr(self, 'separators_container') or not self.separators_container.winfo_exists():
+            return
+
+        row_frame = ttk.Frame(self.separators_container)
+        row_frame.pack(fill=tk.X, pady=2)
+
+        # Прямое создание инпута без временного StringVar (защита от сборщика мусора)
+        ent = ttk.Entry(row_frame)
+        ent.insert(0, str(initial_value)) # 👈 Прямая вставка значения в память поля!
+        ent.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+
+        btn_del = ttk.Button(row_frame, text="❌", width=3, command=lambda: self.remove_separator_row(row_frame, ent))
+        btn_del.pack(side=tk.RIGHT)
+
+        self.separator_entries.append(ent)
+
+    def remove_separator_row(self, row_frame, entry_widget):
+        """Удаляет строчку разделителя"""
+        if entry_widget in self.separator_entries:
+            self.separator_entries.remove(entry_widget)
+        row_frame.destroy()
+
+    
     # --- Вкладка "Настройки" ---
     def setup_settings_tab(self):
         btn_frame = ttk.Frame(self.tab_settings, padding=10)
         btn_frame.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Button(btn_frame, text="💾 Сохранить", command=self.save_settings).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="💾 Сохранить", command=lambda: self.save_settings(show_popup=True)).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="📂 Загрузить конфиг", command=self.import_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="📤 Экспорт конфига", command=self.export_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="🔄 Сбросить", command=self.reset_config).pack(side=tk.LEFT, padx=5)
@@ -3217,9 +3260,17 @@ class TTSApp:
         add_entry(tab_pauses, "После двоеточия (мс):", "pause_colon", 5, tk.IntVar)
         add_entry(tab_pauses, "Пауза разделителя (мс):", "pause_separator", 6, tk.IntVar)
         ttk.Separator(tab_pauses, orient=tk.HORIZONTAL).grid(row=7, column=0, columnspan=2, sticky="ew", pady=10)
-        ttk.Label(tab_pauses, text="Символы-разделители\n(каждый с новой строки):").grid(row=8, column=0, sticky=tk.NW, pady=2, padx=5)
-        self.txt_separators = tk.Text(tab_pauses, height=6, width=30, font=("Arial", 10), undo=True, maxundo=50)
-        self.txt_separators.grid(row=8, column=1, sticky="ew", pady=2, padx=5)
+        # Заголовок и кнопка добавления
+        seps_header_frame = ttk.Frame(tab_pauses)
+        seps_header_frame.grid(row=8, column=0, sticky=tk.NW, pady=2, padx=5)
+
+        ttk.Label(seps_header_frame, text="Символы-разделители:").pack(anchor=tk.W)
+        ttk.Button(seps_header_frame, text="➕ Добавить", command=lambda: self.add_separator_row()).pack(anchor=tk.W, pady=5)
+
+        # Динамический контейнер под строчки ttk.Entry
+        self.separators_container = ttk.Frame(tab_pauses)
+        self.separators_container.grid(row=8, column=1, sticky="ew", pady=2, padx=5)
+        self.separator_entries = []
 
         # 4. Кэш
         add_check(tab_cache, "Авто-исправление аббревиатур (И.И. -> И-И)", "auto_abbreviations", 0)
@@ -3339,8 +3390,11 @@ class TTSApp:
         font_cb = ttk.Combobox(tab_ui, textvariable=self.font_size_var, values=[10, 12, 14, 16, 18, 20, 24], state="readonly", width=15)
         font_cb.grid(row=1, column=1, sticky=tk.W, pady=10, padx=5)
         font_cb.bind("<<ComboboxSelected>>", self.update_fonts)
-        
-        tab_ui.columnconfigure(1, weight=1)
+
+        for tab in (tab_api, tab_folders, tab_pauses, tab_cache, tab_effects, tab_output, tab_ui):
+            tab.columnconfigure(1, weight=1)
+
+        self.set_ui_from_config()
 
     # --- Вкладка "Глоссарий" ---
     def setup_glossary_tab(self):
