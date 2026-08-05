@@ -145,10 +145,11 @@ jobs:
             tar -a -c -f "SileroTTS_Studio_Linux_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_Linux_${{ matrix.target_arch }}"
           fi
           
-          # Для macOS используем официальную утилиту Apple ditto вместо zip/tar
+          # ИСПРАВЛЕНО: Указываем ditto упаковать саму папку .app, а не только её содержимое
           if [ "${{ runner.os }}" = "macOS" ] && [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
-            ditto -c -k --sequesterRsrc "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip"
+            ditto -c -k --keepParent "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip"
           fi
+
 
         shell: bash
 
