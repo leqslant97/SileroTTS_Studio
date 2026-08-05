@@ -1406,12 +1406,6 @@ class TTSApp:
         for widget_cls in ("Text", "Entry", "TEntry"):
             self.root.bind_class(widget_cls, "<Command-Key>", self._dispatch_mac_cmd)
 
-        # 💡 БЕЗОПАСНЫЙ ПАТЧ ПЕРВОГО КЛИКА (Только для macOS .app)
-        # Срабатывает ТОЛЬКО при клике по кнопке, не трогая текстовые поля!
-        # Параметр add="+" гарантирует, что кнопка нажмется штатно.
-        #if is_frozen_mac:
-        #    self.root.bind_class("TButton", "<ButtonPress-1>", lambda e: e.widget.focus_set(), add="+")
-
 
     def _dispatch_mac_cmd(self, event):
         """Нативная обработка горячих клавиш macOS с декодированием путей Finder (unquote + NFC)"""
