@@ -36,7 +36,7 @@ if platform.system() == "Windows":
 # --------------------------
 
 is_frozen_mac = (sys.platform == "darwin") and getattr(sys, 'frozen', False)
-
+'''
 # === ПАТЧИ ДЛЯ macOS (.app) ===
 if is_frozen_mac:
     # 1. Лечение бага PyInstaller #1804 (Кликабельность и фокус окна)
@@ -62,7 +62,7 @@ if is_frozen_mac:
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
 # ------------------------------
-        
+'''        
 # Попытка импорта библиотек для работы с электронными книгами
 try:
     import ebooklib
@@ -231,7 +231,6 @@ DEFAULT_CONFIG = {
     "default_group_pause": 1000,
     
     "ui_font_size": 10,
-    "ui_theme": "light",
     
     "direct_filename": "direct_output.mp3",
     "direct_save": True,
@@ -1410,8 +1409,8 @@ class TTSApp:
         # 💡 БЕЗОПАСНЫЙ ПАТЧ ПЕРВОГО КЛИКА (Только для macOS .app)
         # Срабатывает ТОЛЬКО при клике по кнопке, не трогая текстовые поля!
         # Параметр add="+" гарантирует, что кнопка нажмется штатно.
-        if is_frozen_mac:
-            self.root.bind_class("TButton", "<ButtonPress-1>", lambda e: e.widget.focus_set(), add="+")
+        #if is_frozen_mac:
+        #    self.root.bind_class("TButton", "<ButtonPress-1>", lambda e: e.widget.focus_set(), add="+")
 
 
     def _dispatch_mac_cmd(self, event):
