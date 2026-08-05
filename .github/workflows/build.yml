@@ -121,8 +121,13 @@ jobs:
             SileroTTS_Studio.py
           
           APP_PATH="dist/SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
+          
+          # ВАЖНО: Возвращаем права на запуск внутренним бинарникам FFmpeg, чтобы codesign их не заблокировал
+          chmod +x "$APP_PATH/Contents/MacOS/ffmpeg" "$APP_PATH/Contents/MacOS/ffprobe"
+          
           plutil -replace NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist"
           codesign --force --sign - "$APP_PATH"
+
 
       - name: Package Artifacts into ZIP
         run: |
@@ -142,6 +147,7 @@ jobs:
           if [ "${{ runner.os }}" = "macOS" ] && [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
             zip -r -y "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
           fi
+
         shell: bash
 
     
