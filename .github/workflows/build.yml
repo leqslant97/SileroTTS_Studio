@@ -127,16 +127,23 @@ jobs:
       - name: Package Artifacts into ZIP
         run: |
           cd dist
-          if [ -d "SileroTTS_Studio_Windows" ]; then
+          
+          # 1. Если это Windows-раннер, пакуем Windows через tar
+          if [ "${{ runner.os }}" = "Windows" ] && [ -d "SileroTTS_Studio_Windows" ]; then
             tar -a -c -f SileroTTS_Studio_Windows.zip SileroTTS_Studio_Windows
           fi
-          if [ -d "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" ]; then
+          
+          # 2. Если это Linux-раннер, пакуем Linux через tar
+          if [ "${{ runner.os }}" = "Linux" ] && [ -d "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" ]; then
             tar -a -c -f "SileroTTS_Studio_Linux_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_Linux_${{ matrix.target_arch }}"
           fi
-          if [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
-            tar -a -c -f "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
+          
+          # 3. ЕСЛИ ЭТО MACOS, ПАКУЕМ СТРОГО ЧЕРЕЗ РОДНОЙ ZIP С СОХРАНЕНИЕМ ПРАВ (-y)
+          if [ "${{ runner.os }}" = "macOS" ] && [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
+            zip -r -y "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
           fi
         shell: bash
+
     
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
