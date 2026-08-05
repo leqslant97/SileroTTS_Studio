@@ -62,7 +62,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-tk
 
-      # Создаем venv индивидуально для каждого раннера
       - name: Install Python dependencies in venv
         run: |
           python -m pip install --upgrade pip
@@ -97,31 +96,31 @@ jobs:
           cp $(which ffprobe) ./ffprobe
           chmod +x ffmpeg ffprobe
 
-      # Сборка Windows (Полная папка + Portable .exe)
+      # Сборка Windows
       - name: Build Windows
         if: runner.os == 'Windows'
         run: |
-          # 1. Полная версия (Папка)
+          # 1. Полная версия (Папка с запеченным FFmpeg)
           .\.venv\Scripts\pyinstaller --noconfirm --noconsole --onedir --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
           
-          # 2. Portable версия (Одиночный .exe файл, напрямую без ZIP)
-          .\.venv\Scripts\pyinstaller --noconfirm --noconsole --onefile --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --name "SileroTTS_Studio_Windows_Portable" SileroTTS_Studio.py
+          # 2. Portable версия (Легковесный .exe ~27 МБ без FFmpeg внутри)
+          .\.venv\Scripts\pyinstaller --noconfirm --noconsole --onefile --name "SileroTTS_Studio_Windows_Portable" SileroTTS_Studio.py
 
-      # Сборка Linux (Полная папка + Portable OneFile)
+      # Сборка Linux
       - name: Build Linux
         if: runner.os == 'Linux'
         run: |
-          # 1. Полная версия (Папка)
+          # 1. Полная версия (Папка с запеченным FFmpeg)
           ./.venv/bin/pyinstaller --noconfirm --noconsole --onedir --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" SileroTTS_Studio.py
           
-          # 2. Portable версия (Один файл)
-          ./.venv/bin/pyinstaller --noconfirm --noconsole --onefile --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}_Portable" SileroTTS_Studio.py
+          # 2. Portable версия (Легковесный бинарник без FFmpeg)
+          ./.venv/bin/pyinstaller --noconfirm --noconsole --onefile --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}_Portable" SileroTTS_Studio.py
 
-      # Сборка macOS (.app + Portable OneFile)
+      # Сборка macOS
       - name: Build macOS
         if: runner.os == 'macOS'
         run: |
-          # 1. Полная версия (.app)
+          # 1. Полная версия (.app с запеченным FFmpeg)
           ./.venv/bin/pyinstaller --noconfirm --windowed --onedir \
             --add-binary "ffmpeg:." \
             --add-binary "ffprobe:." \
@@ -134,15 +133,13 @@ jobs:
           plutil -replace NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist"
           codesign --force --sign - "$APP_PATH"
 
-          # 2. Portable версия (Один файл)
+          # 2. Portable версия (Легковесный бинарник без FFmpeg)
           ./.venv/bin/pyinstaller --noconfirm --windowed --onefile \
-            --add-binary "ffmpeg:." \
-            --add-binary "ffprobe:." \
             --target-architecture=${{ matrix.target_arch }} \
             --name "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable" \
             SileroTTS_Studio.py
 
-      # Упаковка артефактов (Сохраняются СТАРАЯ структура и нейминг)
+      # Упаковка артефактов
       - name: Package Artifacts
         run: |
           cd dist
@@ -151,7 +148,6 @@ jobs:
           # --- Windows ---
           if [ "${{ runner.os }}" = "Windows" ] && [ -d "SileroTTS_Studio_Windows" ]; then
             tar -a -c -f SileroTTS_Studio_Windows.zip SileroTTS_Studio_Windows
-            # Windows Portable .exe остается как есть и не упаковывается в ZIP
           fi
           
           # --- Linux ---
@@ -178,7 +174,7 @@ jobs:
 
         shell: bash
 
-      # Автоматический релиз ZIP-архивов и прямого .exe файла
+      # Релиз архивов и чистого .exe файла
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
