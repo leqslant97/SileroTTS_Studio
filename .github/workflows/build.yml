@@ -129,27 +129,27 @@ jobs:
           codesign --force --sign - "$APP_PATH"
 
 
-
+      # ИСПРАВЛЕНО: Добавлен запрет на создание скрытых файлов Apple, ломающих запуск ошибкой -47
       - name: Package Artifacts into ZIP
         run: |
           cd dist
           
-          # 1. Если это Windows-раннер, пакуем Windows через tar
+          # Запрещаем упаковку метаданных ._ для Mac и Linux
+          export COPYFILE_DISABLE=1
+          
           if [ "${{ runner.os }}" = "Windows" ] && [ -d "SileroTTS_Studio_Windows" ]; then
             tar -a -c -f SileroTTS_Studio_Windows.zip SileroTTS_Studio_Windows
           fi
           
-          # 2. Если это Linux-раннер, пакуем Linux через tar
           if [ "${{ runner.os }}" = "Linux" ] && [ -d "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" ]; then
             tar -a -c -f "SileroTTS_Studio_Linux_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_Linux_${{ matrix.target_arch }}"
           fi
           
-          # 3. ЕСЛИ ЭТО MACOS, ПАКУЕМ СТРОГО ЧЕРЕЗ РОДНОЙ ZIP С СОХРАНЕНИЕМ ПРАВ (-y)
           if [ "${{ runner.os }}" = "macOS" ] && [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
             zip -r -y "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
           fi
-
         shell: bash
+
 
     
       - name: Upload Release Asset
