@@ -46,7 +46,7 @@
 ### Шаг 2. Установка зависимостей Python
 Откройте терминал в папке с программой и выполните:
 ```bash
-pip install sv-ttk requests pydub razdel ru-normalizr EbookLib beautifulsoup4 python-docx lxml
+pip install requests pydub razdel ru-normalizr EbookLib beautifulsoup4 python-docx lxml
 ```
 или скачайте файл `requirements.txt` и выполните:
 ```bash
