@@ -103,7 +103,7 @@ jobs:
           # 1. Полная версия (Папка с запеченным FFmpeg)
           .\.venv\Scripts\pyinstaller --noconfirm --noconsole --onedir --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
           
-          # 2. Portable версия (Легковесный .exe ~27 МБ без FFmpeg внутри)
+          # 2. Portable версия (Легковесный .exe ~27 МБ)
           .\.venv\Scripts\pyinstaller --noconfirm --noconsole --onefile --name "SileroTTS_Studio_Windows_Portable" SileroTTS_Studio.py
 
       # Сборка Linux
@@ -113,7 +113,7 @@ jobs:
           # 1. Полная версия (Папка с запеченным FFmpeg)
           ./.venv/bin/pyinstaller --noconfirm --noconsole --onedir --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" SileroTTS_Studio.py
           
-          # 2. Portable версия (Легковесный бинарник без FFmpeg)
+          # 2. Portable версия (Один файл)
           ./.venv/bin/pyinstaller --noconfirm --noconsole --onefile --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}_Portable" SileroTTS_Studio.py
 
       # Сборка macOS
@@ -128,16 +128,22 @@ jobs:
             --name "SileroTTS_Studio_macOS_${{ matrix.target_arch }}" \
             SileroTTS_Studio.py
           
-          APP_PATH="dist/SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
-          chmod +x "$APP_PATH/Contents/Resources/ffmpeg" "$APP_PATH/Contents/Resources/ffprobe"
-          plutil -replace NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_PATH/Contents/Info.plist"
-          codesign --force --sign - "$APP_PATH"
+          APP_FULL="dist/SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
+          chmod +x "$APP_FULL/Contents/Resources/ffmpeg" "$APP_FULL/Contents/Resources/ffprobe"
+          plutil -replace NSHighResolutionCapable -bool true "$APP_FULL/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_FULL/Contents/Info.plist"
+          codesign --force --sign - "$APP_FULL"
 
-          # 2. Portable версия (Легковесный бинарник без FFmpeg)
+          # 2. Portable версия (Создает .app пакет)
           ./.venv/bin/pyinstaller --noconfirm --windowed --onefile \
             --target-architecture=${{ matrix.target_arch }} \
             --name "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable" \
             SileroTTS_Studio.py
+            
+          APP_PORTABLE="dist/SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable.app"
+          if [ -d "$APP_PORTABLE" ]; then
+            plutil -replace NSHighResolutionCapable -bool true "$APP_PORTABLE/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_PORTABLE/Contents/Info.plist"
+            codesign --force --sign - "$APP_PORTABLE"
+          fi
 
       # Упаковка артефактов
       - name: Package Artifacts
@@ -162,19 +168,20 @@ jobs:
           
           # --- macOS ---
           if [ "${{ runner.os }}" = "macOS" ]; then
+            # 1. Полная версия (.app)
             if [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
               ditto -c -k --keepParent "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip"
             fi
-            if [ -f "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable" ]; then
-              tar -a -c -f "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable.zip" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable"
-            elif [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable.app" ]; then
+            
+            # 2. Portable версия (.app)
+            if [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable.app" ]; then
               ditto -c -k --keepParent "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable.app" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable.zip"
             fi
           fi
 
         shell: bash
 
-      # Релиз архивов и чистого .exe файла
+      # Релиз архивов и прямого .exe файла
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
