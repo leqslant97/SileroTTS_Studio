@@ -6,4 +6,3 @@ EbookLib
 beautifulsoup4
 python-docx
 lxml
-sv-ttk

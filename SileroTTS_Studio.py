@@ -24,37 +24,6 @@ import sys
 import urllib.parse
 import unicodedata
 
-def get_ffmpeg_path():
-    """Универсальный поиск FFmpeg (внутри собранного пакета или в системе)"""
-    if getattr(sys, 'frozen', False):
-        # PyInstaller распаковывает --add-binary в _MEIPASS (для --onefile) или рядом с exe
-        bundle_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
-        bin_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
-        local_bin = bundle_dir / bin_name
-        if local_bin.exists():
-            return str(local_bin)
-            
-    sys_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
-    return shutil.which(sys_name) or sys_name
-
-def get_ffprobe_path():
-    """Универсальный поиск FFprobe (внутри собранного пакета или в системе)"""
-    if getattr(sys, 'frozen', False):
-        bundle_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
-        bin_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
-        local_bin = bundle_dir / bin_name
-        if local_bin.exists():
-            return str(local_bin)
-            
-    sys_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
-    return shutil.which(sys_name) or sys_name
-
-try:
-    import sv_ttk
-except ImportError:
-    sv_ttk = None
-    logging.warning("Библиотека sv_ttk не установлена. Выполните: pip install sv-ttk")
-
 # === ГЛОБАЛЬНЫЙ ПАТЧ ДЛЯ СКРЫТИЯ КОНСОЛИ НА WINDOWS ===
 # Запрещает pydub и ffmpeg моргать черными окнами
 if platform.system() == "Windows":
@@ -109,8 +78,6 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from collections import deque
-from pydub import AudioSegment
-from pydub.silence import detect_nonsilent
 from razdel import sentenize
 
 # Для воспроизведения аудио на Windows
@@ -146,27 +113,43 @@ LOG_FILE = APP_DATA_DIR / "tts_processor.log"
 
 SAFE_LIMIT = 30000 # Лимит символов для авто-разрыва в режиме full
 
-# === ПАТЧ ПУТЕЙ FFMPEG ДЛЯ macOS FINDER (.app) ===
+# === ИМПОРТ PYDUB И НАСТРОЙКА ПУТЕЙ FFMPEG ===
+from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
+
+def get_ffmpeg_path():
+    """Сначала ищет FFmpeg зашитый внутри пакета, затем в системе"""
+    if getattr(sys, 'frozen', False):
+        bundle_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
+        bin_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
+        local_bin = bundle_dir / bin_name
+        if local_bin.exists():
+            return str(local_bin)
+            
+    sys_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
+    return shutil.which(sys_name) or ("/opt/homebrew/bin/ffmpeg" if sys.platform == "darwin" and os.path.exists("/opt/homebrew/bin/ffmpeg") else sys_name)
+
+def get_ffprobe_path():
+    """Сначала ищет FFprobe зашитый внутри пакета, затем в системе"""
+    if getattr(sys, 'frozen', False):
+        bundle_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
+        bin_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
+        local_bin = bundle_dir / bin_name
+        if local_bin.exists():
+            return str(local_bin)
+            
+    sys_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
+    return shutil.which(sys_name) or ("/opt/homebrew/bin/ffprobe" if sys.platform == "darwin" and os.path.exists("/opt/homebrew/bin/ffprobe") else sys_name)
+
+# Принудительно скармливаем пути библиотеке Pydub
+AudioSegment.converter = get_ffmpeg_path()
+AudioSegment.ffprobe = get_ffprobe_path()
+
+# Если запущены под macOS из Finder (.app) — добавляем Homebrew в PATH для subprocess
 if is_frozen_mac:
     extra_paths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
     os.environ["PATH"] = ":".join(extra_paths) + ":" + os.environ.get("PATH", "")
-    try:
-        from pydub import AudioSegment
-        if os.path.exists("/opt/homebrew/bin/ffmpeg"):
-            AudioSegment.converter = "/opt/homebrew/bin/ffmpeg"
-            AudioSegment.ffprobe = "/opt/homebrew/bin/ffprobe"
-    except Exception:
-        pass
-
-if is_frozen_mac:
-    # Режим .app на macOS -> корень в Документах
-    BASE_DIR = Path.home() / "Documents" / "SileroTTS_Studio"
-else:
-    # Режим консоли (python3) или Portable .exe на Windows -> корень в папке со скриптом
-    if getattr(sys, 'frozen', False):
-        BASE_DIR = Path(sys.executable).parent
-    else:
-        BASE_DIR = Path(__file__).parent.resolve()
+# -------------------------------------------------------------------------
 
 # ================= НАСТРОЙКА ЛОГИРОВАНИЯ =================
 file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
@@ -273,23 +256,19 @@ class AudioEffects:
             return audio_segment
 
         filters = []
-        
         if pitch != 1.0:
             new_sr = int(48000 * pitch)
             filters.append(f"asetrate={new_sr}")
             filters.append(f"atempo={1/pitch}")
-            
         if speed != 1.0:
             filters.append(f"atempo={speed}")
-            
         if echo:
-            # aecho=in_gain:out_gain:delays:decays
-            d_ms = int(echo_delay)
-            d_cy = float(echo_decay)
-            filters.append(f"aecho=0.8:0.8:{d_ms}:{d_cy}")
+            filters.append(f"aecho=0.8:0.8:{int(echo_delay)}:{float(echo_decay)}")
 
         filter_str = ",".join(filters)
 
+        in_path = None
+        out_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_in, \
                  tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_out:
@@ -297,7 +276,6 @@ class AudioEffects:
                 out_path = f_out.name
 
             audio_segment.export(in_path, format="wav")
-
             command = [get_ffmpeg_path(), "-y", "-i", in_path, "-af", filter_str, out_path]
             
             startupinfo = None
@@ -306,17 +284,18 @@ class AudioEffects:
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
             subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startupinfo, check=True)
-
-            processed_audio = AudioSegment.from_file(out_path, format="wav")
-            os.remove(in_path)
-            os.remove(out_path)
-            return processed_audio
-            
+            return AudioSegment.from_file(out_path, format="wav")
         except Exception as e:
             logging.error(f"Ошибка применения эффектов FFmpeg: {e}")
             return audio_segment
-# ===============================================================
-
+        finally:
+            # Гарантированное удаление файлов при любом исходе
+            if in_path and os.path.exists(in_path):
+                try: os.remove(in_path)
+                except: pass
+            if out_path and os.path.exists(out_path):
+                try: os.remove(out_path)
+                except: pass
 # ================= ЯДРО СИНТЕЗА =================
 class RateLimiter:
     """Контроллер частоты запросов к API."""
@@ -500,19 +479,59 @@ class TTSProcessor:
                 logging.error(f"Ошибка в RegEx '{pattern}': {e}")
         return text
 
-    def apply_glossary(self, text):
+    def load_glossary_file(self):
+        if not os.path.exists(self.glossary_path): return
+        try:
+            with open(self.glossary_path, 'r', encoding='utf-8') as f: data = json.load(f)
+        except Exception as e:
+            logging.error(f"Ошибка чтения файла глоссария: {e}")
+            return
+
+        # Очищаем словари и списки перед загрузкой (защита от дубликатов при перевызове)
+        self.glossary_ignore_case = {}
+        self.glossary_strict_case = {}
+        self.compiled_strict_case = []
+        self.compiled_ignore_case = []
+
+        for w in data.get("accents_ignore_case", []): 
+            if isinstance(w, str) and w.strip():
+                self.glossary_ignore_case[w.replace("+", "").lower()] = w
+                
+        for w in data.get("accents_strict_case", []): 
+            if isinstance(w, str) and w.strip():
+                self.glossary_strict_case[w.replace("+", "")] = w
+                
+        for k, v in data.get("terms_ignore_case", {}).items(): 
+            if isinstance(k, str) and k.strip():
+                self.glossary_ignore_case[k.lower()] = v
+                
+        for k, v in data.get("terms_strict_case", {}).items(): 
+            if isinstance(k, str) and k.strip():
+                self.glossary_strict_case[k] = v
+
+        # Предкомпиляция RegEx
         for original, replacement in self.glossary_strict_case.items():
-            pattern = r'(?<![а-яА-Яa-zA-Z0-9_ёЁ])' + re.escape(original) + r'(?![а-яА-Яa-zA-Z0-9_ёЁ])'
-            text = re.sub(pattern, replacement, text)
-            
+            pattern = re.compile(r'(?<![а-яА-Яa-zA-Z0-9_ёЁ])' + re.escape(original) + r'(?![а-яА-Яa-zA-Z0-9_ёЁ])')
+            self.compiled_strict_case.append((pattern, replacement))
+
         for original_lower, replacement in self.glossary_ignore_case.items():
-            pattern = r'(?<![а-яА-Яa-zA-Z0-9_ёЁ])' + re.escape(original_lower) + r'(?![а-яА-Яa-zA-Z0-9_ёЁ])'
+            pattern = re.compile(r'(?<![а-яА-Яa-zA-Z0-9_ёЁ])' + re.escape(original_lower) + r'(?![а-яА-Яa-zA-Z0-9_ёЁ])', re.IGNORECASE)
+            self.compiled_ignore_case.append((pattern, replacement))
+                
+        self.glossary_regex = data.get("regex_rules", [])
+
+    def apply_glossary(self, text):
+        # Использование предкомпилированных регулярных выражений
+        for pattern, replacement in getattr(self, 'compiled_strict_case', []):
+            text = pattern.sub(replacement, text)
+            
+        for pattern, replacement in getattr(self, 'compiled_ignore_case', []):
             def match_func(m):
                 w = m.group(0)
                 if w.isupper(): return replacement.upper()
                 elif w.istitle(): return replacement[0].upper() + replacement[1:] if replacement else ""
                 return replacement
-            text = re.sub(pattern, match_func, text, flags=re.IGNORECASE)
+            text = pattern.sub(match_func, text)
         return text
 
     def process_sentence_text(self, text):
@@ -626,16 +645,17 @@ class TTSProcessor:
         file_name = f"{text_hash}.ogg"
         cache_file = self.cache_audio_dir / file_name
         
-        if force_new and text_hash in self.cache:
-            self._delete_cache_entry(text_hash)
-            self.unsaved_cache_items += 1
-        
-        if self.cfg.get("use_cache", True) and text_hash in self.cache and cache_file.exists():
-            cache_info = self.cache[text_hash]
-            cache_info["last_accessed"] = time.time()
-            cache_info["usage_count"] += 1
-            self.unsaved_cache_items += 1
-            return cache_file, True
+        with self.cache_lock:
+            if force_new and text_hash in self.cache:
+                self._delete_cache_entry(text_hash)
+                self.unsaved_cache_items += 1
+            
+            if self.cfg.get("use_cache", True) and text_hash in self.cache and cache_file.exists():
+                cache_info = self.cache[text_hash]
+                cache_info["last_accessed"] = time.time()
+                cache_info["usage_count"] += 1
+                self.unsaved_cache_items += 1
+                return cache_file, True
 
         payload = {
             'api_token': self.cfg["api_token"], 'text': normalized_text,
@@ -1282,56 +1302,33 @@ class TTSApp:
         
 
     def _silent_pre_warm_tabs(self):
-        """Тихий фоновый прогрев всех вкладок в памяти (БЕЗ переключения на экране)"""
-        def _step(tabs_list):
+        """Тихий фоновый прогрев всех вкладок в памяти без дублирования задач"""
+        tabs_list = list(self.notebook.tabs())
+        
+        def _step():
             if not tabs_list:
                 return
             tab_id = tabs_list.pop(0)
             try:
-                # Заставляем Ткинтер просчитать геометрию под-вкладки в фоне
                 widget = self.notebook.nametowidget(tab_id)
                 widget.update_idletasks()
             except Exception:
                 pass
-            # Переходим к следующей вкладке через 50 мс
             if tabs_list:
-                self.root.after(50, lambda: _step(tabs_list))
+                self.root.after(15, _step)
 
-        # Запускаем поочередный тихий прогрев через 300 мс после старта окна
-        tabs = list(self.notebook.tabs())
-        self.root.after(300, lambda: _step(tabs))
-
-    def get_fg_color(self):
-        """Возвращает контрастный цвет текста в зависимости от текущей темы"""
-        return "#ffffff" if self.config.get("ui_theme") == "dark" else "#000000"
+        self.root.after(100, _step)
 
     def get_status_color(self, status="info"):
-        """Финальная палитра высокой контрастности (0 мс, чистое чтение из памяти Python)"""
-        # Считываем тему прямо из памяти Python без тяжелых вызовов Tcl/Tk
-        if "ui_theme" in self.settings_vars:
-            theme = self.settings_vars["ui_theme"].get()
-        else:
-            theme = self.config.get("ui_theme", "light")
-            
-        if not sv_ttk:
-            theme = "light"
-            
-        if theme == "dark":
-            colors = {
-                "info": "#38BDF8",     # Мягкий небесно-голубой
-                "success": "#4ADE80",  # Пастельно-зеленый
-                "warning": "#FACC15",  # Янтарный
-                "error": "#F87171"     # Коралл
-            }
-        else:
-            colors = {
-                "info": "#003366",     # Глубокий темно-сапфировый
-                "success": "#15803D",  # Темно-зеленый
-                "warning": "#C2410C",  # Темно-оранжевый
-                "error": "#B91C1C"     # Темно-красный
-            }
-            
-        return colors.get(status, self.get_fg_color())
+        """Централизованная палитра статусов (WCAG AAA)"""
+        colors = {
+            "info": "#003366",     # Глубокий темно-сапфировый
+            "success": "#15803D",  # Темно-зеленый
+            "warning": "#C2410C",  # Темно-оранжевый
+            "error": "#B91C1C",    # Темно-красный
+            "text": "#000000"      # Стандартный черный текст
+        }
+        return colors.get(status, "#000000")
         
     def reset_global_fx(self):
         """Сброс эффектов во вкладке Настройки к дефолтным значениям"""
@@ -1616,81 +1613,28 @@ class TTSApp:
         if hasattr(self, 'lbl_exp_decay'): self.lbl_exp_decay.config(text="0.3")
 
     def apply_theme(self, *args):
-        """Применяет тему ко всем TTK, tk.Text виджетам, холсту root и статусным меткам мгновенно"""
-        if "ui_theme" in self.settings_vars:
-            theme = self.settings_vars["ui_theme"].get()
-            self.config["ui_theme"] = theme
-        else:
-            theme = self.config.get("ui_theme", "default")
-        
+        """Включает нативную системную тему ОС"""
         try:
             self.root.title("Silero TTS Studio")
         except: pass
         
-        # 1. Применяем тему TTK и задаем параметры рамок для идеального контраста
-        if theme == "dark" and sv_ttk:
-            sv_ttk.set_theme("dark")
-            root_bg = "#1c1c1c"
-            text_bg = "#2b2b2b"      # Объёмный серый инпут (выделяется на фоне #1c1c1c)
-            text_fg = "#ffffff"
-            insert_bg = "#ffffff"
-            text_border = {"bd": 0, "highlightthickness": 0, "relief": "flat"}
-        elif theme == "light" and sv_ttk:
-            sv_ttk.set_theme("light")
-            root_bg = "#f3f3f3"      # Легкий светлый фон окна
-            text_bg = "#ffffff"      # Белый лист текста
-            text_fg = "#000000"
-            insert_bg = "#000000"
-            text_border = {"bd": 1, "highlightthickness": 1, "highlightbackground": "#cccccc", "highlightcolor": "#0078d7", "relief": "solid"} # 👈 Аккуратная рамка для светлой темы!
-        else:
-            style = ttk.Style()
-            os_name = platform.system()
-            default_theme = 'vista' if os_name == "Windows" else 'aqua' if os_name == "Darwin" else 'clam'
-            try:
-                style.theme_use(default_theme)
-            except:
-                style.theme_use('default')
-            
-            root_bg = "#ffffff"
-            text_bg = "#ffffff"
-            text_fg = "#000000"
-            insert_bg = "#000000"
-            text_border = {"bd": 1, "highlightthickness": 1, "highlightbackground": "#cccccc", "highlightcolor": "#0078d7", "relief": "solid"}
-
-        # Перекрашиваем задний холст самого главного окна
+        # 1. Включаем самую быструю нативную тему ОС
+        style = ttk.Style()
+        os_name = platform.system()
+        default_theme = 'vista' if os_name == "Windows" else 'aqua' if os_name == "Darwin" else 'clam'
         try:
-            self.root.config(bg=root_bg)
-        except: pass
+            style.theme_use(default_theme)
+        except:
+            style.theme_use('default')
 
-        # 2. Мгновенно перекрашиваем все текстовые поля tk.Text
-        text_widgets = [
-            getattr(self, 'direct_text', None),
-            getattr(self, 'txt_glossary', None),
-            getattr(self, 'help_text_widget', None)
-        ]
-        
-        for w in text_widgets:
-            if w and w.winfo_exists():
-                try:
-                    w.config(
-                        bg=text_bg,
-                        fg=text_fg,
-                        insertbackground=insert_bg,
-                        selectbackground="#0078d7" if theme == "dark" else "#3399ff",
-                        selectforeground="#ffffff",
-                        **text_border # 👈 Применяем рамку для светлой темы / плоский стиль для темной!
-                    )
-                except Exception as e:
-                    logging.debug(f"Ошибка обновления темы для виджета: {e}")
-
-        # 3. Обновляем цвета тегов в таблицах
+        # 2. Обновляем цвета тегов в таблицах из единой палитры
         if hasattr(self, 'tree'):
             self.tree.tag_configure('success', foreground=self.get_status_color("success"))
             self.tree.tag_configure('warning', foreground=self.get_status_color("warning"))
             self.tree.tag_configure('error', foreground=self.get_status_color("error"))
-            self.tree.tag_configure('processing', foreground=self.get_fg_color(), font=('', 10, 'bold'))
+            self.tree.tag_configure('processing', foreground=self.get_status_color("text"), font=('', 10, 'bold'))
 
-        # 4. Мгновенно перекрашиваем статусные надписи
+        # 3. Перекрашиваем статусные надписи
         status_labels = [
             getattr(self, 'lbl_current_text', None),
             getattr(self, 'lbl_direct_status', None),
@@ -1703,40 +1647,16 @@ class TTSApp:
             if lbl and lbl.winfo_exists():
                 try:
                     lbl.config(foreground=self.get_status_color("info"))
-                except Exception as e:
-                    logging.debug(f"Ошибка перекраски статусной метки: {e}")
+                except Exception:
+                    pass
 
     def full_ui_refresh(self):
-        """Полный проход по всем вкладкам для 100% перерисовки шрифтов и тем"""
+        """Обновление значений UI и шрифтов"""
         self._is_updating_ui = True
         try:
-            # 1. Запоминаем текущую активную вкладку
-            try:
-                current_tab = self.notebook.select()
-            except:
-                current_tab = None
-
-            # 2. Выставляем значения переменных из config
             self.set_ui_from_config()
-
-            # 3. Обновляем шрифты во всех текстовых полях
             self.update_fonts()
-
-            # 4. Применяем тему оформления ко всем TTK и tk.Text виджетам
-            self.apply_theme()
-
-            # 5. Быстрый микро-проход по вкладкам для синхронизации буферов
-            for tab in self.notebook.tabs():
-                self.notebook.select(tab)
-                self.root.update_idletasks()
-
-            # 6. Возвращаем пользователя на исходную вкладку
-            if current_tab:
-                self.notebook.select(current_tab)
-
-            # 7. Финальное обновление кадра
             self.root.update_idletasks()
-            self.root.update()
         finally:
             self._is_updating_ui = False
 
@@ -1898,7 +1818,6 @@ class TTSApp:
                 try: self.font_size_var.set(int(self.config["ui_font_size"]))
                 except: pass
     
-            self.apply_theme()
         finally:
             self._is_updating_ui = False
 
@@ -2149,8 +2068,9 @@ class TTSApp:
         self.btn_direct_play.pack(side=tk.LEFT, padx=10)
 
     def play_audio_segment(self, audio_segment):
-        """Проигрывает готовый аудиосегмент через системный плеер"""
+        """Проигрывает готовый аудиосегмент с гарантированным удалением temp-файла"""
         def _play():
+            temp_path = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                     temp_path = f.name
@@ -2162,10 +2082,13 @@ class TTSApp:
                     subprocess.call(["afplay", temp_path])
                 else:
                     subprocess.call(["aplay", temp_path])
-                    
-                os.remove(temp_path)
             except Exception as e:
                 logging.error(f"Ошибка воспроизведения: {e}")
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    try: os.remove(temp_path)
+                    except: pass
+
         threading.Thread(target=_play, daemon=True).start()
 
     def play_audio_file(self, filepath):
@@ -2255,7 +2178,7 @@ class TTSApp:
         single_file = self.settings_vars["import_single_file"].get()
         
         self.btn_import_start.config(state=tk.DISABLED)
-        self.lbl_import_status.config(text="Анализ и извлечение текста...", foreground=self.get_fg_color())
+        self.lbl_import_status.config(text="Анализ и извлечение текста...", foreground=self.get_status_color("text"))
         
         def run():
             try:
@@ -3143,7 +3066,7 @@ class TTSApp:
                         files = self.export_tree.get_children(g_id)
                         if not files: continue
                         
-                        self.root.after(0, lambda n=g_name: self.lbl_export_status.config(text=f"Обработка: {n}...", foreground=self.get_fg_color()))
+                        self.root.after(0, lambda n=g_name: self.lbl_export_status.config(text=f"Обработка: {n}...", foreground=self.get_status_color("text")))
 
                         if g_set["merge"]:
                             final_audio = AudioSegment.empty()
@@ -3221,7 +3144,7 @@ class TTSApp:
                         f_set = self.export_files[f_id]
                         fp = f_set["path"]
                         
-                        self.root.after(0, lambda f=f_set['title']: self.lbl_export_status.config(text=f"Конвертация: {f}...", foreground=self.get_fg_color()))
+                        self.root.after(0, lambda f=f_set['title']: self.lbl_export_status.config(text=f"Конвертация: {f}...", foreground=self.get_status_color("text")))
                         audio = AudioSegment.from_file(fp)
                         
                         if apply_fx:
@@ -3304,7 +3227,6 @@ class TTSApp:
         tab_cache = ttk.Frame(set_notebook, padding=10)
         tab_effects = ttk.Frame(set_notebook, padding=10)
         tab_output = ttk.Frame(set_notebook, padding=10)
-        tab_ui = ttk.Frame(set_notebook, padding=10)
         
         set_notebook.add(tab_api, text="API и Лимиты")
         set_notebook.add(tab_folders, text="Папки")
@@ -3312,7 +3234,6 @@ class TTSApp:
         set_notebook.add(tab_cache, text="Обработка и Кэш")
         set_notebook.add(tab_effects, text="Эффекты (Постобработка)")
         set_notebook.add(tab_output, text="Вывод и Теги")
-        set_notebook.add(tab_ui, text="Интерфейс")
 
         def add_entry(parent, label, key, row, vtype=tk.StringVar):
             ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2, padx=5)
@@ -3474,34 +3395,7 @@ class TTSApp:
         tags_frame.columnconfigure(1, weight=1)
         tags_frame.columnconfigure(3, weight=1)
 
-        # 7. Интерфейс
-        ttk.Label(tab_ui, text="Тема оформления:").grid(row=0, column=0, sticky=tk.W, pady=10, padx=5)
-        if "ui_theme" not in self.settings_vars:
-            self.settings_vars["ui_theme"] = tk.StringVar(value=self.config.get("ui_theme", "default"))
-        theme_cb = ttk.Combobox(tab_ui, textvariable=self.settings_vars["ui_theme"], values=["light", "dark"], state="readonly", width=15)
-        theme_cb.grid(row=0, column=1, sticky=tk.W, pady=10, padx=5)
-        
-        def on_theme_change(event=None):
-            def _apply():
-                new_theme = self.settings_vars["ui_theme"].get()
-                self.config["ui_theme"] = new_theme
-                self.apply_theme()
-                self.save_settings()
-            
-            # 💡 ДАЕМ ВЫПАДАЮЩЕМУ СПИСКУ 10 МС СПОКОЙНО ЗАКРЫТЬСЯ (Защита от Deadlock на Mac)
-            self.root.after(10, _apply)
-
-        theme_cb.bind("<<ComboboxSelected>>", on_theme_change)
-
-        # Выпадающий список размера шрифта
-        ttk.Label(tab_ui, text="Размер шрифта:").grid(row=1, column=0, sticky=tk.W, pady=10, padx=5)
-        font_cb = ttk.Combobox(tab_ui, textvariable=self.font_size_var, values=[10, 12, 14, 16, 18, 20, 24], state="readonly", width=15)
-        font_cb.grid(row=1, column=1, sticky=tk.W, pady=10, padx=5)
-        
-        # 💡 Отложенный вызов обновления шрифтов (Защита от Deadlock на Mac)
-        font_cb.bind("<<ComboboxSelected>>", lambda e: self.root.after(10, self.update_fonts))
-
-        for tab in (tab_api, tab_folders, tab_pauses, tab_cache, tab_effects, tab_output, tab_ui):
+        for tab in (tab_api, tab_folders, tab_pauses, tab_cache, tab_effects, tab_output):
             tab.columnconfigure(1, weight=1)
 
         self.set_ui_from_config()
@@ -4011,19 +3905,7 @@ class TTSApp:
 4. Готовые аудиофайлы появятся в папке output_audio.
 
 ====================================================================
-🎨 2. ТЕМЫ ОФОРМЛЕНИЯ И АДАПТИВНЫЙ ИНТЕРФЕЙС
-====================================================================
-Во вкладке "Настройки" -> "Интерфейс" доступен выбор темы оформления (при установленной библиотеке sv-ttk):
-
-• Светлая тема (Light) / Темная тема (Dark):
-  Мгновенное переключение визуала без перезапуска программы.
-• Адаптивные цвета текста:
-  Все статусы, индикаторы и сервисные надписи автоматически меняют цвет на контрастный бежевый/белый в темной теме, полностью исключая "слепые" зоны текста.
-• Скрытие консольных окон (Windows):
-  Все вызовы внешних утилит (FFmpeg, ffprobe) выполняются в бесшумном фоновом режиме без всплывающих черных окон командной строки.
-
-====================================================================
-🎙 3. РЕЖИМЫ СИНТЕЗА (SYNTHESIS MODES)
+🎙 2. РЕЖИМЫ СИНТЕЗА (SYNTHESIS MODES)
 ====================================================================
 В "Настройках" -> "Вывод и Теги" доступно 3 режима генерации:
 
@@ -4043,7 +3925,7 @@ class TTSApp:
   - Защита: Включает встроенную защиту от переполнения (SAFE_LIMIT = 30 000 символов). Если глава слишком большая, программа автоматически разрывает блок по границам абзацев и вставляет паузу.
 
 ====================================================================
-⚡ 4. ПРЯМОЙ СИНТЕЗ (ЛАБОРАТОРИЯ ТЕСТОВ)
+⚡ 3. ПРЯМОЙ СИНТЕЗ (ЛАБОРАТОРИЯ ТЕСТОВ)
 ====================================================================
 Вкладка "Прямой синтез" предназначена для быстрой озвучки произвольного текста:
 
@@ -4056,7 +3938,7 @@ class TTSApp:
 • Эффекты: Индивидуальные ползунки скорости, тона и эхо. Нажатие кнопки "💾 Сделать глобальными" мгновенно применяет эти эффекты ко всем настройкам программы.
 
 ====================================================================
-⏱ 5. ТОНКАЯ НАСТРОЙКА ПАУЗ И РАЗДЕЛИТЕЛЕЙ
+⏱ 4. ТОНКАЯ НАСТРОЙКА ПАУЗ И РАЗДЕЛИТЕЛЕЙ
 ====================================================================
 Во вкладке "Настройки" -> "Паузы и Разделители" вы можете настроить идеальный ритм повествования (длительность указывается в миллисекундах, 1000 мс = 1 сек):
 
@@ -4069,7 +3951,7 @@ class TTSApp:
   Вы можете ввести любые символы-разделители частей (каждый с новой строки). Когда программа встречает такой символ в тексте, она полностью вырезает его и вставляет на его место чистую тишину заданной длины ("Пауза разделителя").
 
 ====================================================================
-⚙️ 6. ПОЛНЫЙ ЦИКЛ ОБРАБОТКИ И НОРМАЛИЗАЦИИ ТЕКСТА
+⚙️ 5. ПОЛНЫЙ ЦИКЛ ОБРАБОТКИ И НОРМАЛИЗАЦИИ ТЕКСТА
 ====================================================================
 Чтобы нейросеть правильно озвучила текст, программа бережно обрабатывает каждую фразу строго в следующем порядке:
 
@@ -4084,7 +3966,7 @@ class TTSApp:
 9. Очистка: Удаляются лишние кавычки, скобки и спецсимволы, после чего чистая фраза уходит в API.
 
 ====================================================================
-📖 7. ИМПОРТ И НАРЕЗКА КНИГ (EPUB, FB2, DOCX, TXT)
+📖 6. ИМПОРТ И НАРЕЗКА КНИГ (EPUB, FB2, DOCX, TXT)
 ====================================================================
 Вкладка "Импорт книг" позволяет мгновенно подготовить любую электронную книгу к озвучке:
 
@@ -4097,7 +3979,7 @@ class TTSApp:
 • Сохранение в один файл: Галочка позволяет извлечь весь текст книги в один монолитный txt-файл.
 
 ====================================================================
-📚 8. ГЛОССАРИЙ: УДАРЕНИЯ, ТЕРМИНЫ И REGEX
+📚 7. ГЛОССАРИЙ: УДАРЕНИЯ, ТЕРМИНЫ И REGEX
 ====================================================================
 Вкладка "Глоссарий" редактирует файл glossary.json и устраняет ошибки произношения:
 
@@ -4108,7 +3990,7 @@ class TTSApp:
 • Управление шрифтом: В правом верхнем углу расположен выпадающий список размера шрифта (10–24) для комфортного чтения редактора.
 
 ====================================================================
-🎛 9. АУДИОЭФФЕКТЫ И ПОСТОБРАБОТКА (FFMPEG)
+🎛 8. АУДИОЭФФЕКТЫ И ПОСТОБРАБОТКА (FFMPEG)
 ====================================================================
 Вы можете менять звучание голоса БЕЗ повторных запросов к API и БЕЗ траты лимитов! Эффекты накладываются локально через FFmpeg:
 
@@ -4120,7 +4002,7 @@ class TTSApp:
 Эффекты можно настраивать во вкладках "Прямой синтез", "Кэш", "Экспорт и Сборка", а также глобально в "Настройках".
 
 ====================================================================
-🎵 10. ЭКСПОРТ И СБОРКА (АУДИОКНИГИ, ТЕГИ, ОБЛОЖКИ)
+🎵 9. ЭКСПОРТ И СБОРКА (АУДИОКНИГИ, ТЕГИ, ОБЛОЖКИ)
 ====================================================================
 Вкладка "Экспорт и Сборка" — это полноценный комбайн для компиляции готовых аудиофайлов:
 
@@ -4140,7 +4022,7 @@ class TTSApp:
   - [🔄 Ко всем элементам]: Применяет теги абсолютно ко всем группам и файлам.
 
 ====================================================================
-💾 11. УПРАВЛЕНИЕ КЭШЕМ И БЕЗОПАСНОСТЬ
+💾 10. УПРАВЛЕНИЕ КЭШЕМ И БЕЗОПАСНОСТЬ
 ====================================================================
 • Пропуск готовых файлов: При повторном запуске программа проверяет папку вывода и продолжает работу с того места, где остановилась.
 • Раздельное управление (LRU / TTL): В "Настройках" -> "Обработка и Кэш" вы можете независимо включать ограничение по максимальному количеству записей (LRU) или по времени жизни в часах (TTL).
@@ -4150,7 +4032,7 @@ class TTSApp:
 • Архивирование: Возможность упаковать весь кэш в ZIP-архив.
 
 ====================================================================
-⚡ 12. ЛИМИТЫ, КНОПКИ ОСТАНОВКИ И БЕЗОПАСНОСТЬ
+⚡ 11. ЛИМИТЫ, КНОПКИ ОСТАНОВКИ И БЕЗОПАСНОСТЬ
 ====================================================================
 Во вкладке "Настройки" -> "API и Лимиты" вы можете гибко управлять нагрузкой на сеть и процессор:
 
@@ -4164,11 +4046,11 @@ class TTSApp:
 • Кнопка "☠️ Принудительно": Экстренная остановка. Мгновенно разрывает сетевые сокеты HTTP-сессии, гарантируя немедленный останов потока и сброс накопившегося кэша на диск без создания "потоков-зомби".
 
 ====================================================================
-📁 13. ОСОБЕННОСТИ РАБОТЫ НА РАЗНЫХ ОС
+📁 12. ОСОБЕННОСТИ РАБОТЫ НА РАЗНЫХ ОС
 ====================================================================
 • macOS (.app): Из-за системных ограничений Apple (Gatekeeper) скомпилированное приложение автоматически работает через папку Документы (`~/Documents/SileroTTS_Studio/`).
 • Нативные горячие клавиши (macOS): Прямая интеграция с системным буфером обмена (NSPasteboard / pbcopy / pbpaste) гарантирует работу ⌘C, ⌘V, ⌘X, ⌘A, ⌘Z при любой раскладке клавиатуры.
-• Атомарное выделение (macOS): Клик с зажатой клавишей ⌘ позволяет выделять и снимать выделение со строк в таблицах без "призрачных" артефактов.
+• Атомарное выделение (macOS): Клик с зажатой клавишей ⌘ позволяет выделять и снимать выделение со строк в таблицах.
 • Portable-режим: При запуске `.py` файла через консоль (на Mac, Windows, Linux) или `.exe` на Windows программа работает в полностью портативном режиме — все рабочие папки создаются строго рядом со скриптом.
 """
 
@@ -4195,7 +4077,7 @@ class TTSApp:
         self.total_progress['value'] = 0
         self.file_progress['value'] = 0
         self.lbl_file_pct.config(text="0%")
-        self.lbl_current_text.config(text="Ожидание...", foreground=self.get_fg_color())
+        self.lbl_current_text.config(text="Ожидание...", foreground=self.get_status_color("text"))
 
     def remove_selected_from_queue(self):
         selected = self.tree.selection()
@@ -4245,7 +4127,7 @@ class TTSApp:
         self.file_progress['value'] = 0
         self.lbl_file_pct.config(text="0%")
         self.lbl_total_pct.config(text=f"0/{len(items_to_process)}")
-        self.lbl_current_text.config(text="Подготовка...", foreground=self.get_fg_color())
+        self.lbl_current_text.config(text="Подготовка...", foreground=self.get_status_color("text"))
         
         self.processor = TTSProcessor(self.config, error_callback=self.show_critical_error)
         self.processing_thread = threading.Thread(target=self.process_queue, args=(items_to_process,))
@@ -4282,7 +4164,7 @@ class TTSApp:
         self.btn_stop.config(state=tk.DISABLED)
         self.btn_hard_stop.config(state=tk.DISABLED)
         
-        self.lbl_current_text.config(text="Ожидание...", foreground=self.get_fg_color())
+        self.lbl_current_text.config(text="Ожидание...", foreground=self.get_status_color("text"))
         if self.processor and self.processor.is_stopped:
             if self.lbl_current_text.cget("text") != "Принудительно остановлено. Кэш сохранен.":
                 messagebox.showwarning("Остановлено", "Обработка была прервана.")
@@ -4341,7 +4223,10 @@ class TTSApp:
                 if not self.processor.is_stopped:
                     self.root.after(0, self.update_file_status, filepath.name, "encoding")
 
-            for t in self.processor.active_threads: t.join()
+            for t in self.processor.active_threads: 
+                if t.is_alive():
+                    t.join()
+            self.processor.active_threads.clear()
             
         except Exception as e:
             logging.error(f"Критическая ошибка в очереди синтеза: {e}")
@@ -4372,7 +4257,7 @@ class TTSApp:
             self.btn_direct_start.config(state=tk.DISABLED)
             self.btn_direct_stop.config(state=tk.NORMAL)
             self.btn_direct_hard_stop.config(state=tk.NORMAL)
-            self.lbl_direct_status.config(text="Обработка...", foreground=self.get_fg_color())
+            self.lbl_direct_status.config(text="Обработка...", foreground=self.get_status_color("text"))
             
             self.processor = TTSProcessor(self.config, error_callback=self.show_critical_error)
             
@@ -4393,9 +4278,14 @@ class TTSApp:
                         self.play_audio_file(audio)
                     
                 self.processor.process_raw_text(text, filename, force_new=force, save_to_disk=save_file, progress_callback=on_progress, completion_callback=on_complete)
-                for t in self.processor.active_threads: t.join()
+                # Дожидаемся завершения кодирования
+                for t in self.processor.active_threads: 
+                    if t.is_alive():
+                        t.join()
+                # Очищаем память от завершенных потоков сборки
+                self.processor.active_threads.clear()
     
-            self.direct_thread = threading.Thread(target=run_direct)
+            self.direct_thread = threading.Thread(target=run_direct, daemon=True)
             self.direct_thread.start()
 
     def stop_direct_processing(self):
@@ -4487,35 +4377,6 @@ class TTSApp:
             messagebox.showerror("Ошибка JSON", f"Исправьте ошибки в редакторе перед экспортом:\n{e}")
 
 if __name__ == "__main__":
-    # 1. Исправление HiDPI масштабирования для Windows (125%, 150%, 200% экраны)
-    if sys.platform.startswith('win'):
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            pass
-
     root = tk.Tk()
-    
-    # 2. Исправление HiDPI для Linux Ubuntu (Wayland / X11)
-    if sys.platform.startswith('linux'):
-        try:
-            scale_factor = root.winfo_fpixels('1i') / 72.0
-            if scale_factor > 1.0:
-                root.tk.call('tk', 'scaling', scale_factor)
-                
-                from tkinter import font
-                for font_name in font.names():
-                    try:
-                        f = font.nametofont(font_name)
-                        size = f.actual()['size']
-                        # Учитываем как положительный размер (пункты), так и отрицательный (пиксели)
-                        if size != 0:
-                            f.configure(size=int(size * scale_factor * 1.2))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
     app = TTSApp(root)
     root.mainloop()
