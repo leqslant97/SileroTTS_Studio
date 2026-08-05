@@ -36,7 +36,7 @@ if platform.system() == "Windows":
 # --------------------------
 
 is_frozen_mac = (sys.platform == "darwin") and getattr(sys, 'frozen', False)
-'''
+
 # === ПАТЧИ ДЛЯ macOS (.app) ===
 if is_frozen_mac:
     # 1. Лечение бага PyInstaller #1804 (Кликабельность и фокус окна)
@@ -62,7 +62,7 @@ if is_frozen_mac:
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
 # ------------------------------
-'''        
+      
 # Попытка импорта библиотек для работы с электронными книгами
 try:
     import ebooklib
