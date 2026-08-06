@@ -37,30 +37,15 @@ if platform.system() == "Windows":
 
 is_frozen_mac = (sys.platform == "darwin") and getattr(sys, 'frozen', False)
 
-# === ПАТЧИ ДЛЯ macOS (.app) ===
-if is_frozen_mac:
-    # 1. Лечение бага PyInstaller #1804 (Кликабельность и фокус окна)
-    try:
-        import ctypes
-        import ctypes.util
-        appkit_path = ctypes.util.find_library('AppKit')
-        if appkit_path:
-            appkit = ctypes.cdll.LoadLibrary(appkit_path)
-            app_class = appkit.objc_getClass('NSApplication')
-            shared_app_sel = appkit.sel_registerName('sharedApplication')
-            activate_sel = appkit.sel_registerName('activateIgnoringOtherApps:')
-            
-            shared_app = appkit.objc_msgSend(app_class, shared_app_sel)
-            appkit.objc_msgSend(shared_app, activate_sel, True)
-            logging.info("macOS NSApp успешно активирован на переднем плане.")
-    except Exception as e:
-        logging.debug(f"Не удалось принудительно активировать NSApp на Mac: {e}")
-
-    # 2. Защита от сброса FPS в PyInstaller --windowed
-    if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w")
-    if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w")
+# === ЗАЩИТА ОТ СБРОСА В PYINSTALLER --windowed ===
+class NullWriter:
+    def write(self, *args, **kwargs): pass
+    def flush(self, *args, **kwargs): pass
+    
+if sys.stdout is None:
+    sys.stdout = NullWriter()
+if sys.stderr is None:
+    sys.stderr = NullWriter()
 # ------------------------------
       
 # Попытка импорта библиотек для работы с электронными книгами
@@ -154,16 +139,21 @@ if is_frozen_mac:
 # ================= НАСТРОЙКА ЛОГИРОВАНИЯ =================
 file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 file_handler.setLevel(logging.INFO)
-file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%d.%m.%Y %H:%M:%S")
 file_handler.setFormatter(file_formatter)
 
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.ERROR)
-console_formatter = logging.Formatter("[%(levelname)s] %(message)s")
-console_handler.setFormatter(console_formatter)
+handlers = [file_handler]
 
-logging.basicConfig(level=logging.INFO, handlers=[file_handler, console_handler])
+# Добавляем вывод в консоль ТОЛЬКО если она физически существует (не скомпилировано в --windowed)
+if not isinstance(sys.stderr, NullWriter):
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.ERROR)
+    console_formatter = logging.Formatter("[%(levelname)s] %(message)s")
+    console_handler.setFormatter(console_formatter)
+    handlers.append(console_handler)
 
+logging.basicConfig(level=logging.INFO, handlers=handlers)
+# =========================================================
 try:
     from ru_normalizr import NormalizeOptions, Normalizer
     normalizer = Normalizer(NormalizeOptions.tts())
@@ -181,6 +171,7 @@ DEFAULT_CONFIG = {
     "output_dir": DEFAULT_OUTPUT_DIR,
     "cache_dir": DEFAULT_CACHE_DIR,
     "export_dir": "",
+    "last_browse_dir": "",
     
     "output_format": "mp3",
     "output_bitrate": "128k",
@@ -1296,6 +1287,11 @@ class TTSApp:
 
         if sys.platform == "darwin":
             self._setup_mac_hotkeys()
+            # Отложенный жесткий фокус для macOS (имитация клика по окну)
+            self.root.after(500, self._force_mac_focus)
+        else:
+            # Фикс буфера обмена для кириллической раскладки на Windows/Linux
+            self._fix_cyrillic_clipboard()
 
         self.root.after(300, self._silent_pre_warm_tabs)
         
@@ -1317,6 +1313,66 @@ class TTSApp:
                 self.root.after(15, _step)
 
         self.root.after(100, _step)
+
+    def _force_mac_focus(self):
+        """Жестко выводит окно на передний план на macOS после отрисовки"""
+        if is_frozen_mac:
+            try:
+                import ctypes, ctypes.util
+                appkit = ctypes.cdll.LoadLibrary(ctypes.util.find_library('AppKit'))
+                appkit.objc_msgSend(appkit.objc_msgSend(appkit.objc_getClass('NSApplication'), appkit.sel_registerName('sharedApplication')), appkit.sel_registerName('activateIgnoringOtherApps:'), True)
+            except: pass
+        # Трюк Tkinter: делаем окно поверх всех и сразу возвращаем обратно. Это дает окну системный фокус!
+        self.root.attributes('-topmost', True)
+        self.root.update()
+        self.root.attributes('-topmost', False)
+        self.root.focus_force()
+
+    def _fix_cyrillic_clipboard(self):
+        """Чинит кириллицу и добавляет умную вставку (очистка путей) для Win/Linux"""
+        # Копирование, Вырезание, Выделить всё - оставляем нативные (они работают идеально)
+        self.root.bind('<Control-с>', lambda e: self.root.event_generate('<<Copy>>'))
+        self.root.bind('<Control-ч>', lambda e: self.root.event_generate('<<Cut>>'))
+        self.root.bind('<Control-ф>', lambda e: self.root.event_generate('<<SelectAll>>'))
+
+        # А вот вставку перехватываем для стандартного Ctrl+V и кириллического Ctrl+М
+        self.root.bind('<Control-v>', self._smart_win_lin_paste)
+        self.root.bind('<Control-м>', self._smart_win_lin_paste)
+
+    def _smart_win_lin_paste(self, event):
+        """Умная вставка: вычищает кавычки (Windows 11) и file:// (Linux)"""
+        try:
+            clip = self.root.clipboard_get()
+        except Exception:
+            return "break" # Буфер пуст или содержит картинку/файл
+
+        if clip:
+            # Очистка мусора из путей
+            clip = clip.strip()
+            if clip.startswith("file://"):
+                clip = clip[7:]
+            if "%" in clip:
+                try: clip = urllib.parse.unquote(clip)
+                except: pass
+            clip = clip.strip('"\'') # Убираем кавычки от Windows 11 "Copy as path"
+
+            w = event.widget
+            if not isinstance(w, (tk.Text, tk.Entry, ttk.Entry)):
+                w = self.root.focus_get()
+
+            # Безопасная вставка в активный виджет
+            if isinstance(w, tk.Text):
+                if w.tag_ranges(tk.SEL):
+                    w.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                w.insert(tk.INSERT, clip)
+                return "break"
+            elif isinstance(w, (ttk.Entry, tk.Entry)):
+                if w.selection_present():
+                    w.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                w.insert(tk.INSERT, clip)
+                return "break"
+                
+        return "break"
 
     def get_status_color(self, status="info"):
         """Централизованная палитра статусов (WCAG AAA)"""
@@ -1522,22 +1578,41 @@ class TTSApp:
                 logging.debug(f"Ошибка Undo/Redo: {e}")
             return "break"
 
-    def _create_wait_popup(self, title, message):
-        """Создает модальное окно ожидания с бегающим индикатором"""
-        popup = tk.Toplevel(self.root)
-        popup.title(title)
-        popup.geometry("320x100")
-        popup.resizable(False, False)
-        popup.transient(self.root) # Привязывает к главному окну
-        popup.grab_set()           # Блокирует клики по основному окну
+    def _center_popup(self, dialog, width, height):
+        """Центрирует диалоговое окно и мгновенно проявляет его БЕЗ мигания"""
+        self.root.update_idletasks()
         
-        # Центрируем относительного главного окна
-        popup.geometry(f"+{self.root.winfo_x() + 100}+{self.root.winfo_y() + 100}")
+        # Получаем истинные экранные координаты и размеры главного окна
+        p_x = self.root.winfo_rootx()
+        p_y = self.root.winfo_rooty()
+        p_w = self.root.winfo_width()
+        p_h = self.root.winfo_height()
+        
+        # Высчитываем координаты центра
+        x = max(0, p_x + (p_w - width) // 2)
+        y = max(0, p_y + (p_h - height) // 2)
+        
+        # Задаем геометрические координаты
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        
+        # Проявляем окно уже строго в правильной позиции!
+        dialog.deiconify()
+        
+    def _create_wait_popup(self, title, message):
+        popup = tk.Toplevel(self.root)
+        popup.withdraw() # 👈 Прячем при создании
+        
+        popup.title(title)
+        popup.resizable(False, False)
+        popup.transient(self.root)
+        popup.grab_set()
         
         ttk.Label(popup, text=message, font=("", 10)).pack(pady=(15, 5))
         bar = ttk.Progressbar(popup, mode='indeterminate')
         bar.pack(fill=tk.X, padx=20, pady=5)
-        bar.start(10) # Запускаем анимацию
+        bar.start(10)
+        
+        self._center_popup(popup, 320, 100) # 👈 Проявляем в конце
         
         return popup
 
@@ -2235,7 +2310,7 @@ class TTSApp:
         self.export_progress = ttk.Progressbar(prog_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
         self.export_progress.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(10, 0))
 
-        # === 2. ПАНЕЛЬ ЭКСПОРТА (Пакуем над прогресс-баром) ===
+        # === 2. ПАНЕЛЬ ЭКСПОРТА ===
         export_frame = ttk.LabelFrame(frame, text="Экспорт", padding=5)
         export_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
         
@@ -2243,31 +2318,51 @@ class TTSApp:
         row1.pack(fill=tk.X, pady=2)
         ttk.Label(row1, text="Папка:").pack(side=tk.LEFT, padx=5)
         
-        # Читаем отдельный ключ export_dir из конфига
         self.export_outdir_var = tk.StringVar(value=self.config.get("export_dir", ""))
-        
         def choose_exp_dir():
             res = filedialog.askdirectory()
             if res: 
                 self.export_outdir_var.set(res)
                 self.config["export_dir"] = res
                 self.save_settings()
-            
-        ttk.Button(row1, text="📁", width=3, command=choose_exp_dir).pack(side=tk.RIGHT, padx=5)
-        ttk.Entry(row1, textvariable=self.export_outdir_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+                
+        self.btn_export_dir = ttk.Button(row1, text="📁", width=3, command=choose_exp_dir)
+        self.btn_export_dir.pack(side=tk.RIGHT, padx=5)
+        self.ent_export_dir = ttk.Entry(row1, textvariable=self.export_outdir_var)
+        self.ent_export_dir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
         row2 = ttk.Frame(export_frame)
         row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="Формат:").pack(side=tk.LEFT, padx=(5, 2))
         self.export_fmt_var = tk.StringVar(value=self.config.get("output_format", "mp3"))
-        ttk.Combobox(row2, textvariable=self.export_fmt_var, values=["mp3", "wav", "ogg"], width=5, state="readonly").pack(side=tk.LEFT)
+        self.cb_export_fmt = ttk.Combobox(row2, textvariable=self.export_fmt_var, values=["mp3", "wav", "ogg"], width=5, state="readonly")
+        self.cb_export_fmt.pack(side=tk.LEFT)
         
         ttk.Label(row2, text="Битрейт:").pack(side=tk.LEFT, padx=(10, 2))
         self.export_bitrate_var = tk.StringVar(value=self.config.get("output_bitrate", "128k"))
-        ttk.Combobox(row2, textvariable=self.export_bitrate_var, values=["64k", "128k", "192k", "256k", "320k"], width=5, state="readonly").pack(side=tk.LEFT)
+        self.cb_export_bitrate = ttk.Combobox(row2, textvariable=self.export_bitrate_var, values=["64k", "128k", "192k", "256k", "320k"], width=5, state="readonly")
+        self.cb_export_bitrate.pack(side=tk.LEFT)
         
         self.export_apply_fx_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row2, text="Наложить эффекты", variable=self.export_apply_fx_var).pack(side=tk.LEFT, padx=15)
+        self.chk_export_fx = ttk.Checkbutton(row2, text="Наложить эффекты", variable=self.export_apply_fx_var)
+        self.chk_export_fx.pack(side=tk.LEFT, padx=10)
+
+        # НОВАЯ ГАЛОЧКА: Только теги
+        self.export_tags_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row2, text="Только обновить теги (в исходных файлах)", variable=self.export_tags_only_var).pack(side=tk.LEFT, padx=10)
+        
+        # ИСПРАВЛЕНИЕ: Блокировка UI при включении галочки "Только обновить теги"
+        def toggle_export_mode(*args):
+            state = tk.DISABLED if self.export_tags_only_var.get() else tk.NORMAL
+            cb_state = tk.DISABLED if self.export_tags_only_var.get() else "readonly"
+            
+            self.btn_export_dir.config(state=state)
+            self.ent_export_dir.config(state=state)
+            self.cb_export_fmt.config(state=cb_state)
+            self.cb_export_bitrate.config(state=cb_state)
+            self.chk_export_fx.config(state=state)
+            
+        self.export_tags_only_var.trace("w", toggle_export_mode)
         
         self.btn_export_start = ttk.Button(row2, text="🚀 Начать Сборку", command=self.start_export_process)
         self.btn_export_start.pack(side=tk.RIGHT, padx=5)
@@ -2303,45 +2398,49 @@ class TTSApp:
         self.lbl_exp_decay = ttk.Label(row3, text=f"{self.exp_decay_var.get():.1f}", width=3)
         self.lbl_exp_decay.pack(side=tk.LEFT)
         ttk.Scale(row3, from_=0.1, to_=0.8, variable=self.exp_decay_var, command=lambda v: self.lbl_exp_decay.config(text=f"{float(v):.1f}")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-
         ttk.Button(row3, text="🔄 Сброс", command=self.reset_export_fx).pack(side=tk.RIGHT, padx=2)
 
-        # === 3. ПАНЕЛЬ КНОПОК (Пакуем над экспортом) ===
-        mid_frame = ttk.Frame(frame)
-        mid_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
-        
-        self.export_mid_frame = ttk.Frame(frame) # Сохраняем ссылку для блокировки
+        # === 3. ПАНЕЛЬ КНОПОК (В ДВА РЯДА) ===
+        self.export_mid_frame = ttk.Frame(frame)
         self.export_mid_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
         
-        ttk.Button(self.export_mid_frame, text="📁 Добавить группу", command=self.add_export_group).pack(side=tk.LEFT, padx=1)
-        ttk.Button(self.export_mid_frame, text="📂 Добавить папку", command=self.add_export_folder).pack(side=tk.LEFT, padx=1)
-        ttk.Button(self.export_mid_frame, text="🎵 Добавить аудио", command=self.add_export_files).pack(side=tk.LEFT, padx=1)
+        mid_row1 = ttk.Frame(self.export_mid_frame)
+        mid_row1.pack(fill=tk.X, pady=1)
+        ttk.Button(mid_row1, text="📁 Добавить группу", command=self.add_export_group).pack(side=tk.LEFT, padx=1)
+        ttk.Button(mid_row1, text="📂 Добавить папку", command=self.add_export_folder).pack(side=tk.LEFT, padx=1)
+        ttk.Button(mid_row1, text="🎵 Добавить аудио", command=self.add_export_files).pack(side=tk.LEFT, padx=1)
+        ttk.Button(mid_row1, text="📦 В новую группу", command=self.group_selected_into_new).pack(side=tk.LEFT, padx=(10, 1))
+        # ИСПРАВЛЕНИЕ: Разгруппировать перенесено в первый ряд!
+        ttk.Button(mid_row1, text="📤 Разгруппировать", command=self.ungroup_export_items).pack(side=tk.LEFT, padx=1)
         
-        ttk.Button(self.export_mid_frame, text="📦 В новую группу", command=self.group_selected_into_new).pack(side=tk.LEFT, padx=(10, 1))
-        ttk.Button(self.export_mid_frame, text="📤 Разгруппировать", command=self.ungroup_export_items).pack(side=tk.LEFT, padx=1)
-        
-        ttk.Button(self.export_mid_frame, text="➖ Удалить", command=self.remove_export_items).pack(side=tk.LEFT, padx=(10, 1))
-        ttk.Button(self.export_mid_frame, text="⬇", width=3, command=lambda: self.move_export_item(1)).pack(side=tk.LEFT, padx=1)
-        ttk.Button(self.export_mid_frame, text="⬆", width=3, command=lambda: self.move_export_item(-1)).pack(side=tk.LEFT, padx=1)
-        ttk.Button(self.export_mid_frame, text="⏱ Авто-разбивка", command=self.auto_split_export).pack(side=tk.LEFT, padx=(10, 1))
+        mid_row2 = ttk.Frame(self.export_mid_frame)
+        mid_row2.pack(fill=tk.X, pady=1)
+        ttk.Button(mid_row2, text="➖ Удалить", command=self.remove_export_items).pack(side=tk.LEFT, padx=1)
+        ttk.Button(mid_row2, text="⬇", width=3, command=lambda: self.move_export_item(1)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(mid_row2, text="⬆", width=3, command=lambda: self.move_export_item(-1)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(mid_row2, text="⏱ Авто-разбивка", command=self.auto_split_export).pack(side=tk.LEFT, padx=(10, 1))
 
         # === 4. ВЕРХНЯЯ ПАНЕЛЬ С ДЕРЕВОМ ===
+        # Изменены веса, чтобы дерево занимало больше места (weight=4 vs weight=1)
         top_pane = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
         top_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         
         tree_frame = ttk.Frame(top_pane)
-        top_pane.add(tree_frame, weight=3)
+        top_pane.add(tree_frame, weight=4)
         
-        ttk.Label(tree_frame, text="Группы и файлы (Кликните по 'Имя' для сортировки):").pack(anchor=tk.W)
+        # ДОБАВЛЕНО ОБЩЕЕ ВРЕМЯ
+        lbl_tree_header = ttk.Frame(tree_frame)
+        lbl_tree_header.pack(fill=tk.X)
+        ttk.Label(lbl_tree_header, text="Группы и файлы:").pack(side=tk.LEFT)
+        self.lbl_export_total_time = ttk.Label(lbl_tree_header, text="Общее время: 00:00", font=("", 9, "bold"), foreground=self.get_status_color("info"))
+        self.lbl_export_total_time.pack(side=tk.RIGHT, padx=5)
+
         self.export_tree = ttk.Treeview(tree_frame, columns=("duration",), selectmode="extended", height=5)
-        
-        # Привязки Mac и Выделить всё
         if sys.platform == "darwin":
             self.export_tree.bind("<Command-Button-1>", lambda e: self._mac_multiselect(e, self.export_tree))
         self.export_tree.bind("<Control-a>", self._tree_select_all)
         self.export_tree.bind("<Command-a>", self._tree_select_all)
         
-        # Привязка сортировки к заголовку!
         self.export_tree.heading("#0", text="Имя ↕", command=lambda: self._sort_export_tree("#0", False))
         self.export_tree.heading("duration", text="Длительность")
         self.export_tree.column("duration", width=100, anchor=tk.CENTER, stretch=False)
@@ -2353,27 +2452,23 @@ class TTSApp:
         self.export_tree.bind("<<TreeviewSelect>>", self.on_export_tree_select)
         
         self.group_settings_frame = ttk.LabelFrame(top_pane, text="Настройки", padding=5)
-        top_pane.add(self.group_settings_frame, weight=2)
+        top_pane.add(self.group_settings_frame, weight=1)
         
         tmpl_frame = ttk.Frame(self.group_settings_frame)
         tmpl_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
-        # Подсказка про {num:0}
-        ttk.Label(tmpl_frame, text="Шаблон новой группы ({num} или {num:0}):").pack(side=tk.LEFT)
+        ttk.Label(tmpl_frame, text="Шаблон группы:").pack(side=tk.LEFT)
         self.settings_vars["default_group_name"] = tk.StringVar(value=self.config.get("default_group_name", "Том {num}"))
         self.settings_vars["default_group_name"].trace("w", lambda *args: None if getattr(self, '_is_updating_ui', False) else self.save_settings())
         ttk.Entry(tmpl_frame, textvariable=self.settings_vars["default_group_name"]).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        # ------------------------------------------------------------------------
 
-        # Теперь пакуем сами вкладки (они займут всё оставшееся место сверху)
         self.grp_notebook = ttk.Notebook(self.group_settings_frame)
         self.grp_notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         
         self.grp_tab_basic = ttk.Frame(self.grp_notebook, padding=5)
         self.grp_tab_tags = ttk.Frame(self.grp_notebook, padding=5)
         self.grp_notebook.add(self.grp_tab_basic, text="Основные")
-        self.grp_notebook.add(self.grp_tab_tags, text="Теги (ID3)")
+        self.grp_notebook.add(self.grp_tab_tags, text="Теги")
 
-        # Основные настройки
         self.lbl_grp_name = ttk.Label(self.grp_tab_basic, text="Имя группы / Название трека:")
         self.lbl_grp_name.pack(anchor=tk.W, pady=(0, 2))
         self.grp_name_var = tk.StringVar()
@@ -2387,18 +2482,18 @@ class TTSApp:
         
         self.grp_subfolder_var = tk.BooleanVar(value=True)
         self.grp_subfolder_var.trace("w", self.save_export_item_settings)
-        self.chk_subfolder = ttk.Checkbutton(self.grp_tab_basic, text="Сохранять в подпапку (если не склеивать)", variable=self.grp_subfolder_var)
-        self.chk_subfolder.pack(anchor=tk.W, pady=(0, 10))
+        self.chk_subfolder = ttk.Checkbutton(self.grp_tab_basic, text="Сохранять в подпапку", variable=self.grp_subfolder_var)
+        self.chk_subfolder.pack(anchor=tk.W, pady=(0, 5))
         
         ttk.Label(self.grp_tab_basic, text="Пауза между файлами (мс):").pack(anchor=tk.W, pady=(5, 2))
         self.grp_pause_var = tk.IntVar()
         self.grp_pause_var.trace("w", self.save_export_item_settings)
-        pause_frame = ttk.Frame(self.grp_tab_basic)
-        pause_frame.pack(fill=tk.X, pady=(0, 10))
-        self.ent_pause = ttk.Entry(pause_frame, textvariable=self.grp_pause_var, width=10)
-        self.ent_pause.pack(side=tk.LEFT)
-        self.btn_apply_pause = ttk.Button(pause_frame, text="Применить ко всем", command=self.apply_pause_mass)
-        self.btn_apply_pause.pack(side=tk.LEFT, padx=5)
+        self.ent_pause = ttk.Entry(self.grp_tab_basic, textvariable=self.grp_pause_var, width=10)
+        self.ent_pause.pack(anchor=tk.W, pady=(0, 10))
+        
+        # ЭЛЕГАНТНАЯ КНОПКА МАССОВОГО ПРИМЕНЕНИЯ
+        self.btn_mass_apply_basic = ttk.Button(self.grp_tab_basic, text="⚙️ Применить ко всем группам...", command=self.open_mass_apply_dialog)
+        self.btn_mass_apply_basic.pack(anchor=tk.W, pady=5)
         
         # -- Вкладка: Теги --
         tag_grid = ttk.Frame(self.grp_tab_tags)
@@ -2435,7 +2530,6 @@ class TTSApp:
         
         ttk.Separator(self.grp_tab_tags, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         
-        # --- СЕТКА 2х2 ДЛЯ КНОПОК МАССОВОГО ПРИМЕНЕНИЯ ТЕГОВ ---
         btn_grid = ttk.Frame(self.grp_tab_tags)
         btn_grid.pack(fill=tk.X, pady=2)
         btn_grid.columnconfigure(0, weight=1)
@@ -2452,7 +2546,6 @@ class TTSApp:
 
         self.btn_apply_to_all = ttk.Button(btn_grid, text="🔄 Ко всем элементам", command=lambda: self.apply_tags_mass("all"))
         self.btn_apply_to_all.grid(row=1, column=1, sticky="ew", padx=1, pady=1)
-        # --------------------------------------------------------
         
         self.current_selected_export_item = None
         self._disable_export_settings()
@@ -2467,7 +2560,7 @@ class TTSApp:
         # Явно отключаем вложенные элементы
         try:
             self.ent_pause.configure(state=tk.DISABLED)
-            self.btn_apply_pause.configure(state=tk.DISABLED)
+            self.btn_mass_apply_basic.configure(state=tk.DISABLED) # ИСПРАВЛЕНО
             self.btn_apply_to_group_files.configure(state=tk.DISABLED)
             self.btn_apply_to_parent.configure(state=tk.DISABLED)
             self.btn_apply_to_selected.configure(state=tk.DISABLED)
@@ -2487,7 +2580,6 @@ class TTSApp:
         # Явно включаем общие элементы
         try:
             self.ent_pause.configure(state=tk.NORMAL)
-            self.btn_apply_pause.configure(state=tk.NORMAL)
             self.btn_apply_to_selected.configure(state=tk.NORMAL)
             self.btn_apply_to_all.configure(state=tk.NORMAL)
         except: pass
@@ -2496,7 +2588,7 @@ class TTSApp:
             self.chk_merge.configure(state=tk.DISABLED)
             self.chk_subfolder.configure(state=tk.DISABLED)
             self.ent_pause.configure(state=tk.DISABLED)
-            self.btn_apply_pause.configure(state=tk.DISABLED)
+            self.btn_mass_apply_basic.configure(state=tk.DISABLED) # ИСПРАВЛЕНО: Блокируем массовое применение для одиночного файла
             self.lbl_grp_name.config(text="Название трека (Title):")
             self.group_settings_frame.config(text="Настройки файла")
             
@@ -2507,6 +2599,7 @@ class TTSApp:
             else:
                 self.btn_apply_to_parent.configure(state=tk.DISABLED) # Файл в корне
         else:
+            self.btn_mass_apply_basic.configure(state=tk.NORMAL) # ИСПРАВЛЕНО: Включаем для группы
             self.lbl_grp_name.config(text="Имя группы (имя файла/папки):")
             self.group_settings_frame.config(text="Настройки группы")
             
@@ -2593,7 +2686,90 @@ class TTSApp:
             self.export_groups[g_id]["pause"] = val
             
         messagebox.showinfo("Успех", f"Пауза {val} мс применена ко всем группам и сохранена как значение по умолчанию!")
-    
+
+    def update_total_export_duration(self):
+        """Пересчитывает и отображает общее время всех файлов в дереве экспорта"""
+        total_sec = 0.0
+        # Считаем только файлы, чтобы избежать двойного счета групп
+        for f_id, f_data in self.export_files.items():
+            if self.export_tree.exists(f_id):
+                dur_str = self.export_tree.item(f_id, "values")[0]
+                parts = dur_str.split(':')
+                if len(parts) == 3: total_sec += int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+                elif len(parts) == 2: total_sec += int(parts[0])*60 + int(parts[1])
+        
+        self.lbl_export_total_time.config(text=f"Общее время: {self.format_duration(total_sec)}")
+
+
+    def open_mass_apply_dialog(self):
+        if not self.current_selected_export_item or self.current_selected_export_item not in self.export_groups:
+            messagebox.showwarning("Внимание", "Выберите группу-эталон, настройки которой вы хотите применить к остальным.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw() # 👈 1. Мгновенно прячем окно от глаз!
+        
+        dialog.title("Массовое применение")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="Какие настройки текущей группы\nприменить ко всем остальным группам?", justify=tk.CENTER).pack(pady=10)
+        
+        var_merge = tk.BooleanVar(value=True)
+        var_subfolder = tk.BooleanVar(value=True)
+        var_pause = tk.BooleanVar(value=True)
+        var_save_default = tk.BooleanVar(value=False)
+        
+        ttk.Checkbutton(dialog, text="Склеить файлы в один трек", variable=var_merge).pack(anchor=tk.W, padx=30, pady=2)
+        ttk.Checkbutton(dialog, text="Сохранять в подпапку", variable=var_subfolder).pack(anchor=tk.W, padx=30, pady=2)
+        ttk.Checkbutton(dialog, text="Пауза между файлами", variable=var_pause).pack(anchor=tk.W, padx=30, pady=2)
+        
+        ttk.Separator(dialog, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10, padx=10)
+        ttk.Checkbutton(dialog, text="Сохранить эти значения по умолчанию", variable=var_save_default).pack(anchor=tk.W, padx=30, pady=2)
+        
+        def apply_changes():
+            val_merge = self.grp_merge_var.get()
+            val_subfolder = self.grp_subfolder_var.get()
+            try: val_pause = self.grp_pause_var.get()
+            except: val_pause = 1000
+            
+            for g_id, g_data in self.export_groups.items():
+                if var_merge.get(): g_data["merge"] = val_merge
+                if var_subfolder.get(): g_data["subfolder"] = val_subfolder
+                if var_pause.get(): g_data["pause"] = val_pause
+                
+            if var_save_default.get():
+                if var_pause.get(): self.config["default_group_pause"] = val_pause
+                self.save_settings()
+                
+            dialog.destroy()
+            messagebox.showinfo("Успех", "Настройки успешно применены ко всем группам!")
+            
+        ttk.Button(dialog, text="Применить", command=apply_changes).pack(pady=15)
+        
+        # 👈 2. Проявляем окно уже готовым и отцентрированным в самом конце!
+        self._center_popup(dialog, 350, 250)
+        
+        def apply_changes():
+            val_merge = self.grp_merge_var.get()
+            val_subfolder = self.grp_subfolder_var.get()
+            try: val_pause = self.grp_pause_var.get()
+            except: val_pause = 1000
+            
+            for g_id, g_data in self.export_groups.items():
+                if var_merge.get(): g_data["merge"] = val_merge
+                if var_subfolder.get(): g_data["subfolder"] = val_subfolder
+                if var_pause.get(): g_data["pause"] = val_pause
+                
+            if var_save_default.get():
+                if var_pause.get(): self.config["default_group_pause"] = val_pause
+                # Можно добавить сохранение дефолтов merge/subfolder в config, если нужно
+                self.save_settings()
+                
+            dialog.destroy()
+            messagebox.showinfo("Успех", "Настройки успешно применены ко всем группам!")
+            
+        ttk.Button(dialog, text="Применить", command=apply_changes).pack(pady=15)
     def apply_tags_mass(self, scope="group_files"):
         if not self.current_selected_export_item: return
         
@@ -2716,9 +2892,26 @@ class TTSApp:
         if getattr(self, '_export_lock', False): return
         
         if files is None:
-            files = filedialog.askopenfilenames(filetypes=[("Audio Files", "*.mp3 *.wav *.ogg")])
+            # Берём последний зафиксированный путь
+            last_dir = self.config.get("last_browse_dir", "")
+            init_dir = last_dir if last_dir and os.path.exists(last_dir) else None
+            
+            files = filedialog.askopenfilenames(
+                initialdir=init_dir,
+                filetypes=[("Audio Files", "*.mp3 *.wav *.ogg")]
+            )
         if not files: return
-        
+
+        # Запоминаем папку первого выбранного файла
+        chosen_dir = str(Path(files[0]).parent)
+        self.config["last_browse_dir"] = chosen_dir
+
+        if not self.export_outdir_var.get().strip():
+            self.export_outdir_var.set(chosen_dir)
+            self.config["export_dir"] = chosen_dir
+            
+        self.save_settings()
+
         self._export_lock = True
         self._set_export_ui_state(tk.DISABLED)
         
@@ -2726,11 +2919,13 @@ class TTSApp:
             if target_group is None:
                 selected = self.export_tree.selection()
                 if selected:
-                    target_group = selected[0]
-                    if self.export_tree.parent(target_group): 
-                        target_group = self.export_tree.parent(target_group)
+                    sel_item = selected[0]
+                    if sel_item in self.export_groups:
+                        target_group = sel_item # Если выделена группа -> добавляем в эту группу
+                    else:
+                        target_group = self.export_tree.parent(sel_item) # Если выделен файл -> берем его родителя (если файл в корне, вернет "")
                 else:
-                    target_group = ""  # Добавляем прямо в корень!
+                    target_group = ""  # Ничего не выделено -> добавляем в корень!
             
             existing_paths = set()
             for child in self.export_tree.get_children(target_group):
@@ -2756,8 +2951,8 @@ class TTSApp:
                         
                         # Отправляем пачку в UI каждые 10 файлов ИЛИ если это последний файл
                         if len(batch_data) >= 10 or (i + 1) == total_files:
-                            # Копируем данные, чтобы фоновый поток мог безопасно очистить batch_data
-                            def update_ui(batch=batch_data.copy(), curr=i+1):
+                            # ИСПРАВЛЕНИЕ: Передаем аргументы явно, чтобы избежать проблемы замыканий Python
+                            def update_ui(batch, curr):
                                 for fid, fp, m in batch:
                                     self.export_files[fid] = {
                                         "path": fp, "title": m["title"], "artist": m["artist"],
@@ -2769,13 +2964,15 @@ class TTSApp:
                                 
                                 self.lbl_export_status.config(text=f"Добавлено {curr}/{total_files}...", foreground=self.get_status_color("warning"))
                             
-                            self.root.after(0, update_ui)
+                            self.root.after(0, update_ui, batch_data.copy(), i+1)
                             batch_data.clear() # Очищаем накопитель для следующей пачки
                         
                     # Финализация
                     def finish_ui():
                         if target_group != "":
                             self.update_group_duration(target_group)
+                        
+                        self.update_total_export_duration()
                         
                         if added_count == 0:
                             self.lbl_export_status.config(text="Файлы уже присутствуют.", foreground=self.get_status_color("info"))
@@ -2806,8 +3003,17 @@ class TTSApp:
         if getattr(self, '_export_lock', False):
              messagebox.showwarning("Занято", "Дождитесь окончания предыдущего импорта файлов.")
              return
-        folder = filedialog.askdirectory()
+             
+        # Берём последний зафиксированный путь
+        last_dir = self.config.get("last_browse_dir", "")
+        init_dir = last_dir if last_dir and os.path.exists(last_dir) else None
+        
+        folder = filedialog.askdirectory(initialdir=init_dir)
         if not folder: return
+        
+        # Запоминаем родительскую папку выбранной директории
+        self.config["last_browse_dir"] = str(Path(folder).parent)
+        self.save_settings()
         
         create_group = messagebox.askyesno("Добавление папки", f"Создать отдельную группу для папки '{Path(folder).name}'?\n\nДа - создать группу\nНет - добавить файлы в корень (или текущую группу)")
         
@@ -2827,7 +3033,9 @@ class TTSApp:
             if platform.system() == "Windows":
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            out = subprocess.check_output(cmd, startupinfo=startupinfo)
+                
+            # ИСПРАВЛЕНИЕ: Декодируем байты в строку для надежного парсинга JSON
+            out = subprocess.check_output(cmd, startupinfo=startupinfo).decode('utf-8', errors='ignore')
             data = json.loads(out)
             
             tags = {k.lower(): v for k, v in data.get("format", {}).get("tags", {}).items()}
@@ -2848,20 +3056,29 @@ class TTSApp:
                 if cover_file.exists():
                     cover_path = str(cover_file.resolve())
 
+            # ИСПРАВЛЕНИЕ: Расширенный поиск ключей тегов (включая сырые ID3)
+            title = tags.get("title", tags.get("tit2", Path(filepath).stem))
+            artist = tags.get("artist", tags.get("tpe1", ""))
+            album = tags.get("album", tags.get("talb", ""))
+            album_artist = tags.get("album_artist", tags.get("albumartist", tags.get("tpe2", "")))
+            genre = tags.get("genre", tags.get("tcon", ""))
+            composer = tags.get("composer", tags.get("tcom", ""))
+            year = tags.get("date", tags.get("year", tags.get("tyer", tags.get("tdrc", ""))))
+
             return {
                 "duration": duration,
-                "title": tags.get("title", Path(filepath).stem),
-                "artist": tags.get("artist", ""),
-                "album": tags.get("album", ""),
-                "album_artist": tags.get("album_artist", ""),
-                "genre": tags.get("genre", ""),
-                "composer": tags.get("composer", ""),
-                "year": tags.get("date", tags.get("year", "")),
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "album_artist": album_artist,
+                "genre": genre,
+                "composer": composer,
+                "year": year,
                 "cover": cover_path
             }
         except Exception as e:
             logging.error(f"Ошибка чтения метаданных {filepath}: {e}")
-            return {"duration": 0.0, "title": Path(filepath).stem, "artist": "", "album": "", "composer": "", "year": "", "cover": ""}
+            return {"duration": 0.0, "title": Path(filepath).stem, "artist": "","album_artist":"","genre":"", "album": "", "composer": "", "year": "", "cover": ""}
 
     def format_duration(self, seconds):
         m, s = divmod(int(seconds), 60)
@@ -2877,22 +3094,42 @@ class TTSApp:
             if len(parts) == 3: total_sec += int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
             elif len(parts) == 2: total_sec += int(parts[0])*60 + int(parts[1])
         self.export_tree.item(group_id, values=(self.format_duration(total_sec),))
+        self.update_total_export_duration()
 
     def remove_export_items(self):
+        """Безопасное удаление элементов с защитой от фантомных дочерних узлов"""
         selected = self.export_tree.selection()
         groups_to_update = set()
-        
+
         for item in selected:
+            # 1. Защита: Если элемент уже был удален ранее (вместе со своей родитеской группой)
+            if not self.export_tree.exists(item):
+                if item in self.export_groups: del self.export_groups[item]
+                if item in self.export_files: del self.export_files[item]
+                continue
+
+            # 2. Если это ГРУППА
             if item in self.export_groups:
+                # Удаляем из памяти словаря все входящие в нее файлы
+                for child in self.export_tree.get_children(item):
+                    if child in self.export_files:
+                        del self.export_files[child]
                 del self.export_groups[item]
+                self.export_tree.delete(item)
+
+            # 3. Если это ОДИНОЧНЫЙ ФАЙЛ
             elif item in self.export_files:
-                del self.export_files[item]
                 parent = self.export_tree.parent(item)
                 if parent: groups_to_update.add(parent)
-            self.export_tree.delete(item)
-            
+                del self.export_files[item]
+                self.export_tree.delete(item)
+
+        # Пересчитываем длительность для оставшихся групп и общее время
         for g in groups_to_update:
-            if self.export_tree.exists(g): self.update_group_duration(g)
+            if self.export_tree.exists(g): 
+                self.update_group_duration(g)
+                
+        self.update_total_export_duration()
 
     def auto_split_export(self):
         all_files = []
@@ -2905,8 +3142,10 @@ class TTSApp:
             return
 
         dialog = tk.Toplevel(self.root)
+        dialog.withdraw() # 👈 Прячем при создании
         dialog.title("Авто-разбивка")
-        dialog.geometry("350x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
         
         ttk.Label(dialog, text="Максимальная длительность группы (минут):").pack(pady=(10, 0))
         limit_var = tk.IntVar(value=60)
@@ -2972,13 +3211,55 @@ class TTSApp:
                 self.update_group_duration(g_id)
             
         ttk.Button(dialog, text="Разбить", command=do_split).pack(pady=10)
-
+        
+        self._center_popup(dialog, 350, 220)
+        
     # --- Процесс Экспорта ---
     def stop_export_process(self):
         self.is_export_stopped = True
         self.btn_export_stop.config(state=tk.DISABLED)
         self.lbl_export_status.config(text="Остановка сборки (ожидание завершения текущего файла)...", foreground=self.get_status_color("warning"))
 
+    def _update_file_tags_inplace(self, fp, f_tags, cov, title_for_status):
+        """Обновляет теги файла прямо в его исходной папке на диске без конвертации"""
+        self.root.after(0, lambda f=title_for_status: self.lbl_export_status.config(text=f"Обновление тегов: {f}...", foreground=self.get_status_color("warning")))
+
+        temp_file = Path(fp).with_suffix(f".tmp_{uuid.uuid4().hex[:6]}{Path(fp).suffix}")
+        cmd = [get_ffmpeg_path(), "-y", "-i", str(fp)]
+
+        ext = Path(fp).suffix.lower()
+        if cov and os.path.exists(cov):
+            cmd.extend(["-i", str(cov), "-map", "0:a", "-map", "1:v"])
+            if ext == ".mp3":
+                cmd.extend(["-c:a", "copy", "-c:v", "mjpeg", "-id3v2_version", "3", "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"])
+            else:
+                cmd.extend(["-c:a", "copy", "-c:v", "copy", "-disposition:v", "attached_pic"])
+        else:
+            cmd.extend(["-c", "copy"])
+
+        if f_tags:
+            for k, v in f_tags.items():
+                if v: cmd.extend(["-metadata", f"{k}={v}"])
+
+        cmd.append(str(temp_file))
+
+        startupinfo = None
+        if platform.system() == "Windows":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
+        if res.returncode == 0 and temp_file.exists():
+            try:
+                shutil.move(str(temp_file), str(fp))
+            except Exception as e_m:
+                logging.error(f"Не удалось заменить файл {fp}: {e_m}")
+                if temp_file.exists(): os.remove(temp_file)
+        else:
+            err_log = res.stderr.decode('utf-8', errors='ignore') if res.stderr else "Неизвестная ошибка"
+            logging.error(f"Ошибка FFmpeg при обновлении тегов {fp}:\n{err_log}")
+            if temp_file.exists(): os.remove(temp_file)
+    
     def start_export_process(self):
         items = self.export_tree.get_children()
         if not items:
@@ -2999,8 +3280,11 @@ class TTSApp:
             messagebox.showwarning("Нет файлов", "Добавьте аудиофайлы перед началом сборки.")
             return
         
+        # ИСПРАВЛЕНИЕ: Если включено "Только теги", игнорируем пустую папку!
+        tags_only = self.export_tags_only_var.get()
         out_dir_str = self.export_outdir_var.get().strip()
-        if not out_dir_str:
+        
+        if not tags_only and not out_dir_str:
             messagebox.showwarning("Папка не выбрана", "Пожалуйста, укажите папку для сохранения результатов экспорта.")
             chosen = filedialog.askdirectory()
             if chosen:
@@ -3011,8 +3295,9 @@ class TTSApp:
             else:
                 return
 
-        out_dir = Path(out_dir_str)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = Path(out_dir_str) if out_dir_str else None
+        if out_dir and not tags_only:
+            out_dir.mkdir(parents=True, exist_ok=True)
 
         self.save_settings() 
         self.btn_export_start.config(state=tk.DISABLED)
@@ -3022,10 +3307,12 @@ class TTSApp:
         
         def run_export():
             try:
-                total_items = len(items)
-                apply_fx = self.export_apply_fx_var.get()
+                total_files = len(self.export_files)
+                processed_files = 0
+                tags_only = self.export_tags_only_var.get()
                 
-                if apply_fx:
+                apply_fx = self.export_apply_fx_var.get()
+                if apply_fx and not tags_only:
                     sp = float(self.exp_speed_var.get())
                     pt = float(self.exp_pitch_var.get())
                     ec = bool(self.exp_echo_var.get())
@@ -3048,123 +3335,179 @@ class TTSApp:
                     if settings_dict.get("year"): t["date"] = settings_dict["year"]
                     return t
 
-                for item_idx, item_id in enumerate(items):
-                    if self.is_export_stopped: break
-                    
-                    # === СЦЕНАРИЙ А: ЭТО ГРУППА ===
-                    if item_id in self.export_groups:
-                        g_id = item_id
-                        g_set = self.export_groups[g_id]
-                        g_name = g_set["name"]
-                        files = self.export_tree.get_children(g_id)
-                        if not files: continue
-                        
-                        self.root.after(0, lambda n=g_name: self.lbl_export_status.config(text=f"Обработка: {n}...", foreground=self.get_status_color("text")))
+                # =========================================================================
+                # РЕЖИМ 1: ТОЛЬКО ТЕГИ (Обновление прямо в исходных папках файлов)
+                # =========================================================================
+                if tags_only:
+                    for item_id in items:
+                        if self.is_export_stopped: break
 
-                        if g_set["merge"]:
-                            final_audio = AudioSegment.empty()
-                            pause_ms = g_set["pause"]
-                            if apply_fx and sp != 1.0: pause_ms = int(pause_ms / sp)
-                            pause_seg = AudioSegment.silent(duration=pause_ms)
+                        # ЭТО ГРУППА
+                        if item_id in self.export_groups:
+                            g_set = self.export_groups[item_id]
+                            g_tags = build_tags(g_set)
+                            files = self.export_tree.get_children(item_id)
 
-                            first_f_set = self.export_files.get(files[0], {})
-                            for key in ["artist", "album", "album_artist", "genre", "composer", "year", "cover"]:
-                                if not g_set.get(key) and first_f_set.get(key):
-                                    g_set[key] = first_f_set[key]
-                            
-                            for i, f_id in enumerate(files):
+                            for f_id in files:
                                 if self.is_export_stopped: break
-                                fp = self.export_files[f_id]["path"]
-                                final_audio += AudioSegment.from_file(fp)
-                                if i < len(files) - 1 and pause_ms > 0: final_audio += pause_seg
-                                
-                            if self.is_export_stopped: break
-                                
-                            if apply_fx:
-                                self.root.after(0, lambda: self.lbl_export_status.config(text=f"Применение эффектов и сохранение {g_name}...", foreground=self.get_status_color("warning")))
-                                final_audio = AudioEffects.apply_effects(final_audio, speed=sp, pitch=pt, echo=ec, echo_delay=ed, echo_decay=ey)
-                            else:
-                                self.root.after(0, lambda: self.lbl_export_status.config(text=f"Сохранение {g_name}...", foreground=self.get_status_color("warning")))
-                            
-                            export_kwargs = {"format": fmt}
-                            if fmt == "mp3": export_kwargs["bitrate"] = bitrate
-                            
-                            g_set["title"] = g_name
-                            tags = build_tags(g_set)
-                            if tags: export_kwargs["tags"] = tags
-                            if g_set.get("cover") and os.path.exists(g_set["cover"]): export_kwargs["cover"] = g_set["cover"]
-                                
-                            out_file = out_dir / f"{g_name}.{fmt}"
-                            final_audio.export(out_file, **export_kwargs)
-                            
-                        else:
-                            target_dir = out_dir / g_name if g_set.get("subfolder") else out_dir
-                            target_dir.mkdir(exist_ok=True)
-                            
-                            for i, f_id in enumerate(files):
-                                if self.is_export_stopped: break
-                                
                                 f_set = self.export_files[f_id]
-                                fp = f_set["path"]
+                                fp = f_set["path"] # Взяли ТОЧНЫЙ исходный путь файла!
+
+                                f_tags = build_tags(f_set)
+                                for k in ["artist", "album", "album_artist", "genre", "composer", "date"]:
+                                    if k not in f_tags and g_tags.get(k):
+                                        f_tags[k] = g_tags[k]
+                                cov = f_set.get("cover") or g_set.get("cover")
+
+                                self._update_file_tags_inplace(fp, f_tags, cov, f_set.get("title", ""))
+
+                                processed_files += 1
+                                pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
+                                self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
+
+                        # ЭТО ОДИНОЧНЫЙ ФАЙЛ
+                        elif item_id in self.export_files:
+                            f_set = self.export_files[item_id]
+                            fp = f_set["path"] # Взяли ТОЧНЫЙ исходный путь файла!
+
+                            f_tags = build_tags(f_set)
+                            cov = f_set.get("cover")
+
+                            self._update_file_tags_inplace(fp, f_tags, cov, f_set.get("title", ""))
+
+                            processed_files += 1
+                            pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
+                            self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
+
+                # =========================================================================
+                # РЕЖИМ 2: ПОЛНЫЙ ЭКСПОРТ (Конвертация с сохранением в Папку Экспорта)
+                # =========================================================================
+                else:
+                    for item_idx, item_id in enumerate(items):
+                        if self.is_export_stopped: break
+                        
+                        if item_id in self.export_groups:
+                            g_id = item_id
+                            g_set = self.export_groups[g_id]
+                            g_name = g_set["name"]
+                            files = self.export_tree.get_children(g_id)
+                            if not files: continue
+                            
+                            self.root.after(0, lambda n=g_name: self.lbl_export_status.config(text=f"Обработка: {n}...", foreground=self.get_status_color("text")))
+
+                            if g_set["merge"]:
+                                final_audio = AudioSegment.empty()
+                                pause_ms = g_set["pause"]
+                                if apply_fx and sp != 1.0: pause_ms = int(pause_ms / sp)
+                                pause_seg = AudioSegment.silent(duration=pause_ms)
+
+                                first_f_set = self.export_files.get(files[0], {})
+                                for key in ["artist", "album", "album_artist", "genre", "composer", "year", "cover"]:
+                                    if not g_set.get(key) and first_f_set.get(key):
+                                        g_set[key] = first_f_set[key]
                                 
-                                self.root.after(0, lambda f=f_set['title']: self.lbl_export_status.config(text=f"Конвертация: {f}...", foreground=self.get_status_color("warning")))
-                                audio = AudioSegment.from_file(fp)
+                                for i, f_id in enumerate(files):
+                                    if self.is_export_stopped: break
+                                    fp = self.export_files[f_id]["path"]
+                                    final_audio += AudioSegment.from_file(fp)
+                                    if i < len(files) - 1 and pause_ms > 0: final_audio += pause_seg
+                                    
+                                    processed_files += 1
+                                    pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
+                                    self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
                                 
+                                if self.is_export_stopped: break
+                                    
                                 if apply_fx:
-                                    audio = AudioEffects.apply_effects(audio, speed=sp, pitch=pt, echo=ec, echo_delay=ed, echo_decay=ey)
+                                    self.root.after(0, lambda: self.lbl_export_status.config(text=f"Применение эффектов и сохранение {g_name}...", foreground=self.get_status_color("warning")))
+                                    final_audio = AudioEffects.apply_effects(final_audio, speed=sp, pitch=pt, echo=ec, echo_delay=ed, echo_decay=ey)
+                                else:
+                                    self.root.after(0, lambda: self.lbl_export_status.config(text=f"Сохранение {g_name}...", foreground=self.get_status_color("warning")))
                                 
                                 export_kwargs = {"format": fmt}
                                 if fmt == "mp3": export_kwargs["bitrate"] = bitrate
                                 
-                                f_tags = build_tags(f_set)
-                                g_tags = build_tags(g_set)
-                                for k in ["artist", "album", "album_artist", "genre", "composer", "date"]:
-                                    if k not in f_tags and build_tags(g_set).get(k):
-                                        f_tags[k] = build_tags(g_set)[k]
-                                        
-                                if f_tags: export_kwargs["tags"] = f_tags
+                                g_set["title"] = g_name
+                                tags = build_tags(g_set)
+                                if tags: export_kwargs["tags"] = tags
+                                if g_set.get("cover") and os.path.exists(g_set["cover"]): export_kwargs["cover"] = g_set["cover"]
+                                    
+                                out_file = out_dir / f"{g_name}.{fmt}"
+                                final_audio.export(out_file, **export_kwargs)
                                 
-                                cov = f_set.get("cover") or g_set.get("cover")
-                                if cov and os.path.exists(cov): export_kwargs["cover"] = cov
+                            else:
+                                target_dir = out_dir / g_name if g_set.get("subfolder") else out_dir
+                                target_dir.mkdir(exist_ok=True)
                                 
-                                safe_name = re.sub(r'[<>:"/\\|?*]', '_', f_set["title"])
-                                out_file = target_dir / f"{safe_name}.{fmt}"
-                                audio.export(out_file, **export_kwargs)
+                                for i, f_id in enumerate(files):
+                                    if self.is_export_stopped: break
+                                    
+                                    f_set = self.export_files[f_id]
+                                    fp = f_set["path"]
+                                    
+                                    f_tags = build_tags(f_set)
+                                    g_tags = build_tags(g_set)
+                                    for k in ["artist", "album", "album_artist", "genre", "composer", "date"]:
+                                        if k not in f_tags and g_tags.get(k):
+                                            f_tags[k] = g_tags[k]
+                                            
+                                    cov = f_set.get("cover") or g_set.get("cover")
+                                    
+                                    self.root.after(0, lambda f=f_set['title']: self.lbl_export_status.config(text=f"Конвертация: {f}...", foreground=self.get_status_color("warning")))
+                                    audio = AudioSegment.from_file(fp)
+                                    
+                                    if apply_fx:
+                                        audio = AudioEffects.apply_effects(audio, speed=sp, pitch=pt, echo=ec, echo_delay=ed, echo_decay=ey)
+                                    
+                                    export_kwargs = {"format": fmt}
+                                    if fmt == "mp3": export_kwargs["bitrate"] = bitrate
+                                    
+                                    if f_tags: export_kwargs["tags"] = f_tags
+                                    if cov and os.path.exists(cov): export_kwargs["cover"] = cov
+                                    
+                                    safe_name = re.sub(r'[<>:"/\\|?*]', '_', f_set["title"])
+                                    out_file = target_dir / f"{safe_name}.{fmt}"
+                                    audio.export(out_file, **export_kwargs)
 
-                    # === СЦЕНАРИЙ Б: ЭТО ОДИНОЧНЫЙ ФАЙЛ В КОРНЕ ===
-                    elif item_id in self.export_files:
-                        f_id = item_id
-                        f_set = self.export_files[f_id]
-                        fp = f_set["path"]
-                        
-                        self.root.after(0, lambda f=f_set['title']: self.lbl_export_status.config(text=f"Конвертация: {f}...", foreground=self.get_status_color("text")))
-                        audio = AudioSegment.from_file(fp)
-                        
-                        if apply_fx:
-                            audio = AudioEffects.apply_effects(audio, speed=sp, pitch=pt, echo=ec, echo_delay=ed, echo_decay=ey)
-                        
-                        export_kwargs = {"format": fmt}
-                        if fmt == "mp3": export_kwargs["bitrate"] = bitrate
-                        
-                        f_tags = build_tags(f_set)
-                        if f_tags: export_kwargs["tags"] = f_tags
-                        
-                        cov = f_set.get("cover")
-                        if cov and os.path.exists(cov): export_kwargs["cover"] = cov
-                        
-                        safe_name = re.sub(r'[<>:"/\\|?*]', '_', f_set["title"])
-                        out_file = out_dir / f"{safe_name}.{fmt}"
-                        audio.export(out_file, **export_kwargs)
+                                    processed_files += 1
+                                    pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
+                                    self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
+
+                        elif item_id in self.export_files:
+                            f_id = item_id
+                            f_set = self.export_files[f_id]
+                            fp = f_set["path"]
                             
-                    pct = int(((item_idx + 1) / total_items) * 100)
-                    self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
-                    
+                            f_tags = build_tags(f_set)
+                            cov = f_set.get("cover")
+                            
+                            self.root.after(0, lambda f=f_set['title']: self.lbl_export_status.config(text=f"Конвертация: {f}...", foreground=self.get_status_color("text")))
+                            audio = AudioSegment.from_file(fp)
+                            
+                            if apply_fx:
+                                audio = AudioEffects.apply_effects(audio, speed=sp, pitch=pt, echo=ec, echo_delay=ed, echo_decay=ey)
+                            
+                            export_kwargs = {"format": fmt}
+                            if fmt == "mp3": export_kwargs["bitrate"] = bitrate
+                            
+                            if f_tags: export_kwargs["tags"] = f_tags
+                            if cov and os.path.exists(cov): export_kwargs["cover"] = cov
+                            
+                            safe_name = re.sub(r'[<>:"/\\|?*]', '_', f_set["title"])
+                            out_file = out_dir / f"{safe_name}.{fmt}"
+                            audio.export(out_file, **export_kwargs)
+                            
+                            processed_files += 1
+                            pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
+                            self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
+
                 if self.is_export_stopped:
                     self.root.after(0, lambda: self.lbl_export_status.config(text="Сборка прервана!", foreground=self.get_status_color("error")))
                     self.root.after(0, lambda: messagebox.showwarning("Остановлено", "Процесс сборки был прерван пользователем."))
                 else:
+                    msg = "Теги успешно обновлены в исходных файлах!" if tags_only else f"Сборка успешно завершена!\nСохранено в: {out_dir}"
                     self.root.after(0, lambda: self.lbl_export_status.config(text="Готово!", foreground=self.get_status_color("success")))
-                    self.root.after(0, lambda: messagebox.showinfo("Успех", f"Сборка успешно завершена!\nСохранено в: {out_dir}"))
+                    self.root.after(0, lambda m=msg: messagebox.showinfo("Успех", m))
                 
             except Exception as e:
                 logging.error(f"Ошибка сборки: {e}")
@@ -3577,12 +3920,10 @@ class TTSApp:
         if not data: return
         
         top = tk.Toplevel(self.root)
+        top.withdraw()
         top.title(f"Детали кэша: {hash_key}")
-        top.geometry("750x500") # Чуть увеличил высоту для ползунков
-
         top.transient(self.root)
-        top.lift()
-        top.focus_force()
+        
         
         ttk.Label(top, text="Исходный текст:").pack(anchor=tk.W, padx=10, pady=(10,0))
         t1 = tk.Text(top, height=5, wrap=tk.WORD, font=("Arial", self.font_size_var.get()))
@@ -3657,6 +3998,10 @@ class TTSApp:
         # -------------------------------------
         
         filepath = Path(self.config.get("cache_dir", "cache_audio")) / "audio" / data.get("file_name", "")
+
+        self._center_popup(top, 750, 500)
+        top.lift()
+        top.focus_force()
         
         def play_cache_audio():
             if not os.path.exists(filepath): return
@@ -3885,7 +4230,7 @@ class TTSApp:
         scrollbar.config(command=self.help_text_widget.yview)
         # ------------------------------
         
-        help_text = r"""Добро пожаловать в Silero TTS Studio v1.2!
+        help_text = r"""Добро пожаловать в Silero TTS Studio v1.3!
 
 Это профессиональная рабочая среда для генерации аудиокниг, подкастов и озвучки текста с помощью нейросети Silero. Программа разработана с акцентом на бережное отношение к API-лимитам, умное кэширование, гибридную постобработку звука и автоматизацию сборки.
 
@@ -3941,7 +4286,7 @@ class TTSApp:
 • Перед диалогом (Прямая речь): Автоматически УВЕЛИЧИВАЕТ паузу перед абзацем, если он начинается с тире (—) или кавычек (").
 • После двоеточия: Увеличивает паузу перед следующим абзацем, если предыдущий заканчивался на двоеточие (:).
 • Символы-разделители (☆☆☆, ***, ###, ---):
-  Вы можете ввести любые символы-разделители частей (каждый с новой строки). Когда программа встречает такой символ в тексте, она полностью вырезает его и вставляет на его место чистую тишину заданной длины ("Пауза разделителя").
+  Управление разделителями осуществляется через динамические поля (добавление строчки кнопкой "➕ Добавить", удаление — "❌"). Когда программа встречает указанный символ в тексте, она полностью вырезает его и вставляет на его место чистую тишину заданной длины ("Пауза разделителя").
 
 ====================================================================
 ⚙️ 5. ПОЛНЫЙ ЦИКЛ ОБРАБОТКИ И НОРМАЛИЗАЦИИ ТЕКСТА
@@ -3997,20 +4342,22 @@ class TTSApp:
 ====================================================================
 🎵 9. ЭКСПОРТ И СБОРКА (АУДИОКНИГИ, ТЕГИ, ОБЛОЖКИ)
 ====================================================================
-Вкладка "Экспорт и Сборка" — это полноценный комбайн для компиляции готовых аудиофайлов:
+Вкладка "Экспорт и Сборка" — это полноценный комбайн для компиляции и тегирования аудиофайлов:
 
 • Файлы в Корне и Группах: Файлы можно добавлять как в древовидные Группы (Тома), так и прямо в корень проекта.
+• Расчет Общего Времени: В шапке дерева в реальном времени отображается суммарная длительность всех аудиофайлов (HH:MM:SS).
+• Авто-заполнение папки: При добавлении файлов программа сама подставляет папку их расположения в поле экспорта. Единая память путей сохраняется между выбором файлов и папок.
 • Натуральная сортировка: Клик по заголовку "Имя ↕" сортирует файлы по-человечески (Глава 2 встает перед Глава 10).
-• Фоновый многопоточный импорт: Сканирование метаданных через ffprobe происходит в отдельном потоке с пачками по 10 файлов — интерфейс остается живым и никогда не зависает.
-• Перепаковка и Разгруппировка: Выделите файлы и используйте кнопки "📦 В новую группу" или "📤 Разгруппировать".
-• Шаблон групп: Поле шаблона (например: "Том {num}" или "Том {num:0}") задает автоматическое именование новых групп.
+• Фоновый импорт метаданных: Чтение тегов и извлечение встроенных обложек через ffprobe происходит в фоновом потоке пачками по 10 файлов — интерфейс остается живым.
+• Перепаковка и Разгруппировка: Выделите файлы и используйте кнопки "📦 В новую группу" или "📤 Разгруппировать" (кнопка перенесена на верхнюю панель для удобства).
+• Массовое применение настроек: Кнопка "⚙️ Применить ко всем группам..." открывает диалог, позволяющий в 1 клик применить параметры склейки, подпапок, пауз ко всем томам и сохранить их по умолчанию.
 • Склеивание в один трек: Склеивает все файлы группы в один большой аудиофайл с настройкой паузы между ними (в мс).
 • Авто-разбивка по времени: Укажите лимит длительности (например, 60 минут), и программа сама разложит файлы по томам с нумерацией.
-• Компактная панель эффектов: Прямо на панели экспорта доступна строчка с ползунками скорости, тона и эха для быстрой финализации треков.
+• [x] Только обновить теги (In-place tagging): Уникальный режим без перекодирования звука! Мгновенно вшивает метаданные и обложки прямо в исходные файлы на диске с нулевой потерей качества.
 • Редактор ID3-тегов и Обложек: Установка метаданных и автоматическое извлечение обложек из файлов через ffprobe.
 • Умная сетка применения тегов (2х2):
   - [⬇ К файлам группы]: Копирует теги текущей группы на все входящие в нее файлы.
-  - [⬆ В род. группу]: Копирует теги с выделенного файла на его родительскую группу (активно только если файл внутри группы).
+  - [⬆ В род. группу]: Копирует теги с выделенного файла на его родительскую группу.
   - [☑ К выделенным]: Применяет теги ко всем выделенным элементам.
   - [🔄 Ко всем элементам]: Применяет теги абсолютно ко всем группам и файлам.
 
@@ -4042,7 +4389,10 @@ class TTSApp:
 📁 12. ОСОБЕННОСТИ РАБОТЫ НА РАЗНЫХ ОС
 ====================================================================
 • macOS (.app): Из-за системных ограничений Apple (Gatekeeper) скомпилированное приложение автоматически работает через папку Документы (`~/Documents/SileroTTS_Studio/`).
-• Нативные горячие клавиши (macOS): Прямая интеграция с системным буфером обмена (NSPasteboard / pbcopy / pbpaste) гарантирует работу ⌘C, ⌘V, ⌘X, ⌘A, ⌘Z при любой раскладке клавиатуры.
+• Умный буфер обмена (Кроссплатформенный):
+  - На macOS гарантирует работу ⌘C, ⌘V, ⌘X, ⌘A, ⌘Z при любой раскладке с авто-декодированием путей Finder (unquote + NFC).
+  - На Windows и Linux чинит работу русской раскладки (Ctrl+С, Ctrl+М) и автоматически очищает вставляемые пути от кавычек (Windows 11 "Копировать как путь") и префиксов `file://`.
+• Защита NullWriter: Глобальный перехватчик `sys.stdout/stderr` защищает Portable-версии на Windows, macOS и Linux от экстренных вылетов из-за вызовов `print()` в сторонних библиотеках.
 • Атомарное выделение (macOS): Клик с зажатой клавишей ⌘ позволяет выделять и снимать выделение со строк в таблицах.
 • Portable-режим: При запуске `.py` файла через консоль (на Mac, Windows, Linux) или `.exe` на Windows программа работает в полностью портативном режиме — все рабочие папки создаются строго рядом со скриптом.
 """
