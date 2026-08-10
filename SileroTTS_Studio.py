@@ -305,10 +305,12 @@ class RateLimiter:
 
 class TTSProcessor:
     """Главный процессор для обработки текста и взаимодействия с API Silero."""
-    def __init__(self, config, error_callback=None):
+    def __init__(self, config, shared_rate_limiter=None, error_callback=None):
         self.cfg = config
         self.error_callback = error_callback
-        self.rate_limiter = RateLimiter(int(config["api_max_requests"]), float(config["api_time_window"]))
+        
+        # Используем общий лимитер, если передан
+        self.rate_limiter = shared_rate_limiter or RateLimiter(int(config["api_max_requests"]), float(config["api_time_window"]))
         
         Path(self.cfg["input_dir"]).mkdir(parents=True, exist_ok=True)
         Path(self.cfg["output_dir"]).mkdir(parents=True, exist_ok=True)
@@ -338,6 +340,16 @@ class TTSProcessor:
         raw_seps = str(self.cfg.get("separator_symbols", ""))
         if "," in raw_seps and "\n" not in raw_seps: raw_seps = raw_seps.replace(",", "\n")
         self.separators = [s.strip() for s in raw_seps.split("\n") if s.strip()]
+
+        self.processing_statuses_ram = {}
+        status_file = APP_DATA_DIR / "processing_statuses.json"
+        if status_file.exists():
+            try:
+                with open(status_file, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                    # === ИСПРАВЛЕНИЕ: Очищаем старый мусор, загружаем ТОЛЬКО ошибки ===
+                    self.processing_statuses_ram = {k: v for k, v in loaded.items() if v != "success"}
+            except: pass
 
     def _load_cache(self):
         if self.cache_index_path.exists():
@@ -424,32 +436,6 @@ class TTSProcessor:
                     if temp_file.exists():
                         try: os.remove(temp_file)
                         except: pass
-
-    def load_glossary_file(self):
-        if not os.path.exists(self.glossary_path): return
-        try:
-            with open(self.glossary_path, 'r', encoding='utf-8') as f: data = json.load(f)
-        except Exception as e:
-            logging.error(f"Ошибка чтения файла глоссария: {e}")
-            return
-
-        for w in data.get("accents_ignore_case", []): 
-            if isinstance(w, str) and w.strip():
-                self.glossary_ignore_case[w.replace("+", "").lower()] = w
-                
-        for w in data.get("accents_strict_case", []): 
-            if isinstance(w, str) and w.strip():
-                self.glossary_strict_case[w.replace("+", "")] = w
-                
-        for k, v in data.get("terms_ignore_case", {}).items(): 
-            if isinstance(k, str) and k.strip():
-                self.glossary_ignore_case[k.lower()] = v
-                
-        for k, v in data.get("terms_strict_case", {}).items(): 
-            if isinstance(k, str) and k.strip():
-                self.glossary_strict_case[k] = v
-                
-        self.glossary_regex = data.get("regex_rules", [])
 
     def apply_regex_rules(self, text):
         for rule in self.glossary_regex:
@@ -644,7 +630,6 @@ class TTSProcessor:
                 cache_info = self.cache[text_hash]
                 cache_info["last_accessed"] = time.time()
                 cache_info["usage_count"] += 1
-                self.unsaved_cache_items += 1
                 return cache_file, True
 
         payload = {
@@ -722,7 +707,8 @@ class TTSProcessor:
         
         separator_token = "___SEPARATOR_TOKEN___"
         for sep in self.separators:
-            raw_text = raw_text.replace(sep, f"\n{separator_token}\n")
+            pattern = r'^[ \t]*' + re.escape(sep) + r'[ \t]*$'
+            raw_text = re.sub(pattern, f"\n{separator_token}\n", raw_text, flags=re.MULTILINE)
         
         paragraphs = [p.strip() for p in raw_text.split('\n') if p.strip()]
         
@@ -832,95 +818,102 @@ class TTSProcessor:
 
     def _merge_save_and_notify(self, audio_files, out_filepath, original_filename, has_errors, callback):
         def _encode():
+            # ОПТИМИЗАЦИЯ 1: Изолированная временная папка для concat-файла
             temp_dir = APP_DATA_DIR / "temp"
             temp_dir.mkdir(exist_ok=True)
             
+            # Генерируем абсолютно уникальное имя файла для каждого потока
             list_path = temp_dir / f"concat_{uuid.uuid4().hex}.txt"
-            with open(list_path, 'w', encoding='utf-8') as f:
-                for p in audio_files:
-                    safe_path = p.resolve().as_posix().replace("'", "'\\''")
-                    f.write(f"file '{safe_path}'\n")
-
-            cmd = [get_ffmpeg_path(), "-y", "-f", "concat", "-safe", "0", "-i", str(list_path)]
             
-            has_cover = False
-            cover_path = self.cfg.get("tag_cover", "")
-            if cover_path and os.path.exists(cover_path):
-                cmd.extend(["-i", cover_path])
-                has_cover = True
+            try:
+                with open(list_path, 'w', encoding='utf-8') as f:
+                    for p in audio_files:
+                        safe_path = p.resolve().as_posix().replace("'", "'\\''")
+                        f.write(f"file '{safe_path}'\n")
 
-            sp = float(self.cfg.get("fx_speed", 1.0))
-            pt = float(self.cfg.get("fx_pitch", 1.0))
-            ec = bool(self.cfg.get("fx_echo", False))
-            ed = int(self.cfg.get("fx_echo_delay", 300))
-            ey = float(self.cfg.get("fx_echo_decay", 0.3))
-
-            filters = []
-            if pt != 1.0:
-                filters.append(f"asetrate={int(48000 * pt)}")
-                filters.append(f"atempo={1/pt}")
-            if sp != 1.0:
-                filters.append(f"atempo={sp}")
-            if ec:
-                filters.append(f"aecho=0.8:0.8:{int(ed)}:{float(ey)}")
-
-            if filters:
-                cmd.extend(["-af", ",".join(filters)])
-
-            fmt = self.cfg["output_format"].lower()
-            if fmt == "mp3":
-                cmd.extend(["-c:a", "libmp3lame", "-b:a", self.cfg["output_bitrate"]])
-                if has_cover:
-                    # ИСПРАВЛЕНИЕ ОБЛОЖКИ ДЛЯ WINDOWS
-                    cmd.extend(["-map", "0:a", "-map", "1:v", "-c:v", "mjpeg", "-id3v2_version", "3", "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"])
-            elif fmt == "ogg":
-                cmd.extend(["-c:a", "libvorbis"])
-                if has_cover:
-                    cmd.extend(["-map", "0:a", "-map", "1:v", "-disposition:v", "attached_pic"])
-            elif fmt == "wav":
-                cmd.extend(["-c:a", "pcm_s16le"])
-
-            base_name = out_filepath.stem
-            def _apply_tag_template(tmpl_key):
-                val = str(self.cfg.get(tmpl_key, ""))
-                if not val: return ""
-                val = val.replace("{filename}", base_name)
-                val = val.replace("{name}", base_name)
-                val = val.replace("{title}", base_name)
-                return val.strip()
-
-            title = _apply_tag_template("tag_title")
-            if title: cmd.extend(["-metadata", f"title={title}"])
-            
-            artist = _apply_tag_template("tag_artist")
-            if artist: cmd.extend(["-metadata", f"artist={artist}"])
-
-            album_artist = _apply_tag_template("tag_album_artist")
-            if album_artist: cmd.extend(["-metadata", f"album_artist={album_artist}"])
-            
-            album = _apply_tag_template("tag_album")
-            if album: cmd.extend(["-metadata", f"album={album}"])
-
-            genre = _apply_tag_template("tag_genre")
-            if genre: cmd.extend(["-metadata", f"genre={genre}"])
-            
-            composer = _apply_tag_template("tag_composer")
-            if composer: cmd.extend(["-metadata", f"composer={composer}"])
-            
-            year = _apply_tag_template("tag_year")
-            if year: cmd.extend(["-metadata", f"date={year}"])
-
-            cmd.append(str(out_filepath))
-
-            startupinfo = None
-            if platform.system() == "Windows":
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
-            
-            try: os.remove(list_path)
-            except: pass
+                cmd = [get_ffmpeg_path(), "-y", "-f", "concat", "-safe", "0", "-i", str(list_path)]
+                
+                has_cover = False
+                cover_path = self.cfg.get("tag_cover", "")
+                if cover_path and os.path.exists(cover_path):
+                    cmd.extend(["-i", cover_path])
+                    has_cover = True
+    
+                sp = float(self.cfg.get("fx_speed", 1.0))
+                pt = float(self.cfg.get("fx_pitch", 1.0))
+                ec = bool(self.cfg.get("fx_echo", False))
+                ed = int(self.cfg.get("fx_echo_delay", 300))
+                ey = float(self.cfg.get("fx_echo_decay", 0.3))
+    
+                filters = []
+                if pt != 1.0:
+                    filters.append(f"asetrate={int(48000 * pt)}")
+                    filters.append(f"atempo={1/pt}")
+                if sp != 1.0:
+                    filters.append(f"atempo={sp}")
+                if ec:
+                    filters.append(f"aecho=0.8:0.8:{int(ed)}:{float(ey)}")
+    
+                if filters:
+                    cmd.extend(["-af", ",".join(filters)])
+    
+                fmt = self.cfg["output_format"].lower()
+                if fmt == "mp3":
+                    cmd.extend(["-c:a", "libmp3lame", "-b:a", self.cfg["output_bitrate"]])
+                    if has_cover:
+                        # ИСПРАВЛЕНИЕ ОБЛОЖКИ ДЛЯ WINDOWS
+                        cmd.extend(["-map", "0:a", "-map", "1:v", "-c:v", "mjpeg", "-id3v2_version", "3", "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"])
+                elif fmt == "ogg":
+                    cmd.extend(["-c:a", "libvorbis"])
+                    if has_cover:
+                        cmd.extend(["-map", "0:a", "-map", "1:v", "-disposition:v", "attached_pic"])
+                elif fmt == "wav":
+                    cmd.extend(["-c:a", "pcm_s16le"])
+    
+                base_name = out_filepath.stem
+                def _apply_tag_template(tmpl_key):
+                    val = str(self.cfg.get(tmpl_key, ""))
+                    if not val: return ""
+                    val = val.replace("{filename}", base_name)
+                    val = val.replace("{name}", base_name)
+                    val = val.replace("{title}", base_name)
+                    return val.strip()
+    
+                title = _apply_tag_template("tag_title")
+                if title: cmd.extend(["-metadata", f"title={title}"])
+                
+                artist = _apply_tag_template("tag_artist")
+                if artist: cmd.extend(["-metadata", f"artist={artist}"])
+    
+                album_artist = _apply_tag_template("tag_album_artist")
+                if album_artist: cmd.extend(["-metadata", f"album_artist={album_artist}"])
+                
+                album = _apply_tag_template("tag_album")
+                if album: cmd.extend(["-metadata", f"album={album}"])
+    
+                genre = _apply_tag_template("tag_genre")
+                if genre: cmd.extend(["-metadata", f"genre={genre}"])
+                
+                composer = _apply_tag_template("tag_composer")
+                if composer: cmd.extend(["-metadata", f"composer={composer}"])
+                
+                year = _apply_tag_template("tag_year")
+                if year: cmd.extend(["-metadata", f"date={year}"])
+    
+                cmd.append(str(out_filepath))
+    
+                startupinfo = None
+                if platform.system() == "Windows":
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
+            finally:
+                # Блок finally гарантирует, что временный текстовый файл удалится 
+                # строго ПОСЛЕ того, как FFmpeg завершит работу, либо если произойдет сбой
+                if list_path.exists():
+                    try: os.remove(list_path)
+                    except: pass
 
             # --- ЗАЩИТА 1: Если во время сборки нажали «Принудительно» — СТИРАЕМ БИТЫЙ ФАЙЛ ---
             if self.is_stopped:
@@ -942,22 +935,21 @@ class TTSProcessor:
                 has_errors_local = has_errors
             # ---------------------------------------------------------------------------
 
+            # ОПТИМИЗАЦИЯ 2: Безопасное обновление статуса ТОЛЬКО В ПАМЯТИ
+            status_str = "warning" if has_errors_local else "success"
+            
             with self.cache_lock:
-                status_file = APP_DATA_DIR / "processing_statuses.json"
-                statuses = {}
-                if status_file.exists():
-                    try:
-                        with open(status_file, 'r', encoding='utf-8') as f: statuses = json.load(f)
-                    except: pass
-                    
-                statuses[str(out_filepath.resolve())] = "warning" if has_errors_local else "success"
-                with open(status_file, 'w', encoding='utf-8') as f:
-                    json.dump(statuses, f, ensure_ascii=False, indent=4)
+                if has_errors_local:
+                    self.processing_statuses_ram[str(out_filepath.resolve())] = status_str
+                else:
+                    # Если файл собрался успешно, удаляем его из списка ошибок (если он там был)
+                    self.processing_statuses_ram.pop(str(out_filepath.resolve()), None)
                 
             if not has_errors_local:
                 logging.info(f"Файл {out_filepath.name} сохранен с эффектами (Скорость: {sp}x, Тон: {pt}).")
-            if callback: callback(original_filename, "warning" if has_errors_local else "success", str(out_filepath.resolve()))
-
+            if callback: 
+                callback(original_filename, status_str, str(out_filepath.resolve()))
+    
         if self.encode_semaphore:
             with self.encode_semaphore:
                 _encode()
@@ -978,7 +970,8 @@ class TTSProcessor:
         # 3. Обработка разделителей
         separator_token = "___SEPARATOR_TOKEN___"
         for sep in self.separators:
-            raw_text = raw_text.replace(sep, f"\n{separator_token}\n")
+            pattern = r'^[ \t]*' + re.escape(sep) + r'[ \t]*$'
+            raw_text = re.sub(pattern, f"\n{separator_token}\n", raw_text, flags=re.MULTILINE)
         
         paragraphs = [p.strip() for p in raw_text.split('\n') if p.strip()]
         current_full_text_clean = []
@@ -1045,19 +1038,48 @@ class TTSProcessor:
 
 # ================= ЭКСТРАКТОР И НАРЕЗЧИК КНИГ =================
 class BookExtractor:
-    """Утилита для извлечения текста из различных форматов книг (EPUB, FB2, DOCX) с поддержкой автора и расширенных тегов."""
+    """Утилита для извлечения текста из различных форматов книг (EPUB, FB2, DOCX)."""
     
+    @staticmethod
+    def _clean_html_text(soup, block_tags):
+        """
+        Умная очистка HTML: сохраняет абзацы, но игнорирует переносы строк 
+        внутри inline-тегов (em, strong, b, i) и форматирования кода.
+        """
+        # 1. Принудительные переносы заменяем на маркер блока
+        for tag in soup.find_all(['br', 'hr']):
+            tag.replace_with('\n___BLOCK___\n')
+            
+        # 2. Ставим маркер блока ПОСЛЕ каждого блочного тега
+        for tag in soup.find_all(block_tags):
+            tag.insert_after('\n___BLOCK___\n')
+            
+        # 3. Извлекаем весь текст, заменяя ВСЕ внутренние переносы на пробелы
+        raw_text = soup.get_text(separator=' ')
+        
+        # 4. Разбиваем текст по нашим маркерам и очищаем от лишних пробелов
+        blocks = []
+        for block in raw_text.split('___BLOCK___'):
+            clean = re.sub(r'\s+', ' ', block).strip()
+            if clean:
+                blocks.append(clean)
+                
+        # 5. Склеиваем чистые абзацы
+        return "\n".join(blocks)
+
     @staticmethod
     def extract_epub(filepath):
         book = epub.read_epub(str(filepath))
         chapters = []
         author = ""
         
-        # Извлекаем автора из метаданных EPUB
         try:
             creators = book.get_metadata('DC', 'creator')
             if creators: author = creators[0][0]
         except: pass
+
+        # Блочные теги для EPUB
+        epub_blocks = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote']
 
         def parse_toc(toc_list):
             items = []
@@ -1078,7 +1100,7 @@ class BookExtractor:
                     if item.file_name == href:
                         html_content = item.get_content().decode('utf-8', errors='ignore')
                         soup = BeautifulSoup(html_content, 'html.parser')
-                        text = soup.get_text(separator='\n', strip=True)
+                        text = BookExtractor._clean_html_text(soup, epub_blocks)
                         if text: chapters.append((link.title, text))
                         break
         else:
@@ -1087,7 +1109,7 @@ class BookExtractor:
                 if item.get_type() == ebooklib.ITEM_DOCUMENT:
                     html_content = item.get_content().decode('utf-8', errors='ignore')
                     soup = BeautifulSoup(html_content, 'html.parser')
-                    text = soup.get_text(separator='\n', strip=True)
+                    text = BookExtractor._clean_html_text(soup, epub_blocks)
                     if text: chapters.append(("Глава", text))
                     
         return chapters, author
@@ -1100,7 +1122,6 @@ class BookExtractor:
         chapters = []
         author = ""
         
-        # Извлекаем автора из метаданных FB2
         try:
             a_tag = soup.find('author')
             if a_tag:
@@ -1111,17 +1132,22 @@ class BookExtractor:
                 author = f"{fn_str} {ln_str}".strip()
         except: pass
 
+        # Блочные теги для FB2
+        fb2_blocks = ['p', 'v', 'subtitle', 'text-author', 'title', 'empty-line']
+
         body = soup.find('body')
-        if not body: return [("Книга", soup.get_text(separator='\n', strip=True))], author
+        if not body: 
+            return [("Книга", BookExtractor._clean_html_text(soup, fb2_blocks))], author
         
         sections = body.find_all('section', recursive=False)
         if not sections: sections = body.find_all('section')
-        if not sections: return [("Книга", body.get_text(separator='\n', strip=True))], author
+        if not sections: 
+            return [("Книга", BookExtractor._clean_html_text(body, fb2_blocks))], author
 
         for sec in sections:
             title_tag = sec.find('title')
             title = title_tag.get_text(strip=True) if title_tag else "Глава"
-            text = sec.get_text(separator='\n', strip=True)
+            text = BookExtractor._clean_html_text(sec, fb2_blocks)
             if text: chapters.append((title, text))
             
         return chapters, author
@@ -1133,6 +1159,7 @@ class BookExtractor:
         current_title = "Вступление"
         current_text = []
         
+        # DOCX не подвержен проблеме тегов, так как python-docx выдает чистый текст параграфа
         for p in doc.paragraphs:
             if p.style.name.startswith('Heading'):
                 if current_text:
@@ -1184,19 +1211,15 @@ class BookExtractor:
         saved_files = []
         name_no_ext = Path(orig_filename).stem
         
-        # Определяем стартовый номер из шаблона (например "{num:0}" -> 0, "{num}" -> 1)
         match_start = re.search(r'\{num:(\d+)\}', template)
         start_index = int(match_start.group(1)) if match_start else 1
 
         for idx, (title, content) in enumerate(chapters, 0):
             safe_title = re.sub(r'[<>:"/\\|?*]', '_', title)[:50]
-            
             current_num = str(start_index + idx).zfill(pad)
             
             filename = template
-            # Заменяем как расширенную {num:0}, так и стандартную {num}
             filename = re.sub(r'\{num(?::\d+)?\}', current_num, filename)
-            
             filename = filename.replace("{name}", name_no_ext)
             filename = filename.replace("{book}", name_no_ext)
             filename = filename.replace("{title}", safe_title)
@@ -1221,12 +1244,6 @@ class TTSApp:
         
         self.settings_vars = {}
         self.config = self.load_settings()
-        
-        # 🛡 Убираем микро-мигание при старте: предварительно окрашиваем главный холст в цвет темы до отрисовки виджетов!
-        initial_theme = self.config.get("ui_theme", "light")
-        try:
-            self.root.config(bg="#1c1c1c" if initial_theme == "dark" else "#ffffff")
-        except: pass
 
         # Динамический размер окна (70% от экрана по центру)
         screen_width = self.root.winfo_screenwidth()
@@ -1293,6 +1310,9 @@ class TTSApp:
             # Фикс буфера обмена для кириллической раскладки на Windows/Linux
             self._fix_cyrillic_clipboard()
 
+        # Общий лимитер для всех вкладок
+        self.shared_rate_limiter = RateLimiter(int(self.config.get("api_max_requests", 15)), float(self.config.get("api_time_window", 15.0)))
+        
         self.root.after(300, self._silent_pre_warm_tabs)
         
 
@@ -1578,6 +1598,16 @@ class TTSApp:
                 logging.debug(f"Ошибка Undo/Redo: {e}")
             return "break"
 
+    def _get_smart_dir(self, current_path, is_file=False):
+        """Возвращает умный начальный путь для диалогов выбора файлов/папок"""
+        if current_path:
+            p = Path(current_path)
+            if is_file:
+                p = p.parent
+            if p.exists() and p.is_dir():
+                return str(p)
+        return str(BASE_DIR)
+    
     def _center_popup(self, dialog, width, height):
         """Центрирует диалоговое окно и мгновенно проявляет его БЕЗ мигания"""
         self.root.update_idletasks()
@@ -1774,6 +1804,11 @@ class TTSApp:
         self.update_config_from_ui()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # === НОВОЕ: Обновляем глобальный лимитер ===
+        if hasattr(self, 'shared_rate_limiter'):
+            self.shared_rate_limiter.max_requests = int(self.config.get("api_max_requests", 15))
+            self.shared_rate_limiter.time_window = float(self.config.get("api_time_window", 15.0))
         
         try:
             with open(path, 'w', encoding='utf-8') as f:
@@ -1890,45 +1925,63 @@ class TTSApp:
             self._is_updating_ui = False
 
     def import_config(self):
-        """Импорт с сохранением текущей темы (если её нет в файле) и обновлением UI"""
-        filepath = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
-        if not filepath or not os.path.exists(filepath):
-            return
-
+        filepath = filedialog.askopenfilename(initialdir=str(APP_DATA_DIR), filetypes=[("JSON files", "*.json")])
+        if not filepath: return
+        
         try:
-            self.ensure_dirs()
-
             with open(filepath, 'r', encoding='utf-8') as f:
                 imported_data = json.load(f)
-
-            if not isinstance(imported_data, dict):
-                raise ValueError("Файл должен содержать JSON-объект с настройками.")
-
-            # Сохраняем текущую тему, если в импортируемом файле её нет
-            current_theme = self.config.get("ui_theme", "default")
+            if not isinstance(imported_data, dict): raise ValueError()
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+            return
             
-            full_config = DEFAULT_CONFIG.copy()
-            if "ui_theme" not in imported_data:
-                full_config["ui_theme"] = current_theme
-
-            full_config.update(imported_data)
-            self.config = full_config
-
-            # Обновляем поля UI
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("Импорт настроек")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="Какие настройки из файла применить?").pack(pady=10, padx=20)
+        
+        vars_dict = {
+            "api": (tk.BooleanVar(value=True), "API и Лимиты"),
+            "folders": (tk.BooleanVar(value=True), "Пути к папкам"),
+            "pauses": (tk.BooleanVar(value=True), "Паузы и Разделители"),
+            "cache": (tk.BooleanVar(value=True), "Настройки Кэша"),
+            "effects": (tk.BooleanVar(value=True), "Эффекты (Скорость, Тон)"),
+            "tags": (tk.BooleanVar(value=True), "Вывод и Теги ID3")
+        }
+        
+        for key, (var, text) in vars_dict.items():
+            ttk.Checkbutton(dialog, text=text, variable=var).pack(anchor=tk.W, padx=30, pady=2)
+            
+        def do_import():
+            key_groups = {
+                "api": ["api_", "speaker", "max_retries"],
+                "folders": ["input_dir", "output_dir", "cache_dir", "export_dir", "import_outdir"],
+                "pauses": ["pause_", "separator_symbols", "default_group_pause"],
+                "cache": ["auto_", "silence_threshold", "use_cache", "cache_", "enable_cache_"],
+                "effects": ["fx_"],
+                "tags": ["output_", "synthesis_mode", "tag_", "default_group_name"]
+            }
+            
+            for group_key, (var, _) in vars_dict.items():
+                if var.get():
+                    prefixes = key_groups[group_key]
+                    for k, v in imported_data.items():
+                        if any(k.startswith(p) for p in prefixes):
+                            self.config[k] = v
+                            
+            dialog.destroy()
             self.set_ui_from_config()
-
-            # Физически сохраняем обновленный settings.json на диск
             self.save_settings(SETTINGS_FILE)
-
-            # Перерисовываем окно и сканируем файлы
             self.full_ui_refresh()
             self.load_files()
-
-            messagebox.showinfo("Успех", f"Настройки из файла {Path(filepath).name} успешно применены!")
-
-        except Exception as e:
-            logging.error(f"Ошибка при импорте конфигурации: {e}")
-            messagebox.showerror("Ошибка импорта", f"Не удалось загрузить конфигурацию:\n{e}")
+            messagebox.showinfo("Успех", "Выбранные настройки успешно применены!")
+            
+        ttk.Button(dialog, text="Импортировать", command=do_import).pack(pady=15)
+        self._center_popup(dialog, 350, 280)
 
     def reset_config(self):
         """Сброс рабочих настроек с сохранением темы оформления и размера шрифта"""
@@ -1937,12 +1990,10 @@ class TTSApp:
                 self.ensure_dirs()
                 
                 # 1. Сохраняем текущие визуальные предпочтения пользователя
-                current_theme = self.config.get("ui_theme", "default")
                 current_font_size = self.config.get("ui_font_size", 10)
 
                 # 2. Загружаем дефолты и восстанавливаем визуал
                 full_config = DEFAULT_CONFIG.copy()
-                full_config["ui_theme"] = current_theme
                 full_config["ui_font_size"] = current_font_size
                 self.config = full_config
 
@@ -2008,7 +2059,13 @@ class TTSApp:
         self.lbl_total_pct.grid(row=2, column=2)
 
         self.settings_vars["skip_existing"] = tk.BooleanVar(value=self.config.get("skip_existing", True))
-        ttk.Checkbutton(prog_frame, text="Пропускать готовые файлы (продолжить синтез)", variable=self.settings_vars["skip_existing"]).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(5,0))
+        ttk.Checkbutton(prog_frame, text="Пропускать готовые", variable=self.settings_vars["skip_existing"]).grid(row=3, column=0, sticky=tk.W, pady=(5,0))
+
+        self.auto_scroll_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(prog_frame, text="Авто-прокрутка", variable=self.auto_scroll_var).grid(row=3, column=1, sticky=tk.W, pady=(5,0), padx=10)
+
+        self.btn_go_current = ttk.Button(prog_frame, text="📍 К текущему файлу", command=self.scroll_to_current, state=tk.DISABLED)
+        self.btn_go_current.grid(row=3, column=2, sticky=tk.W, pady=(5,0))
 
         # --- ОБНОВЛЕННЫЙ БЛОК КНОПОК ---
         btn_frame = ttk.Frame(self.tab_main, padding=10)
@@ -2036,8 +2093,16 @@ class TTSApp:
     def setup_direct_tab(self):
         frame = ttk.Frame(self.tab_direct, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
+
+        header_frame = ttk.Frame(frame)
+        header_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(header_frame, text="Вставьте текст для синтеза:").pack(side=tk.LEFT)
         
-        ttk.Label(frame, text="Вставьте текст для синтеза:").pack(anchor=tk.W)
+        font_cb = ttk.Combobox(header_frame, textvariable=self.font_size_var, values=[10, 12, 14, 16, 18, 20, 24], state="readonly", width=5)
+        font_cb.pack(side=tk.RIGHT)
+        ttk.Label(header_frame, text="Шрифт:").pack(side=tk.RIGHT, padx=5)
+        font_cb.bind("<<ComboboxSelected>>", lambda e: self.root.after(10, self.update_fonts))
+        
         self.direct_text = tk.Text(frame, wrap=tk.WORD, height=10, undo=True, maxundo=50)
         self.direct_text.pack(fill=tk.BOTH, expand=True, pady=5)
         
@@ -2132,30 +2197,48 @@ class TTSApp:
         self.btn_direct_hard_stop = ttk.Button(btn_frame, text="☠️ Принудительно", command=self.hard_stop_direct_processing, state=tk.DISABLED)
         self.btn_direct_hard_stop.pack(side=tk.LEFT, padx=5)
         
-        self.btn_direct_play = ttk.Button(btn_frame, text="🔊 Слушать (с эффектами)", command=self.play_last_audio, state=tk.DISABLED)
-        self.btn_direct_play.pack(side=tk.LEFT, padx=10)
+        # --- ОБНОВЛЕННЫЕ КНОПКИ ПЛЕЕРА ---
+        self.btn_direct_play = ttk.Button(btn_frame, text="🔊 Слушать", command=self.play_last_audio, state=tk.DISABLED)
+        self.btn_direct_play.pack(side=tk.LEFT, padx=(10, 2))
+        
+        self.btn_direct_stop_audio = ttk.Button(btn_frame, text="🔇", width=3, command=self.stop_audio_playback)
+        self.btn_direct_stop_audio.pack(side=tk.LEFT, padx=2)
+
+    def stop_audio_playback(self):
+        """Принудительно останавливает текущее воспроизведение аудио"""
+        if platform.system() == "Windows":
+            try: winsound.PlaySound(None, winsound.SND_PURGE)
+            except: pass
+        else:
+            if hasattr(self, 'current_playback_process') and self.current_playback_process:
+                try: self.current_playback_process.terminate()
+                except: pass
+                self.current_playback_process = None
 
     def play_audio_segment(self, audio_segment):
-        """Проигрывает готовый аудиосегмент с гарантированным удалением temp-файла"""
+        """Проигрывает аудиосегмент с защитой от наложения (останавливает предыдущий)"""
+        self.stop_audio_playback()
+
         def _play():
-            temp_path = None
+            # Используем один фиксированный файл, чтобы не засорять папку Temp тысячами файлов
+            temp_dir = APP_DATA_DIR / "temp"
+            temp_dir.mkdir(exist_ok=True)
+            temp_path = temp_dir / "current_playback.wav"
+
             try:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                    temp_path = f.name
-                audio_segment.export(temp_path, format="wav")
-                
+                audio_segment.export(str(temp_path), format="wav")
+
                 if platform.system() == "Windows":
-                    winsound.PlaySound(temp_path, winsound.SND_FILENAME)
+                    # SND_ASYNC позволяет UI не зависать, пока играет звук
+                    winsound.PlaySound(str(temp_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
                 elif platform.system() == "Darwin":
-                    subprocess.call(["afplay", temp_path])
+                    self.current_playback_process = subprocess.Popen(["afplay", str(temp_path)])
+                    self.current_playback_process.wait()
                 else:
-                    subprocess.call(["aplay", temp_path])
+                    self.current_playback_process = subprocess.Popen(["aplay", str(temp_path)])
+                    self.current_playback_process.wait()
             except Exception as e:
                 logging.error(f"Ошибка воспроизведения: {e}")
-            finally:
-                if temp_path and os.path.exists(temp_path):
-                    try: os.remove(temp_path)
-                    except: pass
 
         threading.Thread(target=_play, daemon=True).start()
 
@@ -2196,7 +2279,8 @@ class TTSApp:
         ttk.Entry(file_frame, textvariable=self.import_filepath_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
         def choose_import_file():
-            res = filedialog.askopenfilename(filetypes=[("Книги", "*.epub *.fb2 *.docx *.txt")])
+            init_dir = self._get_smart_dir(self.import_filepath_var.get(), is_file=True)
+            res = filedialog.askopenfilename(initialdir=init_dir, filetypes=[("Книги", "*.epub *.fb2 *.docx *.txt")])
             if res: self.import_filepath_var.set(res)
             
         ttk.Button(file_frame, text="Выбрать файл", command=choose_import_file).pack(side=tk.LEFT)
@@ -2210,7 +2294,8 @@ class TTSApp:
         ttk.Entry(split_frame, textvariable=self.settings_vars["import_outdir"], width=40).grid(row=0, column=1, padx=5)
         
         def choose_import_dir():
-            res = filedialog.askdirectory()
+            init_dir = self._get_smart_dir(self.settings_vars["import_outdir"].get())
+            res = filedialog.askdirectory(initialdir=init_dir)
             if res: self.settings_vars["import_outdir"].set(res)
             
         ttk.Button(split_frame, text="📁", width=3, command=choose_import_dir).grid(row=0, column=2)
@@ -2320,7 +2405,8 @@ class TTSApp:
         
         self.export_outdir_var = tk.StringVar(value=self.config.get("export_dir", ""))
         def choose_exp_dir():
-            res = filedialog.askdirectory()
+            init_dir = self._get_smart_dir(self.export_outdir_var.get())
+            res = filedialog.askdirectory(initialdir=init_dir)
             if res: 
                 self.export_outdir_var.set(res)
                 self.config["export_dir"] = res
@@ -2524,7 +2610,8 @@ class TTSApp:
         self.grp_cover_var.trace("w", self.save_export_item_settings)
         ttk.Entry(cov_frame, textvariable=self.grp_cover_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
         def choose_grp_cov():
-            res = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.jpeg *.png")])
+            init_dir = self._get_smart_dir(self.grp_cover_var.get(), is_file=True)
+            res = filedialog.askopenfilename(initialdir=init_dir, filetypes=[("Images", "*.jpg *.jpeg *.png")])
             if res: self.grp_cover_var.set(res)
         ttk.Button(cov_frame, text="📁", width=3, command=choose_grp_cov).pack(side=tk.RIGHT)
         
@@ -3592,7 +3679,8 @@ class TTSApp:
             f.grid(row=row, column=1, sticky="ew", pady=2, padx=5)
             ttk.Entry(f, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True)
             def cmd():
-                res = filedialog.askopenfilename() if is_file else filedialog.askdirectory()
+                init_dir = self._get_smart_dir(var.get(), is_file=is_file)
+                res = filedialog.askopenfilename(initialdir=init_dir) if is_file else filedialog.askdirectory(initialdir=init_dir)
                 if res: var.set(res)
             ttk.Button(f, text="📁", width=3, command=cmd).pack(side=tk.RIGHT, padx=2)
 
@@ -3714,7 +3802,11 @@ class TTSApp:
                 f = ttk.Frame(parent)
                 f.grid(row=r, column=c+1, sticky="ew", pady=2, padx=5)
                 ttk.Entry(f, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True)
-                ttk.Button(f, text="📁", width=3, command=lambda: var.set(filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.jpeg *.png")]) or var.get())).pack(side=tk.RIGHT, padx=2)
+                def cmd():
+                    init_dir = self._get_smart_dir(var.get(), is_file=True)
+                    res = filedialog.askopenfilename(initialdir=init_dir, filetypes=[("Images", "*.jpg *.jpeg *.png")])
+                    if res: var.set(res)
+                ttk.Button(f, text="📁", width=3, command=cmd).pack(side=tk.RIGHT, padx=2)
             else:
                 ttk.Entry(parent, textvariable=var).grid(row=r, column=c+1, sticky="ew", pady=2, padx=5)
 
@@ -4018,8 +4110,12 @@ class TTSApp:
             except Exception as e:
                 logging.error(f"Ошибка чтения файла для плеера: {e}")
                 
-        btn_play = ttk.Button(fx_frame, text="🔊 Слушать с эффектами", command=play_cache_audio)
+        # --- ОБНОВЛЕННЫЕ КНОПКИ ПЛЕЕРА В КЭШЕ ---
+        btn_play = ttk.Button(fx_frame, text="🔊 Слушать", command=play_cache_audio)
         btn_play.pack(side=tk.LEFT, padx=5, pady=2)
+
+        btn_stop_audio = ttk.Button(fx_frame, text="🔇", width=3, command=self.stop_audio_playback)
+        btn_stop_audio.pack(side=tk.LEFT, padx=2, pady=2)
 
     def load_cache_ui(self):
         self.cache_data = {}
@@ -4230,9 +4326,9 @@ class TTSApp:
         scrollbar.config(command=self.help_text_widget.yview)
         # ------------------------------
         
-        help_text = r"""Добро пожаловать в Silero TTS Studio v1.3!
+        help_text = r"""Добро пожаловать в Silero TTS Studio v1.4!
 
-Это профессиональная рабочая среда для генерации аудиокниг, подкастов и озвучки текста с помощью нейросети Silero. Программа разработана с акцентом на бережное отношение к API-лимитам, умное кэширование, гибридную постобработку звука и автоматизацию сборки.
+Это профессиональная рабочая среда для генерации аудиокниг, подкастов и озвучки текста с помощью нейросети Silero. Программа разработана с акцентом на бережное отношение к API-лимитам, молниеносное O(1) RAM-кэширование, гибридную постобработку звука и автоматизацию сборки.
 
 ====================================================================
 🚀 1. БЫСТРЫЙ СТАРТ
@@ -4241,6 +4337,7 @@ class TTSApp:
 2. Во вкладке "Импорт книг" выберите файл книги (EPUB, FB2, DOCX, TXT) и нажмите "Извлечь и Нарезать". Скрипт автоматически разобьет книгу на главы и сохранит их в папку input_texts.
 3. Перейдите во вкладку "Синтез из папки" и нажмите "▶ Старт (Все)".
 4. Готовые аудиофайлы появятся в папке output_audio.
+5. В процессе работы список файлов автоматически прокручивается. Вы всегда можете вернуться к активному файлу кнопкой "📍 К текущему файлу".
 
 ====================================================================
 🎙 2. РЕЖИМЫ СИНТЕЗА (SYNTHESIS MODES)
@@ -4273,6 +4370,7 @@ class TTSApp:
   - [x] Сохранить: Сохраняет аудиофайл на диск в папку вывода.
   - [x] Игнорировать кэш: Принудительно генерирует речь заново через API.
   - [x] Авто-воспроизведение: Мгновенно проигрывает результат через системный плеер.
+• Умный плеер: Кнопка "🔊 Слушать" мгновенно прерывает старый трек при повторном нажатии (никакой звуковой каши). Кнопка "🔇" принудительно останавливает любой звук.
 • Эффекты: Индивидуальные ползунки скорости, тона и эхо. Нажатие кнопки "💾 Сделать глобальными" мгновенно применяет эти эффекты ко всем настройкам программы.
 
 ====================================================================
@@ -4311,6 +4409,7 @@ class TTSApp:
 • Поддерживаемые форматы: .epub, .fb2, .docx, .txt.
 • Авто-структурирование: Скрипт рекурсивно читает оглавление (TOC) книги и режет её точно по главам.
 • Автоматическое извлечение автора: Извлекает метаданные автора из файлов EPUB и FB2.
+• Умная очистка HTML (EPUB/FB2): Парсер корректно обрабатывает теги <br/> и не разрывает абзацы из-за внутреннего форматирования (жирный, курсив, ссылки), выдавая идеально чистый текст.
 • Нарезка TXT по RegEx: Вы можете нарезать обычный текстовый файл по шаблону заголовков (например: ^Глава \d+ или ^Часть [I-V]+).
 • Шаблоны имен файлов: Используйте переменные {name}, {title}, {author} и {num}. 
   Синтаксис {num:0} или {num:15} позволяет начать нумерацию с нужного вам числа (с нуля, с 15 и т.д.).
@@ -4326,6 +4425,7 @@ class TTSApp:
 • Режимы регистра: "Чувствительно к регистру" (Strict Case) заменяет только точные совпадения. Без галочки (Ignore Case) программа умна: если исходник "Ос", замена станет "Операционная система".
 • RegEx (Паттерны): Мощные регулярные выражения. Например, замена всех римских цифр или очистка сносок [1], (прим. ред.).
 • Управление шрифтом: В правом верхнем углу расположен выпадающий список размера шрифта (10–24) для комфортного чтения редактора.
+• Выборочный импорт/экспорт: При сохранении или загрузке Настроек и Глоссария появляются удобные окна с галочками — вы сами решаете, какие именно группы параметров (папки, эффекты, API) перенести в другой проект.
 
 ====================================================================
 🎛 8. АУДИОЭФФЕКТЫ И ПОСТОБРАБОТКА (FFMPEG)
@@ -4364,6 +4464,7 @@ class TTSApp:
 ====================================================================
 💾 10. УПРАВЛЕНИЕ КЭШЕМ И БЕЗОПАСНОСТЬ
 ====================================================================
+• O(1) RAM-Архитектура: Чтение из кэша происходит исключительно в оперативной памяти без блокировки жесткого диска. Сборка готовой книги на сотни часов занимает считанные минуты, полностью загружая процессор для параллельного рендера!
 • Пропуск готовых файлов: При повторном запуске программа проверяет папку вывода и продолжает работу с того места, где остановилась.
 • Раздельное управление (LRU / TTL): В "Настройках" -> "Обработка и Кэш" вы можете независимо включать ограничение по максимальному количеству записей (LRU) или по времени жизни в часах (TTL).
 • Просмотр кэша: Двойной клик по строке открывает карточку с исходным и нормализованным текстом, спикером и ползунками тестов.
@@ -4376,7 +4477,7 @@ class TTSApp:
 ====================================================================
 Во вкладке "Настройки" -> "API и Лимиты" вы можете гибко управлять нагрузкой на сеть и процессор:
 
-• Сетевые лимиты API: Настройка частоты запросов (по умолчанию 15 за 15 сек) защищает ваш токен от блокировки за превышение лимитов сервера.
+• Сетевые лимиты API: Настройка частоты запросов защищает ваш токен от блокировки. Лимитер является Глобальным — он синхронизирует запросы между вкладкой папок и Прямым синтезом, гарантируя отсутствие банов.
 • Параллельных сборок FFmpeg (Аппаратный лимит CPU):
   - Значение [ 0 ]: Режим максимальной скорости (без ограничений). Задействует 100% ресурсов процессора для мгновенной сборки из кэша.
   - Значение [ 1 ]: "Тихий / Фоновый режим" — [РЕКОМЕНДУЕТСЯ ДЛЯ НОУТБУКОВ]. Файлы собираются строго по очереди один за другим. Процессор и кулеры остаются абсолютно тихими и холодными, а система не лагает.
@@ -4395,6 +4496,7 @@ class TTSApp:
 • Защита NullWriter: Глобальный перехватчик `sys.stdout/stderr` защищает Portable-версии на Windows, macOS и Linux от экстренных вылетов из-за вызовов `print()` в сторонних библиотеках.
 • Атомарное выделение (macOS): Клик с зажатой клавишей ⌘ позволяет выделять и снимать выделение со строк в таблицах.
 • Portable-режим: При запуске `.py` файла через консоль (на Mac, Windows, Linux) или `.exe` на Windows программа работает в полностью портативном режиме — все рабочие папки создаются строго рядом со скриптом.
+• Умные пути (Smart Paths): Программа запоминает последние открытые папки для каждого поля индивидуально. Если поле пустое, диалог вежливо откроет папку текущего проекта. Вам больше не нужно каждый раз прокликивать путь от корня диска!
 """
 
         self.help_text_widget.insert(tk.END, help_text)
@@ -4436,14 +4538,38 @@ class TTSApp:
     def update_file_status(self, filename, status_code):
         status_map = {
             "processing": ("🔄 Синтез...", "processing"),
-            "encoding": ("⚙️ Сборка аудиофайла...", "processing"), # <-- НОВЫЙ СТАТУС
+            "encoding": ("⚙️ Сборка аудиофайла...", "processing"), # <-- ВОЗВРАЩЕНО
             "success": ("✅ Готово", "success"),
             "warning": ("⚠️ С ошибками", "warning"),
             "error": ("❌ Ошибка", "error")
         }
         text, tag = status_map.get(status_code, ("?", "queued"))
         self.tree.item(filename, values=(text, filename), tags=(tag,))
+        
+        if status_code in ("processing", "encoding"):
+            self.current_processing_file = filename
+            try: self.btn_go_current.config(state=tk.NORMAL)
+            except: pass
+            
+            if getattr(self, 'auto_scroll_var', None) and self.auto_scroll_var.get():
+                self.scroll_to_current()
 
+    def scroll_to_current(self):
+        """Центрирует текущий обрабатываемый файл в таблице"""
+        if not hasattr(self, 'current_processing_file') or not self.current_processing_file:
+            return
+            
+        if self.tree.exists(self.current_processing_file):
+            children = self.tree.get_children("")
+            try:
+                idx = children.index(self.current_processing_file)
+                total = len(children)
+                # Отнимаем 8 позиций, чтобы элемент оказался примерно посередине видимой области
+                target_idx = max(0, idx - 8)
+                self.tree.yview_moveto(target_idx / total)
+            except ValueError:
+                self.tree.see(self.current_processing_file)
+    
     def start_processing(self, only_selected=False):
         self.save_settings()
         if not self.config.get("api_token"):
@@ -4472,7 +4598,7 @@ class TTSApp:
         self.lbl_total_pct.config(text=f"0/{len(items_to_process)}")
         self.lbl_current_text.config(text="Подготовка...", foreground=self.get_status_color("text"))
         
-        self.processor = TTSProcessor(self.config, error_callback=self.show_critical_error)
+        self.processor = TTSProcessor(self.config, shared_rate_limiter=self.shared_rate_limiter, error_callback=self.show_critical_error)
         self.processing_thread = threading.Thread(target=self.process_queue, args=(items_to_process,))
         self.processing_thread.start()
 
@@ -4517,14 +4643,6 @@ class TTSApp:
     def process_queue(self, items_to_process):
         try:
             total_files = len(items_to_process)
-            
-            status_file = APP_DATA_DIR / "processing_statuses.json"
-            statuses = {}
-            if status_file.exists():
-                try:
-                    with open(status_file, 'r', encoding='utf-8') as f: statuses = json.load(f)
-                except: pass
-
             skip_existing = self.settings_vars["skip_existing"].get()
             input_dir = Path(self.config["input_dir"])
             
@@ -4540,8 +4658,9 @@ class TTSApp:
                 out_filename = filepath.with_suffix(f'.{self.config["output_format"]}').name
                 out_filepath = Path(self.config["output_dir"]) / out_filename
                 
+                # === ИЗМЕНЕНО: Читаем статусы прямо из RAM процессора ===
                 if skip_existing and out_filepath.exists():
-                    file_status = statuses.get(str(out_filepath.resolve()), "success")
+                    file_status = self.processor.processing_statuses_ram.get(str(out_filepath.resolve()), "success")
                     if file_status == "success":
                         self.root.after(0, self.update_file_status, filepath.name, "success")
                         self.root.after(0, self.update_total_ui, idx + 1, total_files)
@@ -4571,9 +4690,21 @@ class TTSApp:
                     t.join()
             self.processor.active_threads.clear()
             
+            # === НОВОЕ: Финальное сохранение статусов на диск после всей очереди ===
+            self.processor._save_cache()
+            
         except Exception as e:
             logging.error(f"Критическая ошибка в очереди синтеза: {e}")
         finally:
+            # === ФИНАЛЬНОЕ СОХРАНЕНИЕ СТАТУСОВ НА ДИСК (Один раз за весь процесс) ===
+            if self.processor:
+                status_file = APP_DATA_DIR / "processing_statuses.json"
+                try:
+                    with open(status_file, 'w', encoding='utf-8') as f:
+                        json.dump(self.processor.processing_statuses_ram, f, ensure_ascii=False, indent=4)
+                except Exception as e:
+                    logging.error(f"Не удалось записать статусы на диск: {e}")
+                    
             self.root.after(0, self.finish_processing)
 
     def start_direct_processing(self):
@@ -4602,7 +4733,7 @@ class TTSApp:
             self.btn_direct_hard_stop.config(state=tk.NORMAL)
             self.lbl_direct_status.config(text="Обработка...", foreground=self.get_status_color("text"))
             
-            self.processor = TTSProcessor(self.config, error_callback=self.show_critical_error)
+            self.processor = TTSProcessor(self.config, shared_rate_limiter=self.shared_rate_limiter, error_callback=self.show_critical_error)
             
             def run_direct():
                 def on_progress(current, total, txt):
@@ -4674,50 +4805,166 @@ class TTSApp:
 
     def export_config(self):
         self.update_config_from_ui()
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".json", 
-            filetypes=[("JSON files", "*.json")],
-            initialfile="my_tts_config.json"
-        )
-        if filepath:
-            try:
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(self.config, f, indent=4, ensure_ascii=False)
-                messagebox.showinfo("Успех", f"Настройки экспортированы в:\n{filepath}")
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось экспортировать конфиг:\n{e}")
-
-    def import_glossary(self):
-        filepath = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
-        if filepath:
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                # Проверяем, что это действительно глоссарий
-                if not isinstance(data, dict): raise ValueError("Файл не является словарем JSON.")
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("Экспорт настроек")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="Выберите группы настроек для экспорта:").pack(pady=10, padx=20)
+        
+        vars_dict = {
+            "api": (tk.BooleanVar(value=True), "API и Лимиты (Токен, Голос)"),
+            "folders": (tk.BooleanVar(value=True), "Пути к папкам (Ввод, Вывод, Кэш)"),
+            "pauses": (tk.BooleanVar(value=True), "Паузы и Разделители"),
+            "cache": (tk.BooleanVar(value=True), "Настройки Кэша и Очистки"),
+            "effects": (tk.BooleanVar(value=True), "Эффекты (Скорость, Тон, Эхо)"),
+            "tags": (tk.BooleanVar(value=True), "Вывод и Теги ID3")
+        }
+        
+        for key, (var, text) in vars_dict.items():
+            ttk.Checkbutton(dialog, text=text, variable=var).pack(anchor=tk.W, padx=30, pady=2)
+            
+        def do_export():
+            key_groups = {
+                "api": ["api_", "speaker", "max_retries"],
+                "folders": ["input_dir", "output_dir", "cache_dir", "export_dir", "import_outdir"],
+                "pauses": ["pause_", "separator_symbols", "default_group_pause"],
+                "cache": ["auto_", "silence_threshold", "use_cache", "cache_", "enable_cache_"],
+                "effects": ["fx_"],
+                "tags": ["output_", "synthesis_mode", "tag_", "default_group_name"]
+            }
+            export_data = {}
+            for group_key, (var, _) in vars_dict.items():
+                if var.get():
+                    prefixes = key_groups[group_key]
+                    for k, v in self.config.items():
+                        if any(k.startswith(p) for p in prefixes):
+                            export_data[k] = v
+                            
+            dialog.destroy()
+            if len(export_data) <= 1:
+                messagebox.showwarning("Пусто", "Ничего не выбрано для экспорта.")
+                return
                 
-                self.txt_glossary.delete(1.0, tk.END)
-                self.txt_glossary.insert(tk.END, json.dumps(data, indent=4, ensure_ascii=False))
-                self.save_glossary_ui() # Сразу сохраняем в рабочий файл
-                messagebox.showinfo("Успех", "Глоссарий успешно импортирован!")
-            except Exception as e:
-                messagebox.showerror("Ошибка импорта", f"Неверный формат файла:\n{e}")
+            filepath = filedialog.asksaveasfilename(initialdir=str(APP_DATA_DIR), defaultextension=".json", filetypes=[("JSON files", "*.json")], initialfile="my_tts_config.json")
+            if filepath:
+                try:
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        json.dump(export_data, f, indent=4, ensure_ascii=False)
+                    messagebox.showinfo("Успех", f"Настройки экспортированы в:\n{filepath}")
+                except Exception as e:
+                    messagebox.showerror("Ошибка", f"Не удалось экспортировать конфиг:\n{e}")
+                    
+        ttk.Button(dialog, text="Экспортировать", command=do_export).pack(pady=15)
+        self._center_popup(dialog, 350, 280)
 
     def export_glossary(self):
         content = self.txt_glossary.get(1.0, tk.END).strip()
         try:
-            parsed = json.loads(content) # Проверяем валидность перед экспортом
-            filepath = filedialog.asksaveasfilename(
-                defaultextension=".json", 
-                filetypes=[("JSON files", "*.json")],
-                initialfile="my_glossary.json"
-            )
-            if filepath:
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(parsed, f, indent=4, ensure_ascii=False)
-                messagebox.showinfo("Успех", f"Глоссарий экспортирован в:\n{filepath}")
+            parsed = json.loads(content)
         except Exception as e:
             messagebox.showerror("Ошибка JSON", f"Исправьте ошибки в редакторе перед экспортом:\n{e}")
+            return
+            
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("Экспорт Глоссария")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="Что экспортировать?").pack(pady=10, padx=20)
+        
+        var_acc = tk.BooleanVar(value=True)
+        var_trm = tk.BooleanVar(value=True)
+        var_reg = tk.BooleanVar(value=True)
+        
+        ttk.Checkbutton(dialog, text="Ударения (+)", variable=var_acc).pack(anchor=tk.W, padx=30, pady=2)
+        ttk.Checkbutton(dialog, text="Замена терминов", variable=var_trm).pack(anchor=tk.W, padx=30, pady=2)
+        ttk.Checkbutton(dialog, text="RegEx правила", variable=var_reg).pack(anchor=tk.W, padx=30, pady=2)
+        
+        def do_export():
+            export_data = {}
+            if var_acc.get():
+                export_data["accents_ignore_case"] = parsed.get("accents_ignore_case", [])
+                export_data["accents_strict_case"] = parsed.get("accents_strict_case", [])
+            if var_trm.get():
+                export_data["terms_ignore_case"] = parsed.get("terms_ignore_case", {})
+                export_data["terms_strict_case"] = parsed.get("terms_strict_case", {})
+            if var_reg.get():
+                export_data["regex_rules"] = parsed.get("regex_rules", [])
+                
+            dialog.destroy()
+            if not export_data: return
+                
+            filepath = filedialog.asksaveasfilename(initialdir=str(APP_DATA_DIR), defaultextension=".json", filetypes=[("JSON files", "*.json")], initialfile="my_glossary.json")
+            if filepath:
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, indent=4, ensure_ascii=False)
+                messagebox.showinfo("Успех", f"Глоссарий экспортирован в:\n{filepath}")
+                
+        ttk.Button(dialog, text="Экспортировать", command=do_export).pack(pady=15)
+        self._center_popup(dialog, 300, 200)
+
+    def import_glossary(self):
+        filepath = filedialog.askopenfilename(initialdir=str(APP_DATA_DIR), filetypes=[("JSON files", "*.json")])
+        if not filepath: return
+        
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                imported_data = json.load(f)
+            if not isinstance(imported_data, dict): raise ValueError()
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+            return
+            
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("Импорт Глоссария")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        ttk.Label(dialog, text="Что импортировать?\n(Данные будут добавлены к текущим)").pack(pady=10, padx=20)
+        
+        var_acc = tk.BooleanVar(value=True)
+        var_trm = tk.BooleanVar(value=True)
+        var_reg = tk.BooleanVar(value=True)
+        
+        ttk.Checkbutton(dialog, text="Ударения (+)", variable=var_acc).pack(anchor=tk.W, padx=30, pady=2)
+        ttk.Checkbutton(dialog, text="Замена терминов", variable=var_trm).pack(anchor=tk.W, padx=30, pady=2)
+        ttk.Checkbutton(dialog, text="RegEx правила", variable=var_reg).pack(anchor=tk.W, padx=30, pady=2)
+        
+        def do_import():
+            content = self.txt_glossary.get(1.0, tk.END).strip()
+            current = json.loads(content) if content else {}
+            
+            if var_acc.get():
+                current.setdefault("accents_ignore_case", []).extend(imported_data.get("accents_ignore_case", []))
+                current.setdefault("accents_strict_case", []).extend(imported_data.get("accents_strict_case", []))
+                current["accents_ignore_case"] = list(set(current["accents_ignore_case"]))
+                current["accents_strict_case"] = list(set(current["accents_strict_case"]))
+                
+            if var_trm.get():
+                current.setdefault("terms_ignore_case", {}).update(imported_data.get("terms_ignore_case", {}))
+                current.setdefault("terms_strict_case", {}).update(imported_data.get("terms_strict_case", {}))
+                
+            if var_reg.get():
+                # Простая защита от дубликатов RegEx (по паттерну)
+                existing_patterns = {r.get("pattern") for r in current.get("regex_rules", [])}
+                for r in imported_data.get("regex_rules", []):
+                    if r.get("pattern") not in existing_patterns:
+                        current.setdefault("regex_rules", []).append(r)
+                        existing_patterns.add(r.get("pattern"))
+                        
+            dialog.destroy()
+            self.txt_glossary.delete(1.0, tk.END)
+            self.txt_glossary.insert(tk.END, json.dumps(current, indent=4, ensure_ascii=False))
+            self.save_glossary_ui()
+            messagebox.showinfo("Успех", "Правила успешно добавлены в глоссарий!")
+            
+        ttk.Button(dialog, text="Импортировать (Добавить)", command=do_import).pack(pady=15)
+        self._center_popup(dialog, 320, 220)
 
 if __name__ == "__main__":
     root = tk.Tk()
