@@ -1306,9 +1306,6 @@ class TTSApp:
             self._setup_mac_hotkeys()
             # 1. Привязываем фокус к событию реального проявления окна на экране
             self.root.bind("<Map>", lambda e: self.root.after(200, self._force_mac_focus), add="+")
-            # 2. Двойной каскадный таймер для гарантии (если <Map> проскочил)
-            self.root.after(400, self._force_mac_focus)
-            self.root.after(1200, self._force_mac_focus)
         else:
             # Фикс буфера обмена для кириллической раскладки на Windows/Linux
             self._fix_cyrillic_clipboard()
@@ -1338,25 +1335,25 @@ class TTSApp:
         self.root.after(100, _step)
 
     def _force_mac_focus(self, *args):
-        """Жестко выводит окно .app на передний план и передает ему фокус ввода"""
+        """Активирует нативный Click-Through на macOS без ломания событий Tkinter"""
         if is_frozen_mac:
             try:
                 import ctypes, ctypes.util
                 appkit = ctypes.cdll.LoadLibrary(ctypes.util.find_library('AppKit'))
                 ns_app = appkit.objc_msgSend(appkit.objc_getClass('NSApplication'), appkit.sel_registerName('sharedApplication'))
                 
-                # Активируем само приложение
+                # 1. Активируем приложение
                 appkit.objc_msgSend(ns_app, appkit.sel_registerName('activateIgnoringOtherApps:'), True)
-                # Выводим все окна приложения на передний план над другими окнами
-                appkit.objc_msgSend(ns_app, appkit.sel_registerName('arrangeInFront:'), None)
+                
+                # 2. Делаем главное окно ключевым для приема ВСЕХ кликов с первого раза (Click-Through)
+                main_win = appkit.objc_msgSend(ns_app, appkit.sel_registerName('keyWindow'))
+                if main_win:
+                    appkit.objc_msgSend(main_win, appkit.sel_registerName('makeKeyAndOrderFront:'), None)
             except Exception as e:
                 logging.debug(f"Ошибка активации фокуса AppKit: {e}")
 
         try:
             self.root.lift()
-            self.root.attributes('-topmost', True)
-            self.root.update()
-            self.root.attributes('-topmost', False)
             self.root.focus_force()
         except Exception:
             pass
