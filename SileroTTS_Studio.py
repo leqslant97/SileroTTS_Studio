@@ -1335,20 +1335,23 @@ class TTSApp:
         self.root.after(100, _step)
 
     def _force_mac_focus(self, *args):
-        """Активирует нативный Click-Through на macOS без ломания событий Tkinter"""
-        if is_frozen_mac:
+        """Жестко выводит окно .app на передний план и включает Click-Through"""
+        if sys.platform == "darwin":
             try:
                 import ctypes, ctypes.util
                 appkit = ctypes.cdll.LoadLibrary(ctypes.util.find_library('AppKit'))
                 ns_app = appkit.objc_msgSend(appkit.objc_getClass('NSApplication'), appkit.sel_registerName('sharedApplication'))
                 
-                # 1. Активируем приложение
+                # 1. Активируем само приложение
                 appkit.objc_msgSend(ns_app, appkit.sel_registerName('activateIgnoringOtherApps:'), True)
                 
-                # 2. Делаем главное окно ключевым для приема ВСЕХ кликов с первого раза (Click-Through)
+                # 2. Получаем главное окно
                 main_win = appkit.objc_msgSend(ns_app, appkit.sel_registerName('keyWindow'))
                 if main_win:
+                    # Выводим поверх всех
                     appkit.objc_msgSend(main_win, appkit.sel_registerName('makeKeyAndOrderFront:'), None)
+                    # Заставляем окно принимать клики даже когда оно не в фокусе (Click-Through)
+                    appkit.objc_msgSend(main_win, appkit.sel_registerName('setAcceptsMouseMovedEvents:'), True)
             except Exception as e:
                 logging.debug(f"Ошибка активации фокуса AppKit: {e}")
 
@@ -1357,52 +1360,183 @@ class TTSApp:
             self.root.focus_force()
         except Exception:
             pass
-
+        
     def _fix_cyrillic_clipboard(self):
-        """Чинит кириллицу и добавляет умную вставку (очистка путей) для Win/Linux"""
-        # Копирование, Вырезание, Выделить всё - оставляем нативные (они работают идеально)
-        self.root.bind('<Control-с>', lambda e: self.root.event_generate('<<Copy>>'))
-        self.root.bind('<Control-ч>', lambda e: self.root.event_generate('<<Cut>>'))
-        self.root.bind('<Control-ф>', lambda e: self.root.event_generate('<<SelectAll>>'))
-
-        # А вот вставку перехватываем для стандартного Ctrl+V и кириллического Ctrl+М
-        self.root.bind('<Control-v>', self._smart_win_lin_paste)
-        self.root.bind('<Control-м>', self._smart_win_lin_paste)
-
-    def _smart_win_lin_paste(self, event):
-        """Умная вставка: вычищает кавычки (Windows 11) и file:// (Linux)"""
-        try:
-            clip = self.root.clipboard_get()
-        except Exception:
-            return "break" # Буфер пуст или содержит картинку/файл
-
-        if clip:
-            # Очистка мусора из путей
-            clip = clip.strip()
-            if clip.startswith("file://"):
-                clip = clip[7:]
-            if "%" in clip:
-                try: clip = urllib.parse.unquote(clip)
-                except: pass
-            clip = clip.strip('"\'') # Убираем кавычки от Windows 11 "Copy as path"
-
+        """Универсальный и надежный обработчик горячих клавиш без дублей (Win/Linux, RU/EN)"""
+    
+        def get_target_widget(event):
             w = event.widget
             if not isinstance(w, (tk.Text, tk.Entry, ttk.Entry)):
                 w = self.root.focus_get()
-
-            # Безопасная вставка в активный виджет
+            return w if isinstance(w, (tk.Text, tk.Entry, ttk.Entry)) else None
+    
+        def smart_copy(event):
+            w = get_target_widget(event)
+            if not w:
+                return "break"
+    
+            text_to_copy = ""
+            try:
+                if isinstance(w, tk.Text) and w.tag_ranges(tk.SEL):
+                    text_to_copy = w.get(tk.SEL_FIRST, tk.SEL_LAST)
+                elif isinstance(w, (tk.Entry, ttk.Entry)):
+                    if hasattr(w, 'selection_present') and w.selection_present():
+                        text_to_copy = w.selection_get()
+                    else:
+                        sel = w.selection_range()
+                        if sel:
+                            text_to_copy = w.get()[sel[0]:sel[1]]
+            except Exception:
+                pass
+    
+            if text_to_copy:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text_to_copy)
+            return "break"
+    
+        def smart_cut(event):
+            w = get_target_widget(event)
+            if not w:
+                return "break"
+    
+            text_to_copy = ""
+            try:
+                if isinstance(w, tk.Text) and w.tag_ranges(tk.SEL):
+                    text_to_copy = w.get(tk.SEL_FIRST, tk.SEL_LAST)
+                    w.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                elif isinstance(w, (tk.Entry, ttk.Entry)):
+                    if hasattr(w, 'selection_present') and w.selection_present():
+                        text_to_copy = w.selection_get()
+                        w.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                    else:
+                        sel = w.selection_range()
+                        if sel:
+                            start, end = sel
+                            text_to_copy = w.get()[start:end]
+                            w.delete(start, end)
+            except Exception:
+                pass
+    
+            if text_to_copy:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text_to_copy)
+            return "break"
+    
+        def smart_paste(event):
+            w = get_target_widget(event)
+            if not w:
+                return "break"
+    
+            try:
+                clip = self.root.clipboard_get()
+            except Exception:
+                return "break"
+    
+            if clip:
+                clip = clip.strip()
+                if clip.startswith("file://"):
+                    clip = clip[7:]
+                if "%" in clip:
+                    try:
+                        clip = urllib.parse.unquote(clip)
+                    except Exception:
+                        pass
+                clip = clip.strip('"\'')
+    
+                try:
+                    if isinstance(w, tk.Text):
+                        if w.tag_ranges(tk.SEL):
+                            w.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                        w.insert(tk.INSERT, clip)
+                    elif isinstance(w, (tk.Entry, ttk.Entry)):
+                        try:
+                            if hasattr(w, 'selection_present') and w.selection_present():
+                                w.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                            else:
+                                sel = w.selection_range()
+                                if sel:
+                                    w.delete(sel[0], sel[1])
+                        except Exception:
+                            pass
+                        w.insert(tk.INSERT, clip)
+                except Exception:
+                    pass
+    
+            return "break"
+    
+        def smart_select_all(event):
+            w = get_target_widget(event)
+            if not w:
+                return "break"
+            try:
+                if isinstance(w, tk.Text):
+                    w.tag_add(tk.SEL, "1.0", "end-1c")
+                    w.mark_set(tk.INSERT, "1.0")
+                elif isinstance(w, (tk.Entry, ttk.Entry)):
+                    w.selection_range(0, tk.END)
+                    w.icursor(tk.END)
+            except Exception:
+                pass
+            return "break"
+    
+        def smart_undo_redo(event):
+            w = get_target_widget(event)
+            if not w:
+                return "break"
             if isinstance(w, tk.Text):
-                if w.tag_ranges(tk.SEL):
-                    w.delete(tk.SEL_FIRST, tk.SEL_LAST)
-                w.insert(tk.INSERT, clip)
-                return "break"
-            elif isinstance(w, (ttk.Entry, tk.Entry)):
-                if w.selection_present():
-                    w.delete(tk.SEL_FIRST, tk.SEL_LAST)
-                w.insert(tk.INSERT, clip)
-                return "break"
-                
-        return "break"
+                try:
+                    if event.state & 0x0001:  # Shift
+                        w.edit_redo()
+                    else:
+                        w.edit_undo()
+                except Exception:
+                    pass
+            return "break"
+    
+        def handle_global_shortcuts(event):
+            # Проверяем зажатый Ctrl (маска 0x0004)
+            if not (event.state & 0x0004):
+                return None
+    
+            kc = event.keycode
+            char = str(event.char)
+    
+            # Keycodes (Win: 67, 86, 88, 65, 90 / Linux: 54, 55, 53, 38, 52)
+            # + Страховка через ASCII символы управления (\x03, \x16, \x18, \x01, \x1a)
+            is_c = kc in (67, 54) or char in ('\x03', 'c', 'с')
+            is_v = kc in (86, 55) or char in ('\x16', 'v', 'м')
+            is_x = kc in (88, 53) or char in ('\x18', 'x', 'ч')
+            is_a = kc in (65, 38) or char in ('\x01', 'a', 'ф')
+            is_z = kc in (90, 52) or char in ('\x1a', 'z', 'я')
+    
+            if is_c:
+                return smart_copy(event)
+            elif is_v:
+                return smart_paste(event)
+            elif is_x:
+                return smart_cut(event)
+            elif is_a:
+                return smart_select_all(event)
+            elif is_z:
+                return smart_undo_redo(event)
+    
+            return None
+    
+        # 1. Отключаем дефолтную вставку Tkinter на английской раскладке, чтобы убрать задвоение
+        for w_class in ('Text', 'Entry', 'TEntry'):
+            self.root.bind_class(w_class, '<Control-v>', smart_paste)
+            self.root.bind_class(w_class, '<Control-V>', smart_paste)
+            self.root.bind_class(w_class, '<Control-c>', smart_copy)
+            self.root.bind_class(w_class, '<Control-C>', smart_copy)
+            self.root.bind_class(w_class, '<Control-x>', smart_cut)
+            self.root.bind_class(w_class, '<Control-X>', smart_cut)
+            self.root.bind_class(w_class, '<Control-a>', smart_select_all)
+            self.root.bind_class(w_class, '<Control-A>', smart_select_all)
+            self.root.bind_class(w_class, '<Control-z>', smart_undo_redo)
+            self.root.bind_class(w_class, '<Control-Z>', smart_undo_redo)
+    
+        # 2. Глобальный перехватчик для русской раскладки и нетипичных клавиатур
+        self.root.bind("<KeyPress>", handle_global_shortcuts, add="+")
 
     def get_status_color(self, status="info"):
         """Централизованная палитра статусов (WCAG AAA)"""
@@ -2034,6 +2168,7 @@ class TTSApp:
         self.tree = ttk.Treeview(list_frame, columns=("status", "filename"), show="headings", selectmode="extended")
         if sys.platform == "darwin":
             self.tree.bind("<Command-Button-1>", lambda e: self._mac_multiselect(e, self.tree))
+            self.tree.bind("<Button-1>", lambda e: self.root.focus_set(), add="+")
         self.tree.heading("status", text="Статус")
         self.tree.heading("filename", text="Имя файла")
         self.tree.column("status", width=120, anchor=tk.CENTER)
@@ -2165,7 +2300,7 @@ class TTSApp:
         ttk.Checkbutton(mid_fx, text="Эхо", variable=self.dir_echo_var).pack(side=tk.LEFT, padx=5)
         
         ttk.Label(mid_fx, text="Задержка:").pack(side=tk.LEFT, padx=(10, 2))
-        self.lbl_dir_delay = ttk.Label(mid_fx, text=f"{self.dir_echo_delay_var.get()}мс", width=5)
+        self.lbl_dir_delay = ttk.Label(mid_fx, text=f"{self.dir_echo_delay_var.get()}мс", width=6)
         self.lbl_dir_delay.pack(side=tk.LEFT)
         scale_dir_delay = ttk.Scale(mid_fx, from_=50, to_=1000, variable=self.dir_echo_delay_var, command=lambda v: self.lbl_dir_delay.config(text=f"{int(float(v))}мс"))
         scale_dir_delay.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
@@ -3775,7 +3910,7 @@ class TTSApp:
         
         ttk.Label(tab_effects, text="Задержка эхо (мс):").grid(row=5, column=0, sticky=tk.W, pady=5, padx=5)
         self.settings_vars["fx_echo_delay"] = tk.IntVar(value=self.config.get("fx_echo_delay", 300))
-        self.lbl_delay_val = ttk.Label(tab_effects, text=f"{self.settings_vars['fx_echo_delay'].get()}мс", width=5)
+        self.lbl_delay_val = ttk.Label(tab_effects, text=f"{self.settings_vars['fx_echo_delay'].get()}мс", width=6)
         self.lbl_delay_val.grid(row=5, column=2, sticky=tk.W)
         scale_delay = ttk.Scale(tab_effects, from_=50, to_=1000, variable=self.settings_vars["fx_echo_delay"], command=lambda v: self.lbl_delay_val.config(text=f"{int(float(v))}мс"))
         scale_delay.grid(row=5, column=1, sticky=tk.EW, padx=10)
@@ -3986,6 +4121,7 @@ class TTSApp:
         self.cache_tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended")
         if sys.platform == "darwin":
             self.cache_tree.bind("<Command-Button-1>", lambda e: self._mac_multiselect(e, self.cache_tree))
+            self.cache_tree.bind("<Button-1>", lambda e: self.root.focus_set(), add="+")
         self.cache_tree.heading("hash", text="Хэш")
         self.cache_tree.heading("text", text="Текст")
         self.cache_tree.heading("speaker", text="Спикер")
@@ -4075,7 +4211,7 @@ class TTSApp:
         ttk.Checkbutton(mid_fx, text="Эхо", variable=cache_echo_var).pack(side=tk.LEFT, padx=5)
         
         ttk.Label(mid_fx, text="Задержка:").pack(side=tk.LEFT, padx=(10, 2))
-        lbl_delay = ttk.Label(mid_fx, text=f"{cache_echo_delay_var.get()}мс", width=5)
+        lbl_delay = ttk.Label(mid_fx, text=f"{cache_echo_delay_var.get()}мс", width=6)
         lbl_delay.pack(side=tk.LEFT)
         sc_delay = ttk.Scale(mid_fx, from_=50, to_=1000, variable=cache_echo_delay_var, command=lambda v: lbl_delay.config(text=f"{int(float(v))}мс"))
         sc_delay.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
