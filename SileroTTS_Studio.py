@@ -6,7 +6,6 @@ Silero TTS Studio - Профессиональная среда для для г
 
 import os
 import re
-import io
 import json
 import time
 import uuid
@@ -16,13 +15,13 @@ import threading
 import logging
 import requests
 import shutil
-import atexit
 import tempfile
 import platform
 import subprocess
 import sys
 import urllib.parse
 import unicodedata
+import queue
 
 # === ГЛОБАЛЬНЫЙ ПАТЧ ДЛЯ СКРЫТИЯ КОНСОЛИ НА WINDOWS ===
 # Запрещает pydub и ffmpeg моргать черными окнами
@@ -102,26 +101,43 @@ SAFE_LIMIT = 30000 # Лимит символов для авто-разрыва 
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
 
+def _find_bundled_binary(bin_name):
+    if not getattr(sys, 'frozen', False):
+        return None
+
+    exe_dir = Path(sys.executable).resolve().parent
+    bundle_dir = Path(getattr(sys, '_MEIPASS', exe_dir)).resolve()
+    candidates = [
+        bundle_dir / bin_name,
+        exe_dir / bin_name,
+        exe_dir.parent / "Frameworks" / bin_name,
+        exe_dir.parent / "Resources" / bin_name,
+        exe_dir.parent / "MacOS" / bin_name,
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
 def get_ffmpeg_path():
-    """Сначала ищет FFmpeg зашитый внутри пакета, затем в системе"""
+    """Сначала ищет FFmpeg внутри пакета, затем в системе."""
     if getattr(sys, 'frozen', False):
-        bundle_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
         bin_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
-        local_bin = bundle_dir / bin_name
-        if local_bin.exists():
-            return str(local_bin)
+        local_bin = _find_bundled_binary(bin_name)
+        if local_bin:
+            return local_bin
             
     sys_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
     return shutil.which(sys_name) or ("/opt/homebrew/bin/ffmpeg" if sys.platform == "darwin" and os.path.exists("/opt/homebrew/bin/ffmpeg") else sys_name)
 
 def get_ffprobe_path():
-    """Сначала ищет FFprobe зашитый внутри пакета, затем в системе"""
+    """Сначала ищет FFprobe внутри пакета, затем в системе."""
     if getattr(sys, 'frozen', False):
-        bundle_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
         bin_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
-        local_bin = bundle_dir / bin_name
-        if local_bin.exists():
-            return str(local_bin)
+        local_bin = _find_bundled_binary(bin_name)
+        if local_bin:
+            return local_bin
             
     sys_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
     return shutil.which(sys_name) or ("/opt/homebrew/bin/ffprobe" if sys.platform == "darwin" and os.path.exists("/opt/homebrew/bin/ffprobe") else sys_name)
@@ -239,6 +255,24 @@ DEFAULT_CONFIG = {
 # ================= ОБРАБОТКА ЭФФЕКТОВ (FFmpeg) =================
 class AudioEffects:
     """Класс для применения аудиоэффектов (скорость, тон, эхо) через системный FFmpeg."""
+
+    @staticmethod
+    def _atempo_filters(factor):
+        """Разбивает tempo на допустимые для FFmpeg звенья диапазона 0.5..2.0."""
+        factor = float(factor)
+        if factor <= 0:
+            raise ValueError("Коэффициент темпа должен быть больше нуля")
+
+        filters = []
+        while factor > 2.0:
+            filters.append("atempo=2.0")
+            factor /= 2.0
+        while factor < 0.5:
+            filters.append("atempo=0.5")
+            factor /= 0.5
+        if not filters or abs(factor - 1.0) > 1e-9:
+            filters.append(f"atempo={factor:.8g}")
+        return filters
     
     @staticmethod
     def apply_effects(audio_segment, speed=1.0, pitch=1.0, echo=False, echo_delay=300, echo_decay=0.3):
@@ -249,9 +283,9 @@ class AudioEffects:
         if pitch != 1.0:
             new_sr = int(48000 * pitch)
             filters.append(f"asetrate={new_sr}")
-            filters.append(f"atempo={1/pitch}")
+            filters.extend(AudioEffects._atempo_filters(1 / pitch))
         if speed != 1.0:
-            filters.append(f"atempo={speed}")
+            filters.extend(AudioEffects._atempo_filters(speed))
         if echo:
             filters.append(f"aecho=0.8:0.8:{int(echo_delay)}:{float(echo_decay)}")
 
@@ -290,22 +324,53 @@ class AudioEffects:
 class RateLimiter:
     """Контроллер частоты запросов к API."""
     def __init__(self, max_requests, time_window):
-        self.max_requests = max_requests
-        self.time_window = time_window
+        self.max_requests = max(1, int(max_requests))
+        self.time_window = max(0.0, float(time_window))
         self.timestamps = deque()
+        self._lock = threading.Lock()
 
-    def wait(self):
-        now = time.time()
-        while self.timestamps and now - self.timestamps[0] > self.time_window:
-            self.timestamps.popleft()
-        if len(self.timestamps) >= self.max_requests:
-            sleep_time = self.time_window - (now - self.timestamps[0])
-            if sleep_time > 0: time.sleep(sleep_time)
-        self.timestamps.append(time.time())
+    def update_limits(self, max_requests, time_window):
+        """Атомарно обновляет лимиты, пока другие потоки делают запросы."""
+        with self._lock:
+            self.max_requests = max(1, int(max_requests))
+            self.time_window = max(0.0, float(time_window))
+
+    def wait(self, cancelled=None):
+        # Один lock нужен не только для deque: без него два параллельных
+        # синтеза могли одновременно пройти проверку и превысить API-лимит.
+        while True:
+            if cancelled and cancelled():
+                return False
+            with self._lock:
+                now = time.monotonic()
+                while self.timestamps and now - self.timestamps[0] >= self.time_window:
+                    self.timestamps.popleft()
+
+                if len(self.timestamps) < self.max_requests:
+                    if cancelled and cancelled():
+                        return False
+                    self.timestamps.append(now)
+                    return True
+
+                sleep_time = self.time_window - (now - self.timestamps[0])
+
+            # Не держим lock во сне: настройки лимитера и другие ожидающие
+            # потоки остаются отзывчивыми. При остановке просыпаемся не реже
+            # десяти раз в секунду, а не ждём всё окно лимитера.
+            if sleep_time > 0:
+                time.sleep(min(sleep_time, 0.1) if cancelled else sleep_time)
 
 class TTSProcessor:
     """Главный процессор для обработки текста и взаимодействия с API Silero."""
-    def __init__(self, config, shared_rate_limiter=None, error_callback=None):
+    def __init__(
+        self,
+        config,
+        shared_rate_limiter=None,
+        error_callback=None,
+        shared_cache=None,
+        shared_cache_lock=None,
+        shared_processing_statuses=None,
+    ):
         self.cfg = config
         self.error_callback = error_callback
         
@@ -321,12 +386,17 @@ class TTSProcessor:
         self.glossary_path = self.cache_dir / "glossary.json"
 
         self.session = requests.Session()
+        self.cache_lock = shared_cache_lock or threading.RLock()
 
         max_enc = int(self.cfg.get("max_parallel_encodes", 0))
         self.encode_semaphore = threading.Semaphore(max_enc) if max_enc > 0 else None
         
-        self.cache = self._load_cache()
+        # Одновременно работающие вкладки с одной cache_dir используют один
+        # RAM-словарь. Иначе две независимые финальные записи могли потерять
+        # элементы, добавленные соседним процессором.
+        self.cache = shared_cache if shared_cache is not None else self._load_cache()
         self.unsaved_cache_items = 0
+        self.cache_metadata_dirty = False
         self.active_threads = []
         
         self.glossary_ignore_case = {}
@@ -335,21 +405,77 @@ class TTSProcessor:
         self.load_glossary_file()
         
         self.is_stopped = False
-        self.cache_lock = threading.Lock()
         
         raw_seps = str(self.cfg.get("separator_symbols", ""))
         if "," in raw_seps and "\n" not in raw_seps: raw_seps = raw_seps.replace(",", "\n")
         self.separators = [s.strip() for s in raw_seps.split("\n") if s.strip()]
 
-        self.processing_statuses_ram = {}
+        self.processing_statuses_ram = shared_processing_statuses
+        if self.processing_statuses_ram is None:
+            self.processing_statuses_ram = {}
+            status_file = APP_DATA_DIR / "processing_statuses.json"
+            if status_file.exists():
+                try:
+                    with open(status_file, 'r', encoding='utf-8') as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        # Очищаем старый мусор, загружаем только проблемные статусы.
+                        self.processing_statuses_ram = {
+                            key: value
+                            for key, value in loaded.items()
+                            if value in ("warning", "error")
+                        }
+                except Exception as exc:
+                    logging.error(f"Ошибка загрузки processing_statuses.json: {exc}")
+
+            # Не оставляем устаревший файл с success или пустым объектом до
+            # следующего синтеза. Непустые ошибки останутся для resume.
+            if not self.processing_statuses_ram:
+                try:
+                    status_file.unlink(missing_ok=True)
+                except OSError as exc:
+                    logging.error(f"Не удалось удалить пустой processing_statuses.json: {exc}")
+
+    def _mark_output_status(self, out_filepath, status):
+        """Запоминает только проблемные результаты для корректного resume."""
+        key = str(Path(out_filepath).resolve())
+        with self.cache_lock:
+            if status in ("warning", "error"):
+                self.processing_statuses_ram[key] = status
+            else:
+                self.processing_statuses_ram.pop(key, None)
+
+    def _save_processing_statuses(self):
+        """Сохраняет ошибки resume; пустой список на диске не держим."""
         status_file = APP_DATA_DIR / "processing_statuses.json"
-        if status_file.exists():
+        temp_file = status_file.with_suffix(".json.tmp")
+
+        with self.cache_lock:
+            # Миграция старых файлов: success и неизвестные значения не нужны.
+            statuses = {
+                key: value
+                for key, value in self.processing_statuses_ram.items()
+                if value in ("warning", "error")
+            }
+            self.processing_statuses_ram.clear()
+            self.processing_statuses_ram.update(statuses)
+
             try:
-                with open(status_file, 'r', encoding='utf-8') as f:
-                    loaded = json.load(f)
-                    # === ИСПРАВЛЕНИЕ: Очищаем старый мусор, загружаем ТОЛЬКО ошибки ===
-                    self.processing_statuses_ram = {k: v for k, v in loaded.items() if v != "success"}
-            except: pass
+                if not statuses:
+                    status_file.unlink(missing_ok=True)
+                    temp_file.unlink(missing_ok=True)
+                    return
+
+                status_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(temp_file, "w", encoding="utf-8") as file:
+                    json.dump(statuses, file, ensure_ascii=False, indent=4)
+                os.replace(temp_file, status_file)
+            except Exception as exc:
+                logging.error(f"Не удалось сохранить processing_statuses.json: {exc}")
+                try:
+                    temp_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _load_cache(self):
         if self.cache_index_path.exists():
@@ -392,7 +518,7 @@ class TTSProcessor:
         try:
             self.session.close() # Разрывает висящие HTTP-запросы за 1 миллисекунду
         except: pass
-        self._save_cache()
+        self._save_cache(force=True)
     
     def _enforce_cache_limits(self):
         now = time.time()
@@ -413,9 +539,11 @@ class TTSProcessor:
                     self._delete_cache_entry(k)
                     self.unsaved_cache_items += 1
 
-    def _save_cache(self):
-        if self.unsaved_cache_items > 0:
-            with self.cache_lock:
+    def _save_cache(self, force=False):
+        """Атомарно сохраняет индекс; force также сбрасывает hit-статистику."""
+        with self.cache_lock:
+            should_save = self.unsaved_cache_items > 0 or (force and self.cache_metadata_dirty)
+            if should_save:
                 self._enforce_cache_limits()
                 temp_file = self.cache_index_path.with_suffix(".json.tmp")
                 bak_file = self.cache_index_path.with_suffix(".json.bak")
@@ -431,6 +559,7 @@ class TTSProcessor:
                     # 3. Атомарно заменяем рабочий файл (мгновенная операция на уровне ОС)
                     os.replace(temp_file, self.cache_index_path)
                     self.unsaved_cache_items = 0
+                    self.cache_metadata_dirty = False
                 except Exception as e:
                     logging.error(f"Ошибка при атомарном сохранении кэша: {e}")
                     if temp_file.exists():
@@ -591,30 +720,48 @@ class TTSProcessor:
     def _run_ffmpeg_concat(self, audio_files):
         """Склеивает список аудиофайлов через FFmpeg (для Прямого синтеза)"""
         temp_dir = APP_DATA_DIR / "temp"
-        temp_dir.mkdir(exist_ok=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
         
         list_path = temp_dir / f"concat_{uuid.uuid4().hex}.txt"
         temp_out = temp_dir / f"out_{uuid.uuid4().hex}.ogg"
         
-        with open(list_path, 'w', encoding='utf-8') as f:
-            for p in audio_files:
-                safe_path = p.resolve().as_posix().replace("'", "'\\''")
-                f.write(f"file '{safe_path}'\n")
-        
-        # Перекодируем в чистый OGG через -c:a libvorbis
-        cmd = [get_ffmpeg_path(), "-y", "-f", "concat", "-safe", "0", "-i", str(list_path), "-c:a", "libvorbis", str(temp_out)]
-        
-        startupinfo = None
-        if platform.system() == "Windows":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startupinfo)
-        
-        try: os.remove(list_path)
-        except: pass
-        
-        return temp_out if temp_out.exists() else None
+        try:
+            with open(list_path, 'w', encoding='utf-8') as f:
+                for p in audio_files:
+                    safe_path = p.resolve().as_posix().replace("'", "'\\''")
+                    f.write(f"file '{safe_path}'\n")
+
+            # Перекодируем в чистый OGG через -c:a libvorbis
+            cmd = [
+                get_ffmpeg_path(), "-y", "-f", "concat", "-safe", "0",
+                "-i", str(list_path), "-c:a", "libvorbis", str(temp_out),
+            ]
+
+            startupinfo = None
+            if platform.system() == "Windows":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                startupinfo=startupinfo,
+            )
+            if result.returncode != 0 or not temp_out.exists():
+                error_text = result.stderr.decode("utf-8", errors="ignore") if result.stderr else ""
+                logging.error(f"Ошибка FFmpeg при временной склейке:\n{error_text}")
+                if temp_out.exists():
+                    temp_out.unlink(missing_ok=True)
+                return None
+            return temp_out
+        except Exception:
+            logging.exception("Не удалось выполнить временную склейку FFmpeg")
+            if temp_out.exists():
+                temp_out.unlink(missing_ok=True)
+            return None
+        finally:
+            list_path.unlink(missing_ok=True)
 
     def synthesize_sentence(self, normalized_text, original_text, force_new=False):
         text_hash = self.get_hash(normalized_text)
@@ -629,7 +776,14 @@ class TTSProcessor:
             if self.cfg.get("use_cache", True) and text_hash in self.cache and cache_file.exists():
                 cache_info = self.cache[text_hash]
                 cache_info["last_accessed"] = time.time()
-                cache_info["usage_count"] += 1
+                cache_info["usage_count"] = int(cache_info.get("usage_count", 0)) + 1
+                # Статистика попаданий обновляется только в RAM. Не помечаем весь
+                # индекс грязным: иначе _save_cache() в конце каждого входного
+                # файла заново сериализует огромный JSON даже при 100% cache hit.
+                # Если в запуске появились/удалились записи, свежая статистика
+                # попадёт в ту же пакетную запись. При чистом cache-hit проходе
+                # диск не трогаем на каждом файле — только в конце очереди/Stop.
+                self.cache_metadata_dirty = True
                 return cache_file, True
 
         payload = {
@@ -639,14 +793,19 @@ class TTSProcessor:
         }
         
         for attempt in range(1, int(self.cfg["max_retries"]) + 1):
-            if self.is_stopped: return None, False
-            self.rate_limiter.wait()
+            if self.is_stopped:
+                return None, False
+            if not self.rate_limiter.wait(lambda: self.is_stopped):
+                return None, False
+            if self.is_stopped:
+                return None, False
             try:
                 r = self.session.post(self.cfg["api_url"], json=payload, timeout=30)
                 r.raise_for_status()
                 audio_data = base64.b64decode(r.json()['results'][0]['audio'])
                 
                 temp_ogg = self.cache_audio_dir / f"temp_{uuid.uuid4().hex}.ogg"
+                prepared_ogg = self.cache_audio_dir / f"prepared_{uuid.uuid4().hex}.ogg"
                 with open(temp_ogg, "wb") as f: f.write(audio_data)
                     
                 if self.cfg.get("auto_trim_silence", True):
@@ -655,26 +814,45 @@ class TTSProcessor:
                     if nonsilent_ranges:
                         start_trim = max(0, nonsilent_ranges[0][0] - 20)
                         end_trim = min(len(audio_segment), nonsilent_ranges[-1][1] + 20)
-                        audio_segment[start_trim:end_trim].export(cache_file, format="ogg")
+                        audio_segment[start_trim:end_trim].export(prepared_ogg, format="ogg")
                     else:
-                        shutil.move(temp_ogg, cache_file)
+                        os.replace(temp_ogg, prepared_ogg)
                 else:
-                    shutil.move(temp_ogg, cache_file)
-                    
-                if temp_ogg.exists(): os.remove(temp_ogg)
+                    os.replace(temp_ogg, prepared_ogg)
+
+                # Читатели видят либо старый полный файл, либо новый полный файл —
+                # но никогда частично записанный OGG.
+                with self.cache_lock:
+                    os.replace(prepared_ogg, cache_file)
+
+                if temp_ogg.exists():
+                    temp_ogg.unlink(missing_ok=True)
+                if prepared_ogg.exists():
+                    prepared_ogg.unlink(missing_ok=True)
                 
+                should_save_cache = False
                 if self.cfg.get("use_cache", True):
-                    self.cache[text_hash] = {
-                        "file_name": file_name, "original_text": original_text,
-                        "normalized_text": normalized_text, "speaker": self.cfg["speaker"],
-                        "created_at": time.time(), "last_accessed": time.time(), "usage_count": 1
-                    }
-                    self.unsaved_cache_items += 1
-                    if self.unsaved_cache_items >= int(self.cfg["cache_save_frequency"]):
-                        self._save_cache()
+                    with self.cache_lock:
+                        now = time.time()
+                        self.cache[text_hash] = {
+                            "file_name": file_name, "original_text": original_text,
+                            "normalized_text": normalized_text, "speaker": self.cfg["speaker"],
+                            "created_at": now, "last_accessed": now, "usage_count": 1
+                        }
+                        self.unsaved_cache_items += 1
+                        should_save_cache = self.unsaved_cache_items >= int(self.cfg["cache_save_frequency"])
+
+                if should_save_cache:
+                    self._save_cache()
                 return cache_file, True
                 
             except requests.exceptions.HTTPError as e:
+                if 'temp_ogg' in locals():
+                    temp_ogg.unlink(missing_ok=True)
+                if 'prepared_ogg' in locals():
+                    prepared_ogg.unlink(missing_ok=True)
+                if self.is_stopped:
+                    return None, False
                 if r.status_code == 422:
                     try:
                         detail = r.json().get("detail", "")
@@ -693,14 +871,31 @@ class TTSProcessor:
                             return None, False # <-- ИСПРАВЛЕНО
                     except: pass
                 logging.warning(f"HTTP Ошибка (попытка {attempt}): {e}")
-                if attempt < int(self.cfg["max_retries"]): time.sleep(2)
+                if attempt < int(self.cfg["max_retries"]):
+                    time.sleep(2)
                 else: return self._get_silence_file(int(self.cfg["pause_sentence"])), False
             except Exception as e:
+                if 'temp_ogg' in locals():
+                    temp_ogg.unlink(missing_ok=True)
+                if 'prepared_ogg' in locals():
+                    prepared_ogg.unlink(missing_ok=True)
+                if self.is_stopped:
+                    return None, False
                 logging.error(f"Ошибка сети (попытка {attempt}): {e}")
-                if attempt < int(self.cfg["max_retries"]): time.sleep(2)
+                if attempt < int(self.cfg["max_retries"]):
+                    time.sleep(2)
                 else: return self._get_silence_file(int(self.cfg["pause_sentence"])), False
 
-    def process_raw_text(self, raw_text, out_filename, force_new=False, save_to_disk=True, progress_callback=None, completion_callback=None):
+    def process_raw_text(
+        self,
+        raw_text,
+        out_filename,
+        force_new=False,
+        save_to_disk=True,
+        progress_callback=None,
+        completion_callback=None,
+        encoding_callback=None,
+    ):
         raw_text = re.sub(r'[«»“”„]', '"', raw_text)
         raw_text = re.sub(r'^[ \t]*[-–—−]+\s*', '— ', raw_text, flags=re.MULTILINE)
         raw_text = self.apply_regex_rules(raw_text)
@@ -766,6 +961,13 @@ class TTSProcessor:
             tasks.append(("\n".join(current_full_text_clean), "\n".join(current_full_text_raw), 0))
 
         audio_files = []
+        if not tasks:
+            if save_to_disk:
+                self._mark_output_status(Path(self.cfg["output_dir"]) / out_filename, "error")
+            if completion_callback:
+                completion_callback(out_filename, "error", None)
+            return
+
         if int(self.cfg["pause_file_start"]) > 0:
             f = self._get_silence_file(int(self.cfg["pause_file_start"]))
             if f: audio_files.append(f)
@@ -776,6 +978,8 @@ class TTSProcessor:
         for i, task in enumerate(tasks):
             if self.is_stopped:
                 self._save_cache()
+                if save_to_disk:
+                    self._mark_output_status(Path(self.cfg["output_dir"]) / out_filename, "error")
                 if completion_callback: completion_callback(out_filename, "error", None)
                 return
 
@@ -803,18 +1007,25 @@ class TTSProcessor:
         self._save_cache()
 
         if not audio_files:
+            if save_to_disk:
+                self._mark_output_status(Path(self.cfg["output_dir"]) / out_filename, "error")
             if completion_callback: completion_callback(out_filename, "error", None)
             return
 
         if save_to_disk:
             out_filepath = Path(self.cfg["output_dir"]) / out_filename
+            if encoding_callback:
+                encoding_callback(out_filename)
             t = threading.Thread(target=self._merge_save_and_notify, args=(audio_files, out_filepath, out_filename, file_has_errors, completion_callback))
             self.active_threads.append(t)
             t.start()
         else:
             temp_out = self._run_ffmpeg_concat(audio_files)
             if completion_callback:
-                completion_callback(out_filename, "warning" if file_has_errors else "success", temp_out)
+                if temp_out:
+                    completion_callback(out_filename, "warning" if file_has_errors else "success", str(temp_out))
+                else:
+                    completion_callback(out_filename, "error", None)
 
     def _merge_save_and_notify(self, audio_files, out_filepath, original_filename, has_errors, callback):
         def _encode():
@@ -825,6 +1036,7 @@ class TTSProcessor:
             # Генерируем абсолютно уникальное имя файла для каждого потока
             list_path = temp_dir / f"concat_{uuid.uuid4().hex}.txt"
             
+            res = None
             try:
                 with open(list_path, 'w', encoding='utf-8') as f:
                     for p in audio_files:
@@ -833,6 +1045,8 @@ class TTSProcessor:
 
                 cmd = [get_ffmpeg_path(), "-y", "-f", "concat", "-safe", "0", "-i", str(list_path)]
                 
+                out_filepath.parent.mkdir(parents=True, exist_ok=True)
+
                 has_cover = False
                 cover_path = self.cfg.get("tag_cover", "")
                 if cover_path and os.path.exists(cover_path):
@@ -848,9 +1062,9 @@ class TTSProcessor:
                 filters = []
                 if pt != 1.0:
                     filters.append(f"asetrate={int(48000 * pt)}")
-                    filters.append(f"atempo={1/pt}")
+                    filters.extend(AudioEffects._atempo_filters(1 / pt))
                 if sp != 1.0:
-                    filters.append(f"atempo={sp}")
+                    filters.extend(AudioEffects._atempo_filters(sp))
                 if ec:
                     filters.append(f"aecho=0.8:0.8:{int(ed)}:{float(ey)}")
     
@@ -908,6 +1122,8 @@ class TTSProcessor:
                     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     
                 res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo)
+            except Exception:
+                logging.exception(f"Ошибка запуска FFmpeg при сохранении {out_filepath.name}")
             finally:
                 # Блок finally гарантирует, что временный текстовый файл удалится 
                 # строго ПОСЛЕ того, как FFmpeg завершит работу, либо если произойдет сбой
@@ -920,30 +1136,35 @@ class TTSProcessor:
                 if out_filepath.exists():
                     try: os.remove(out_filepath)
                     except: pass
+                self._mark_output_status(out_filepath, "error")
+                if callback:
+                    callback(original_filename, "error", None)
                 return
             # -----------------------------------------------------------------------------------
 
             # --- ЗАЩИТА 2: Если FFmpeg вылетел с ошибкой — СТИРАЕМ ПОЛУГОТОВЫЙ ФАЙЛ ---
-            if res.returncode != 0 or not out_filepath.exists():
-                err_log = res.stderr.decode('utf-8', errors='ignore') if res.stderr else "Неизвестная ошибка"
+            encode_succeeded = res is not None and res.returncode == 0 and out_filepath.exists()
+            if not encode_succeeded:
+                err_log = (
+                    res.stderr.decode('utf-8', errors='ignore')
+                    if res is not None and res.stderr
+                    else "Не удалось запустить FFmpeg или получить выходной файл"
+                )
                 logging.error(f"Ошибка FFmpeg при сохранении {out_filepath.name}:\n{err_log}")
-                has_errors_local = True
                 if out_filepath.exists():
                     try: os.remove(out_filepath)
                     except: pass
-            else:
-                has_errors_local = has_errors
+                self._mark_output_status(out_filepath, "error")
+                if callback:
+                    callback(original_filename, "error", None)
+                return
             # ---------------------------------------------------------------------------
 
             # ОПТИМИЗАЦИЯ 2: Безопасное обновление статуса ТОЛЬКО В ПАМЯТИ
+            has_errors_local = has_errors
             status_str = "warning" if has_errors_local else "success"
             
-            with self.cache_lock:
-                if has_errors_local:
-                    self.processing_statuses_ram[str(out_filepath.resolve())] = status_str
-                else:
-                    # Если файл собрался успешно, удаляем его из списка ошибок (если он там был)
-                    self.processing_statuses_ram.pop(str(out_filepath.resolve()), None)
+            self._mark_output_status(out_filepath, status_str)
                 
             if not has_errors_local:
                 logging.info(f"Файл {out_filepath.name} сохранен с эффектами (Скорость: {sp}x, Тон: {pt}).")
@@ -1020,7 +1241,14 @@ class TTSProcessor:
 
         return hashes
     
-    def process_text_file(self, filepath, dry_run=False, progress_callback=None, completion_callback=None):
+    def process_text_file(
+        self,
+        filepath,
+        dry_run=False,
+        progress_callback=None,
+        completion_callback=None,
+        encoding_callback=None,
+    ):
         try:
             with open(filepath, 'r', encoding='utf-8') as f: raw_text = f.read()
         except Exception as e:
@@ -1032,7 +1260,15 @@ class TTSProcessor:
             self.cfg["use_cache"] = False
         else:
             out_filename = filepath.with_suffix(f'.{self.cfg["output_format"]}').name
-            self.process_raw_text(raw_text, out_filename, False, True, progress_callback, lambda fname, status, audio: completion_callback(filepath.name, status) if completion_callback else None)
+            self.process_raw_text(
+                raw_text,
+                out_filename,
+                False,
+                True,
+                progress_callback,
+                lambda fname, status, audio: completion_callback(filepath.name, status) if completion_callback else None,
+                lambda _fname: encoding_callback(filepath.name) if encoding_callback else None,
+            )
 
         
 
@@ -1238,12 +1474,37 @@ class BookExtractor:
 # ================= ГРАФИЧЕСКИЙ ИНТЕРФЕЙС (GUI) =================
 class TTSApp:
     """Главный класс графического интерфейса приложения."""
+    STATUS_COLORS = {
+        "info": "#003366",
+        "success": "#15803D",
+        "warning": "#C2410C",
+        "error": "#B91C1C",
+        "text": "#000000",
+    }
+
     def __init__(self, root):
         self.root = root
         self.root.title("Silero TTS Studio")
+
+        # Фоновые потоки не должны обращаться к Tcl/Tk напрямую. Они складывают
+        # вызовы сюда, а главный поток регулярно исполняет их из mainloop.
+        self._ui_queue = queue.SimpleQueue()
+        self.root.after(25, self._drain_ui_queue)
         
         self.settings_vars = {}
         self.config = self.load_settings()
+
+        # Старые версии сохраняли вычисляемый путь глоссария в settings.json.
+        # Источник истины — cache_dir; удаляем устаревший ключ, чтобы он не
+        # выглядел как импортированный путь и не переезжал в новые конфиги.
+        self.config.pop("glossary_path", None)
+
+        # Общий лимитер создаём до построения вкладок: setup/load_files вызывают
+        # save_settings(), и теперь им не нужна проверка частично созданного app.
+        self.shared_rate_limiter = RateLimiter(
+            self.config.get("api_max_requests", 15),
+            self.config.get("api_time_window", 15.0),
+        )
 
         # Динамический размер окна (70% от экрана по центру)
         screen_width = self.root.winfo_screenwidth()
@@ -1255,8 +1516,20 @@ class TTSApp:
         self.root.geometry(f"{w}x{h}+{x}+{y}")
         
         self.processor = None
+        self.batch_processor = None
+        self.direct_processor = None
         self.processing_thread = None
+        self.direct_thread = None
         self.last_direct_audio = None
+        self.last_direct_audio_has_effects = False
+        self._batch_hard_stop_requested = False
+        self._direct_hard_stop_requested = False
+        self._is_closing = False
+        self._shared_cache_dir = None
+        self._shared_cache = None
+        self._shared_processing_statuses = None
+        self._shared_cache_lock = threading.RLock()
+        self._cache_ui_filter_after_id = None
 
         self._export_lock = False
         
@@ -1304,17 +1577,85 @@ class TTSApp:
 
         if sys.platform == "darwin":
             self._setup_mac_hotkeys()
-            # 1. Привязываем фокус к событию реального проявления окна на экране
-            self.root.bind("<Map>", lambda e: self.root.after(200, self._force_mac_focus), add="+")
+            self._setup_mac_startup_focus()
         else:
             # Фикс буфера обмена для кириллической раскладки на Windows/Linux
             self._fix_cyrillic_clipboard()
 
-        # Общий лимитер для всех вкладок
-        self.shared_rate_limiter = RateLimiter(int(self.config.get("api_max_requests", 15)), float(self.config.get("api_time_window", 15.0)))
-        
         self.root.after(300, self._silent_pre_warm_tabs)
         
+
+    def _post_to_ui(self, callback, *args, **kwargs):
+        """Потокобезопасно ставит вызов Tkinter в очередь главного потока."""
+        if getattr(self, "_is_closing", False):
+            return
+        self._ui_queue.put((callback, args, kwargs))
+
+    def _create_synthesis_processor(self, config):
+        """Создаёт процессор и делит RAM-кэш между одновременно активными вкладками."""
+        cache_dir = Path(config["cache_dir"]).expanduser().resolve()
+        active_processors = tuple(
+            processor
+            for processor in (self.batch_processor, self.direct_processor)
+            if processor is not None
+        )
+        if active_processors and any(processor.cache_dir.resolve() != cache_dir for processor in active_processors):
+            raise RuntimeError("Нельзя одновременно синтезировать с разными папками кэша")
+        shared_cache = self._shared_cache if self._shared_cache_dir == cache_dir else None
+        processor = TTSProcessor(
+            config,
+            shared_rate_limiter=self.shared_rate_limiter,
+            error_callback=self.show_critical_error,
+            shared_cache=shared_cache,
+            shared_cache_lock=self._shared_cache_lock,
+            shared_processing_statuses=(
+                self._shared_processing_statuses
+                if self._shared_cache_dir == cache_dir
+                else None
+            ),
+        )
+        # Первый процессор загружает и мигрирует индекс штатным _load_cache();
+        # следующие получают уже тот же объект dict.
+        self._shared_cache_dir = cache_dir
+        self._shared_cache = processor.cache
+        self._shared_processing_statuses = processor.processing_statuses_ram
+        return processor
+
+    def _release_shared_cache_if_idle(self):
+        """Не держит устаревшую RAM-копию после завершения обоих синтезов."""
+        if self.batch_processor is None and self.direct_processor is None:
+            self._shared_cache_dir = None
+            self._shared_cache = None
+            self._shared_processing_statuses = None
+
+    def _drain_ui_queue(self):
+        """Исполняет UI-вызовы порциями, не монополизируя Tk mainloop."""
+        processed = 0
+        deadline = time.monotonic() + 0.008
+        queue_was_limited = False
+
+        while processed < 200 and time.monotonic() < deadline:
+            try:
+                callback, args, kwargs = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            try:
+                callback(*args, **kwargs)
+            except Exception:
+                logging.exception("Ошибка отложенного UI-вызова")
+            processed += 1
+
+        if processed >= 200 or time.monotonic() >= deadline:
+            queue_was_limited = True
+
+        try:
+            if self.root.winfo_exists():
+                # Если producer быстрее UI, отдаём Tk возможность обработать
+                # клики/перерисовку и продолжаем почти сразу следующей порцией.
+                self.root.after(1 if queue_was_limited else 25, self._drain_ui_queue)
+        except tk.TclError:
+            pass
 
     def _silent_pre_warm_tabs(self):
         """Тихий фоновый прогрев всех вкладок в памяти без дублирования задач"""
@@ -1334,31 +1675,80 @@ class TTSApp:
 
         self.root.after(100, _step)
 
-    def _force_mac_focus(self, *args):
-        """Жестко выводит окно .app на передний план и включает Click-Through"""
-        if sys.platform == "darwin":
+    def _setup_mac_startup_focus(self):
+        """Один раз поднимает главное окно после его первого появления на macOS."""
+        if sys.platform != "darwin":
+            return
+
+        self._mac_startup_focus_done = False
+        self._mac_startup_focus_after_id = None
+        self._mac_startup_map_bind_id = self.root.bind("<Map>", self._on_mac_initial_map, add="+")
+        # update_idletasks() во время построения большого интерфейса иногда успевает
+        # отобразить root до установки bind. after_idle служит одноразовой страховкой.
+        self.root.after_idle(self._schedule_mac_startup_focus)
+
+    def _on_mac_initial_map(self, event):
+        """Игнорирует Map дочерних окон и повторные Map после сворачивания."""
+        if event.widget is not self.root or self._mac_startup_focus_done:
+            return
+        self._schedule_mac_startup_focus()
+
+    def _schedule_mac_startup_focus(self):
+        """Планирует единственную активацию после завершения отрисовки окна."""
+        if self._mac_startup_focus_done:
+            return
+        if self._mac_startup_focus_after_id is None:
+            self._mac_startup_focus_after_id = self.root.after(200, self._run_mac_startup_focus)
+
+    def _run_mac_startup_focus(self):
+        self._mac_startup_focus_after_id = None
+        if self._mac_startup_focus_done:
+            return
+        self._mac_startup_focus_done = True
+        bind_id = getattr(self, "_mac_startup_map_bind_id", None)
+        if bind_id:
             try:
-                import ctypes, ctypes.util
-                appkit = ctypes.cdll.LoadLibrary(ctypes.util.find_library('AppKit'))
-                ns_app = appkit.objc_msgSend(appkit.objc_getClass('NSApplication'), appkit.sel_registerName('sharedApplication'))
-                
-                # 1. Активируем само приложение
-                appkit.objc_msgSend(ns_app, appkit.sel_registerName('activateIgnoringOtherApps:'), True)
-                
-                # 2. Получаем главное окно
-                main_win = appkit.objc_msgSend(ns_app, appkit.sel_registerName('keyWindow'))
-                if main_win:
-                    # Выводим поверх всех
-                    appkit.objc_msgSend(main_win, appkit.sel_registerName('makeKeyAndOrderFront:'), None)
-                    # Заставляем окно принимать клики даже когда оно не в фокусе (Click-Through)
-                    appkit.objc_msgSend(main_win, appkit.sel_registerName('setAcceptsMouseMovedEvents:'), True)
-            except Exception as e:
-                logging.debug(f"Ошибка активации фокуса AppKit: {e}")
+                self.root.unbind("<Map>", bind_id)
+            except tk.TclError:
+                pass
+            self._mac_startup_map_bind_id = None
+        self._force_mac_focus()
+
+    def _force_mac_focus(self, *args):
+        """Активирует приложение и поднимает окно; вызывается только при старте."""
+        if sys.platform != "darwin":
+            return
+
+        # Finder-сборке иногда нужна явная активация процесса. Не вызываем
+        # objc_msgSend через ctypes: на разных ABI неверная сигнатура такого
+        # вызова приводит к нативному SIGSEGV, который Python поймать не может.
+        # Системный `open` выполняет активацию вне процесса Tk.
+        if is_frozen_mac:
+            try:
+                subprocess.Popen(
+                    ["/usr/bin/open", "-a", str(Path(sys.executable).resolve().parents[2])],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except (OSError, IndexError) as exc:
+                logging.debug(f"Ошибка стартовой активации .app: {exc}")
 
         try:
+            # Одноразово поднимаем окно над Terminal/Finder, затем снимаем
+            # topmost без повторного focus_force и без вложенного root.update().
+            self.root.attributes("-topmost", True)
             self.root.lift()
             self.root.focus_force()
-        except Exception:
+            self.root.after(120, self._release_mac_startup_topmost)
+        except tk.TclError as e:
+            logging.debug(f"Не удалось поднять стартовое окно Tk: {e}")
+
+    def _release_mac_startup_topmost(self):
+        """Снимает только временный topmost, не вмешиваясь в текущий фокус."""
+        try:
+            if self.root.winfo_exists():
+                self.root.attributes("-topmost", False)
+        except tk.TclError:
             pass
         
     def _fix_cyrillic_clipboard(self):
@@ -1540,14 +1930,7 @@ class TTSApp:
 
     def get_status_color(self, status="info"):
         """Централизованная палитра статусов (WCAG AAA)"""
-        colors = {
-            "info": "#003366",     # Глубокий темно-сапфировый
-            "success": "#15803D",  # Темно-зеленый
-            "warning": "#C2410C",  # Темно-оранжевый
-            "error": "#B91C1C",    # Темно-красный
-            "text": "#000000"      # Стандартный черный текст
-        }
-        return colors.get(status, "#000000")
+        return self.STATUS_COLORS.get(status, "#000000")
         
     def reset_global_fx(self):
         """Сброс эффектов во вкладке Настройки к дефолтным значениям"""
@@ -1607,6 +1990,11 @@ class TTSApp:
     
     def _mac_multiselect(self, event, tree):
         """Атомарное выделение с гарантированной зачисткой призраков на macOS"""
+        try:
+            tree.focus_set()
+        except Exception:
+            pass
+
         item = tree.identify_row(event.y)
         if item:
             current_sel = set(tree.selection())
@@ -1617,8 +2005,46 @@ class TTSApp:
             
             # Атомарно задаем весь новый массив выделения и принудительно перерисовываем
             tree.selection_set(tuple(current_sel))
-            tree.update()
+            tree.focus(item)
+            tree.event_generate("<<TreeviewSelect>>")
+            tree.update_idletasks()
         return "break"
+
+    def _bind_mac_treeview_clicks(self, tree):
+        """Единый macOS-патч для ttk.Treeview: фокус + fallback выбора строки."""
+        if sys.platform != "darwin":
+            return
+
+        tree.bind("<ButtonPress-1>", lambda e, t=tree: self._mac_tree_button_press(e, t), add="+")
+        tree.bind("<Command-ButtonPress-1>", lambda e, t=tree: self._mac_multiselect(e, t))
+
+    def _mac_tree_button_press(self, event, tree):
+        try:
+            tree.focus_set()
+        except Exception:
+            pass
+
+        item = tree.identify_row(event.y)
+        region = tree.identify_region(event.x, event.y)
+        if item and region in ("tree", "cell") and not self._mac_event_has_selection_modifier(event):
+            tree.after_idle(lambda t=tree, i=item: self._mac_ensure_tree_plain_click(t, i))
+
+    def _mac_event_has_selection_modifier(self, event):
+        state = getattr(event, "state", 0)
+        return bool(state & (0x0001 | 0x0004 | 0x0008 | 0x0010))
+
+    def _mac_ensure_tree_plain_click(self, tree, item):
+        try:
+            if not tree.winfo_exists() or not tree.exists(item):
+                return
+            if tuple(tree.selection()) != (item,) or tree.focus() != item:
+                tree.selection_set(item)
+                tree.focus(item)
+                tree.event_generate("<<TreeviewSelect>>")
+            else:
+                tree.focus(item)
+        except tk.TclError:
+            pass
 
     def _setup_mac_hotkeys(self):
         """Обработка горячих клавиш macOS и безопасный патч первого клика"""
@@ -1771,6 +2197,10 @@ class TTSApp:
         
         # Проявляем окно уже строго в правильной позиции!
         dialog.deiconify()
+        # transient/grab_set задают владельца и модальность. lift достаточно для
+        # показа над root, но в отличие от focus_force не обесцвечивает выделение
+        # в ранее активном Entry/Text при каждом открытии служебного окна.
+        dialog.lift(self.root)
         
     def _create_wait_popup(self, title, message):
         popup = tk.Toplevel(self.root)
@@ -1804,9 +2234,20 @@ class TTSApp:
     
     def on_closing(self):
         """Безопасное закрытие программы с очисткой временных файлов"""
-        # 1. Если идет синтез, мягко его останавливаем и сохраняем кэш
-        if self.processor and not self.processor.is_stopped:
-            self.processor.stop()
+        if self._is_closing:
+            return
+        self._is_closing = True
+
+        # 1. Если идет синтез, мягко его останавливаем и сохраняем кэш.
+        # Уже завершившийся processor тоже может содержать RAM-only статистику
+        # cache hit, пока finish_processing ещё не успел освободить ссылку.
+        for processor in (self.batch_processor, self.direct_processor):
+            if not processor:
+                continue
+            if not processor.is_stopped:
+                processor.stop()
+            else:
+                processor._save_cache(force=True)
             
         self.save_settings()
         
@@ -1916,7 +2357,6 @@ class TTSApp:
             
     def load_settings(self, path=SETTINGS_FILE):
         """Безопасная загрузка настроек с авто-созданием папки"""
-        self.ensure_dirs()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -1950,9 +2390,10 @@ class TTSApp:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         # === НОВОЕ: Обновляем глобальный лимитер ===
-        if hasattr(self, 'shared_rate_limiter'):
-            self.shared_rate_limiter.max_requests = int(self.config.get("api_max_requests", 15))
-            self.shared_rate_limiter.time_window = float(self.config.get("api_time_window", 15.0))
+        self.shared_rate_limiter.update_limits(
+            self.config.get("api_max_requests", 15),
+            self.config.get("api_time_window", 15.0),
+        )
         
         try:
             with open(path, 'w', encoding='utf-8') as f:
@@ -1963,6 +2404,72 @@ class TTSApp:
             logging.error(f"Ошибка сохранения конфига {path}: {e}")
             if show_popup:
                 messagebox.showerror("Ошибка", f"Не удалось сохранить настройки:\n{e}")
+
+    def _config_group_rules(self):
+        """Точные списки ключей для независимого импорта групп настроек."""
+        return {
+            "api": {
+                "api_token",
+                "api_url",
+                "speaker",
+                "api_max_requests",
+                "api_time_window",
+                "max_retries",
+                "max_parallel_encodes",
+            },
+            "folders": {
+                "input_dir",
+                "output_dir",
+                "cache_dir",
+                "export_dir",
+                "import_outdir",
+            },
+            "pauses": {
+                "pause_file_start",
+                "pause_file_end",
+                "pause_sentence",
+                "pause_paragraph",
+                "pause_speech",
+                "pause_colon",
+                "pause_separator",
+                "separator_symbols",
+                "default_group_pause",
+            },
+            "cache": {
+                "auto_trim_silence",
+                "auto_abbreviations",
+                "auto_short_words",
+                "silence_threshold",
+                "use_cache",
+                "cache_save_frequency",
+                "enable_cache_lru",
+                "enable_cache_ttl",
+                "cache_max_entries",
+                "cache_ttl_hours",
+                "skip_existing",
+            },
+            "effects": {
+                "fx_speed",
+                "fx_pitch",
+                "fx_echo",
+                "fx_echo_delay",
+                "fx_echo_decay",
+            },
+            "tags": {
+                "output_format",
+                "output_bitrate",
+                "synthesis_mode",
+                "tag_title",
+                "tag_artist",
+                "tag_album_artist",
+                "tag_album",
+                "tag_genre",
+                "tag_composer",
+                "tag_year",
+                "tag_cover",
+                "default_group_name",
+            },
+        }
 
     def set_ui_from_config(self):
         """Заполнение полей UI из self.config с полной блокировкой trace-событий"""
@@ -2101,21 +2608,17 @@ class TTSApp:
             ttk.Checkbutton(dialog, text=text, variable=var).pack(anchor=tk.W, padx=30, pady=2)
             
         def do_import():
-            key_groups = {
-                "api": ["api_", "speaker", "max_retries"],
-                "folders": ["input_dir", "output_dir", "cache_dir", "export_dir", "import_outdir"],
-                "pauses": ["pause_", "separator_symbols", "default_group_pause"],
-                "cache": ["auto_", "silence_threshold", "use_cache", "cache_", "enable_cache_"],
-                "effects": ["fx_"],
-                "tags": ["output_", "synthesis_mode", "tag_", "default_group_name"]
-            }
-            
+            key_groups = self._config_group_rules()
+            selected_keys = set()
             for group_key, (var, _) in vars_dict.items():
                 if var.get():
-                    prefixes = key_groups[group_key]
-                    for k, v in imported_data.items():
-                        if any(k.startswith(p) for p in prefixes):
-                            self.config[k] = v
+                    selected_keys.update(key_groups[group_key])
+
+            self.config.update({
+                key: value
+                for key, value in imported_data.items()
+                if key in selected_keys
+            })
                             
             dialog.destroy()
             self.set_ui_from_config()
@@ -2167,8 +2670,7 @@ class TTSApp:
         # ДОБАВЛЕНО: selectmode="extended" для множественного выделения
         self.tree = ttk.Treeview(list_frame, columns=("status", "filename"), show="headings", selectmode="extended")
         if sys.platform == "darwin":
-            self.tree.bind("<Command-Button-1>", lambda e: self._mac_multiselect(e, self.tree))
-            self.tree.bind("<Button-1>", lambda e: self.root.focus_set(), add="+")
+            self._bind_mac_treeview_clicks(self.tree)
         self.tree.heading("status", text="Статус")
         self.tree.heading("filename", text="Имя файла")
         self.tree.column("status", width=120, anchor=tk.CENTER)
@@ -2385,7 +2887,13 @@ class TTSApp:
             except Exception as e:
                 logging.error(f"Ошибка воспроизведения: {e}")
 
-        threading.Thread(target=_play, daemon=True).start()
+        # Этот метод может быть вызван как из Tk-потока, так и после фоновой
+        # подготовки эффектов. subprocess не трогает Tk, поэтому запускаем
+        # воспроизведение сразу в текущем worker либо создаём worker из UI.
+        if threading.current_thread() is threading.main_thread():
+            threading.Thread(target=_play, daemon=True).start()
+        else:
+            _play()
 
     def play_audio_file(self, filepath):
         if not os.path.exists(filepath): return
@@ -2396,16 +2904,38 @@ class TTSApp:
             logging.error(f"Ошибка чтения файла для плеера: {e}")
 
     def play_last_audio(self):
-        if self.last_direct_audio and os.path.exists(self.last_direct_audio):
-            seg = AudioSegment.from_file(self.last_direct_audio)
-            sp = self.dir_speed_var.get()
-            pt = self.dir_pitch_var.get()
-            ec = self.dir_echo_var.get()
-            ed = self.dir_echo_delay_var.get()
-            ey = self.dir_echo_decay_var.get()
+        if not self.last_direct_audio or not os.path.exists(self.last_direct_audio):
+            return
 
-            processed_segment = AudioEffects.apply_effects(seg, speed=sp, pitch=pt, echo=ec, echo_delay=ed, echo_decay=ey)
-            self.play_audio_segment(processed_segment)
+        # Декодирование и эффекты могут занимать секунды. Не блокируем Tk mainloop,
+        # но все значения Tk-переменных читаем заранее в главном потоке.
+        audio_path = self.last_direct_audio
+        already_processed = self.last_direct_audio_has_effects
+        effect_settings = (
+            self.dir_speed_var.get(),
+            self.dir_pitch_var.get(),
+            self.dir_echo_var.get(),
+            self.dir_echo_delay_var.get(),
+            self.dir_echo_decay_var.get(),
+        )
+
+        def _prepare_and_play():
+            try:
+                segment = AudioSegment.from_file(audio_path)
+                if not already_processed:
+                    segment = AudioEffects.apply_effects(
+                        segment,
+                        speed=effect_settings[0],
+                        pitch=effect_settings[1],
+                        echo=effect_settings[2],
+                        echo_delay=effect_settings[3],
+                        echo_decay=effect_settings[4],
+                    )
+                self.play_audio_segment(segment)
+            except Exception:
+                logging.exception("Ошибка подготовки последнего аудио к воспроизведению")
+
+        threading.Thread(target=_prepare_and_play, daemon=True).start()
 
     # --- Вкладка "Импорт книг" ---
     def setup_import_tab(self):
@@ -2504,22 +3034,27 @@ class TTSApp:
                 if not chapters:
                     raise ValueError("Не удалось найти текст или главы в файле.")
                     
-                self.root.after(0, lambda: self.lbl_import_status.config(text=f"Найдено глав: {len(chapters)}. Сохранение...", foreground=self.get_status_color("warning")))
+                self._post_to_ui(
+                    self.lbl_import_status.config,
+                    text=f"Найдено глав: {len(chapters)}. Сохранение...",
+                    foreground=self.STATUS_COLORS["warning"],
+                )
                 
                 # Передаем автора в сохранение
                 saved_files = BookExtractor.save_chapters(chapters, out_dir, filepath, template, author=author)
                 
                 msg = f"Успешно извлечено и сохранено файлов: {len(saved_files)}\nПапка: {out_dir}"
-                self.root.after(0, lambda: self.lbl_import_status.config(text="Готово!", foreground=self.get_status_color("success")))
-                self.root.after(0, lambda: messagebox.showinfo("Успех", msg))
-                self.root.after(0, self.load_files)
+                self._post_to_ui(self.lbl_import_status.config, text="Готово!", foreground=self.STATUS_COLORS["success"])
+                self._post_to_ui(messagebox.showinfo, "Успех", msg)
+                self._post_to_ui(self.load_files)
                 
             except Exception as e:
                 logging.error(f"Ошибка импорта: {e}")
-                self.root.after(0, lambda: self.lbl_import_status.config(text="Ошибка!", foreground=self.get_status_color("error")))
-                self.root.after(0, lambda: messagebox.showerror("Ошибка", f"Не удалось обработать файл:\n{e}"))
+                error_message = f"Не удалось обработать файл:\n{e}"
+                self._post_to_ui(self.lbl_import_status.config, text="Ошибка!", foreground=self.STATUS_COLORS["error"])
+                self._post_to_ui(messagebox.showerror, "Ошибка", error_message)
             finally:
-                self.root.after(0, lambda: self.btn_import_start.config(state=tk.NORMAL))
+                self._post_to_ui(self.btn_import_start.config, state=tk.NORMAL)
                 
         threading.Thread(target=run, daemon=True).start()
 
@@ -2668,7 +3203,7 @@ class TTSApp:
 
         self.export_tree = ttk.Treeview(tree_frame, columns=("duration",), selectmode="extended", height=5)
         if sys.platform == "darwin":
-            self.export_tree.bind("<Command-Button-1>", lambda e: self._mac_multiselect(e, self.export_tree))
+            self._bind_mac_treeview_clicks(self.export_tree)
         self.export_tree.bind("<Control-a>", self._tree_select_all)
         self.export_tree.bind("<Command-a>", self._tree_select_all)
         
@@ -2981,27 +3516,7 @@ class TTSApp:
         
         # 👈 2. Проявляем окно уже готовым и отцентрированным в самом конце!
         self._center_popup(dialog, 350, 250)
-        
-        def apply_changes():
-            val_merge = self.grp_merge_var.get()
-            val_subfolder = self.grp_subfolder_var.get()
-            try: val_pause = self.grp_pause_var.get()
-            except: val_pause = 1000
-            
-            for g_id, g_data in self.export_groups.items():
-                if var_merge.get(): g_data["merge"] = val_merge
-                if var_subfolder.get(): g_data["subfolder"] = val_subfolder
-                if var_pause.get(): g_data["pause"] = val_pause
-                
-            if var_save_default.get():
-                if var_pause.get(): self.config["default_group_pause"] = val_pause
-                # Можно добавить сохранение дефолтов merge/subfolder в config, если нужно
-                self.save_settings()
-                
-            dialog.destroy()
-            messagebox.showinfo("Успех", "Настройки успешно применены ко всем группам!")
-            
-        ttk.Button(dialog, text="Применить", command=apply_changes).pack(pady=15)
+
     def apply_tags_mass(self, scope="group_files"):
         if not self.current_selected_export_item: return
         
@@ -3194,9 +3709,9 @@ class TTSApp:
                                     }
                                     self.export_tree.insert(target_group, tk.END, iid=fid, text=m["title"], values=(self.format_duration(m["duration"]),))
                                 
-                                self.lbl_export_status.config(text=f"Добавлено {curr}/{total_files}...", foreground=self.get_status_color("warning"))
+                                self.lbl_export_status.config(text=f"Добавлено {curr}/{total_files}...", foreground=self.STATUS_COLORS["warning"])
                             
-                            self.root.after(0, update_ui, batch_data.copy(), i+1)
+                            self._post_to_ui(update_ui, batch_data.copy(), i + 1)
                             batch_data.clear() # Очищаем накопитель для следующей пачки
                         
                     # Финализация
@@ -3207,22 +3722,22 @@ class TTSApp:
                         self.update_total_export_duration()
                         
                         if added_count == 0:
-                            self.lbl_export_status.config(text="Файлы уже присутствуют.", foreground=self.get_status_color("info"))
+                            self.lbl_export_status.config(text="Файлы уже присутствуют.", foreground=self.STATUS_COLORS["info"])
                         else:
-                            self.lbl_export_status.config(text="Ожидание...", foreground=self.get_status_color("info"))
+                            self.lbl_export_status.config(text="Ожидание...", foreground=self.STATUS_COLORS["info"])
                             
                         self._export_lock = False
                         self._set_export_ui_state(tk.NORMAL)
                         
-                    self.root.after(0, finish_ui)
+                    self._post_to_ui(finish_ui)
                     
                 except Exception as e:
                     logging.error(f"Ошибка при добавлении файлов: {e}")
                     def fail_ui():
-                        self.lbl_export_status.config(text="Ошибка при добавлении!", foreground=self.get_status_color("error"))
+                        self.lbl_export_status.config(text="Ошибка при добавлении!", foreground=self.STATUS_COLORS["error"])
                         self._export_lock = False
                         self._set_export_ui_state(tk.NORMAL)
-                    self.root.after(0, fail_ui)
+                    self._post_to_ui(fail_ui)
 
             threading.Thread(target=run_import, daemon=True).start()
             
@@ -3454,7 +3969,11 @@ class TTSApp:
 
     def _update_file_tags_inplace(self, fp, f_tags, cov, title_for_status):
         """Обновляет теги файла прямо в его исходной папке на диске без конвертации"""
-        self.root.after(0, lambda f=title_for_status: self.lbl_export_status.config(text=f"Обновление тегов: {f}...", foreground=self.get_status_color("warning")))
+        self._post_to_ui(
+            self.lbl_export_status.config,
+            text=f"Обновление тегов: {title_for_status}...",
+            foreground=self.get_status_color("warning"),
+        )
 
         temp_file = Path(fp).with_suffix(f".tmp_{uuid.uuid4().hex[:6]}{Path(fp).suffix}")
         cmd = [get_ffmpeg_path(), "-y", "-i", str(fp)]
@@ -3531,7 +4050,34 @@ class TTSApp:
         if out_dir and not tags_only:
             out_dir.mkdir(parents=True, exist_ok=True)
 
-        self.save_settings() 
+        # Все значения Tk и структура дерева снимаются до запуска потока.
+        # В фоне используются только обычные Python-объекты.
+        apply_fx = bool(self.export_apply_fx_var.get())
+        if apply_fx and not tags_only:
+            sp = float(self.exp_speed_var.get())
+            pt = float(self.exp_pitch_var.get())
+            ec = bool(self.exp_echo_var.get())
+            ed = int(self.exp_delay_var.get())
+            ey = float(self.exp_decay_var.get())
+        else:
+            sp, pt, ec, ed, ey = 1.0, 1.0, False, 300, 0.3
+
+        fmt = self.export_fmt_var.get()
+        bitrate = self.export_bitrate_var.get()
+        group_children = {
+            group_id: tuple(self.export_tree.get_children(group_id))
+            for group_id in self.export_groups
+        }
+        export_groups = {
+            group_id: settings.copy()
+            for group_id, settings in self.export_groups.items()
+        }
+        export_files = {
+            file_id: settings.copy()
+            for file_id, settings in self.export_files.items()
+        }
+
+        self.save_settings()
         self.btn_export_start.config(state=tk.DISABLED)
         self.btn_export_stop.config(state=tk.NORMAL)
         self.export_progress['value'] = 0
@@ -3539,22 +4085,8 @@ class TTSApp:
         
         def run_export():
             try:
-                total_files = len(self.export_files)
+                total_files = len(export_files)
                 processed_files = 0
-                tags_only = self.export_tags_only_var.get()
-                
-                apply_fx = self.export_apply_fx_var.get()
-                if apply_fx and not tags_only:
-                    sp = float(self.exp_speed_var.get())
-                    pt = float(self.exp_pitch_var.get())
-                    ec = bool(self.exp_echo_var.get())
-                    ed = int(self.exp_delay_var.get())
-                    ey = float(self.exp_decay_var.get())
-                else:
-                    sp, pt, ec, ed, ey = 1.0, 1.0, False, 300, 0.3
-                    
-                fmt = self.export_fmt_var.get()
-                bitrate = self.export_bitrate_var.get()
                 
                 def build_tags(settings_dict):
                     t = {}
@@ -3575,14 +4107,14 @@ class TTSApp:
                         if self.is_export_stopped: break
 
                         # ЭТО ГРУППА
-                        if item_id in self.export_groups:
-                            g_set = self.export_groups[item_id]
+                        if item_id in export_groups:
+                            g_set = export_groups[item_id]
                             g_tags = build_tags(g_set)
-                            files = self.export_tree.get_children(item_id)
+                            files = group_children.get(item_id, ())
 
                             for f_id in files:
                                 if self.is_export_stopped: break
-                                f_set = self.export_files[f_id]
+                                f_set = export_files[f_id]
                                 fp = f_set["path"] # Взяли ТОЧНЫЙ исходный путь файла!
 
                                 f_tags = build_tags(f_set)
@@ -3595,11 +4127,11 @@ class TTSApp:
 
                                 processed_files += 1
                                 pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
-                                self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
+                                self._post_to_ui(self.export_progress.config, value=pct)
 
                         # ЭТО ОДИНОЧНЫЙ ФАЙЛ
-                        elif item_id in self.export_files:
-                            f_set = self.export_files[item_id]
+                        elif item_id in export_files:
+                            f_set = export_files[item_id]
                             fp = f_set["path"] # Взяли ТОЧНЫЙ исходный путь файла!
 
                             f_tags = build_tags(f_set)
@@ -3609,7 +4141,7 @@ class TTSApp:
 
                             processed_files += 1
                             pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
-                            self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
+                            self._post_to_ui(self.export_progress.config, value=pct)
 
                 # =========================================================================
                 # РЕЖИМ 2: ПОЛНЫЙ ЭКСПОРТ (Конвертация с сохранением в Папку Экспорта)
@@ -3618,14 +4150,14 @@ class TTSApp:
                     for item_idx, item_id in enumerate(items):
                         if self.is_export_stopped: break
                         
-                        if item_id in self.export_groups:
+                        if item_id in export_groups:
                             g_id = item_id
-                            g_set = self.export_groups[g_id]
+                            g_set = export_groups[g_id]
                             g_name = g_set["name"]
-                            files = self.export_tree.get_children(g_id)
+                            files = group_children.get(g_id, ())
                             if not files: continue
                             
-                            self.root.after(0, lambda n=g_name: self.lbl_export_status.config(text=f"Обработка: {n}...", foreground=self.get_status_color("text")))
+                            self._post_to_ui(self.lbl_export_status.config, text=f"Обработка: {g_name}...", foreground=self.STATUS_COLORS["text"])
 
                             if g_set["merge"]:
                                 final_audio = AudioSegment.empty()
@@ -3633,28 +4165,28 @@ class TTSApp:
                                 if apply_fx and sp != 1.0: pause_ms = int(pause_ms / sp)
                                 pause_seg = AudioSegment.silent(duration=pause_ms)
 
-                                first_f_set = self.export_files.get(files[0], {})
+                                first_f_set = export_files.get(files[0], {})
                                 for key in ["artist", "album", "album_artist", "genre", "composer", "year", "cover"]:
                                     if not g_set.get(key) and first_f_set.get(key):
                                         g_set[key] = first_f_set[key]
                                 
                                 for i, f_id in enumerate(files):
                                     if self.is_export_stopped: break
-                                    fp = self.export_files[f_id]["path"]
+                                    fp = export_files[f_id]["path"]
                                     final_audio += AudioSegment.from_file(fp)
                                     if i < len(files) - 1 and pause_ms > 0: final_audio += pause_seg
                                     
                                     processed_files += 1
                                     pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
-                                    self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
+                                    self._post_to_ui(self.export_progress.config, value=pct)
                                 
                                 if self.is_export_stopped: break
                                     
                                 if apply_fx:
-                                    self.root.after(0, lambda: self.lbl_export_status.config(text=f"Применение эффектов и сохранение {g_name}...", foreground=self.get_status_color("warning")))
+                                    self._post_to_ui(self.lbl_export_status.config, text=f"Применение эффектов и сохранение {g_name}...", foreground=self.STATUS_COLORS["warning"])
                                     final_audio = AudioEffects.apply_effects(final_audio, speed=sp, pitch=pt, echo=ec, echo_delay=ed, echo_decay=ey)
                                 else:
-                                    self.root.after(0, lambda: self.lbl_export_status.config(text=f"Сохранение {g_name}...", foreground=self.get_status_color("warning")))
+                                    self._post_to_ui(self.lbl_export_status.config, text=f"Сохранение {g_name}...", foreground=self.STATUS_COLORS["warning"])
                                 
                                 export_kwargs = {"format": fmt}
                                 if fmt == "mp3": export_kwargs["bitrate"] = bitrate
@@ -3674,7 +4206,7 @@ class TTSApp:
                                 for i, f_id in enumerate(files):
                                     if self.is_export_stopped: break
                                     
-                                    f_set = self.export_files[f_id]
+                                    f_set = export_files[f_id]
                                     fp = f_set["path"]
                                     
                                     f_tags = build_tags(f_set)
@@ -3685,7 +4217,7 @@ class TTSApp:
                                             
                                     cov = f_set.get("cover") or g_set.get("cover")
                                     
-                                    self.root.after(0, lambda f=f_set['title']: self.lbl_export_status.config(text=f"Конвертация: {f}...", foreground=self.get_status_color("warning")))
+                                    self._post_to_ui(self.lbl_export_status.config, text=f"Конвертация: {f_set['title']}...", foreground=self.STATUS_COLORS["warning"])
                                     audio = AudioSegment.from_file(fp)
                                     
                                     if apply_fx:
@@ -3703,17 +4235,17 @@ class TTSApp:
 
                                     processed_files += 1
                                     pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
-                                    self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
+                                    self._post_to_ui(self.export_progress.config, value=pct)
 
-                        elif item_id in self.export_files:
+                        elif item_id in export_files:
                             f_id = item_id
-                            f_set = self.export_files[f_id]
+                            f_set = export_files[f_id]
                             fp = f_set["path"]
                             
                             f_tags = build_tags(f_set)
                             cov = f_set.get("cover")
                             
-                            self.root.after(0, lambda f=f_set['title']: self.lbl_export_status.config(text=f"Конвертация: {f}...", foreground=self.get_status_color("text")))
+                            self._post_to_ui(self.lbl_export_status.config, text=f"Конвертация: {f_set['title']}...", foreground=self.STATUS_COLORS["text"])
                             audio = AudioSegment.from_file(fp)
                             
                             if apply_fx:
@@ -3731,23 +4263,24 @@ class TTSApp:
                             
                             processed_files += 1
                             pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
-                            self.root.after(0, lambda p=pct: self.export_progress.config(value=p))
+                            self._post_to_ui(self.export_progress.config, value=pct)
 
                 if self.is_export_stopped:
-                    self.root.after(0, lambda: self.lbl_export_status.config(text="Сборка прервана!", foreground=self.get_status_color("error")))
-                    self.root.after(0, lambda: messagebox.showwarning("Остановлено", "Процесс сборки был прерван пользователем."))
+                    self._post_to_ui(self.lbl_export_status.config, text="Сборка прервана!", foreground=self.STATUS_COLORS["error"])
+                    self._post_to_ui(messagebox.showwarning, "Остановлено", "Процесс сборки был прерван пользователем.")
                 else:
                     msg = "Теги успешно обновлены в исходных файлах!" if tags_only else f"Сборка успешно завершена!\nСохранено в: {out_dir}"
-                    self.root.after(0, lambda: self.lbl_export_status.config(text="Готово!", foreground=self.get_status_color("success")))
-                    self.root.after(0, lambda m=msg: messagebox.showinfo("Успех", m))
+                    self._post_to_ui(self.lbl_export_status.config, text="Готово!", foreground=self.STATUS_COLORS["success"])
+                    self._post_to_ui(messagebox.showinfo, "Успех", msg)
                 
             except Exception as e:
                 logging.error(f"Ошибка сборки: {e}")
-                self.root.after(0, lambda: self.lbl_export_status.config(text="Ошибка!", foreground=self.get_status_color("error")))
-                self.root.after(0, lambda: messagebox.showerror("Ошибка", f"Произошла ошибка при сборке:\n{e}"))
+                error_message = f"Произошла ошибка при сборке:\n{e}"
+                self._post_to_ui(self.lbl_export_status.config, text="Ошибка!", foreground=self.STATUS_COLORS["error"])
+                self._post_to_ui(messagebox.showerror, "Ошибка", error_message)
             finally:
-                self.root.after(0, lambda: self.btn_export_start.config(state=tk.NORMAL))
-                self.root.after(0, lambda: self.btn_export_stop.config(state=tk.DISABLED))
+                self._post_to_ui(self.btn_export_start.config, state=tk.NORMAL)
+                self._post_to_ui(self.btn_export_stop.config, state=tk.DISABLED)
 
         threading.Thread(target=run_export, daemon=True).start()
 
@@ -4073,7 +4606,6 @@ class TTSApp:
         cache_dir = Path(self.config.get("cache_dir", "cache_audio"))
         cache_dir.mkdir(exist_ok=True)
         path = cache_dir / "glossary.json"
-        self.config["glossary_path"] = str(path)
         
         self.txt_glossary.delete(1.0, tk.END)
         if os.path.exists(path):
@@ -4105,7 +4637,7 @@ class TTSApp:
         search_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(search_frame, text="Поиск по тексту:").pack(side=tk.LEFT)
         self.search_var = tk.StringVar()
-        self.search_var.trace("w", lambda name, index, mode: self.filter_cache())
+        self.search_var.trace_add("write", self._schedule_cache_filter)
         ttk.Entry(search_frame, textvariable=self.search_var, width=50).pack(side=tk.LEFT, padx=5)
         
         self.lbl_cache_count = ttk.Label(search_frame, text="Всего записей: 0", foreground=self.get_status_color("info"))
@@ -4120,8 +4652,7 @@ class TTSApp:
         # selectmode="extended" разрешает выделение множества строк
         self.cache_tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended")
         if sys.platform == "darwin":
-            self.cache_tree.bind("<Command-Button-1>", lambda e: self._mac_multiselect(e, self.cache_tree))
-            self.cache_tree.bind("<Button-1>", lambda e: self.root.focus_set(), add="+")
+            self._bind_mac_treeview_clicks(self.cache_tree)
         self.cache_tree.heading("hash", text="Хэш")
         self.cache_tree.heading("text", text="Текст")
         self.cache_tree.heading("speaker", text="Спикер")
@@ -4238,8 +4769,6 @@ class TTSApp:
         filepath = Path(self.config.get("cache_dir", "cache_audio")) / "audio" / data.get("file_name", "")
 
         self._center_popup(top, 750, 500)
-        top.lift()
-        top.focus_force()
         
         def play_cache_audio():
             if not os.path.exists(filepath): return
@@ -4264,6 +4793,14 @@ class TTSApp:
         btn_stop_audio.pack(side=tk.LEFT, padx=2, pady=2)
 
     def load_cache_ui(self):
+        pending_filter = getattr(self, "_cache_ui_filter_after_id", None)
+        if pending_filter is not None:
+            try:
+                self.root.after_cancel(pending_filter)
+            except tk.TclError:
+                pass
+            self._cache_ui_filter_after_id = None
+
         self.cache_data = {}
         cache_path = Path(self.config.get("cache_dir", "cache_audio")) / "sentence_cache.json"
         bak_path = cache_path.with_suffix(".json.bak")
@@ -4281,12 +4818,24 @@ class TTSApp:
         self.lbl_cache_count.config(text=f"Всего записей: {len(self.cache_data)}")
         self.filter_cache()
 
+    def _schedule_cache_filter(self, *_args):
+        """Объединяет быстрый набор в поиске в одну перерисовку Treeview."""
+        pending_filter = getattr(self, "_cache_ui_filter_after_id", None)
+        if pending_filter is not None:
+            try:
+                self.root.after_cancel(pending_filter)
+            except tk.TclError:
+                pass
+        self._cache_ui_filter_after_id = self.root.after(150, self.filter_cache)
+
     def filter_cache(self):
+        self._cache_ui_filter_after_id = None
         if not hasattr(self, 'cache_data'):
             self.cache_data = {}
         query = self.search_var.get().lower()
-        for item in self.cache_tree.get_children():
-            self.cache_tree.delete(item)
+        old_items = self.cache_tree.get_children()
+        if old_items:
+            self.cache_tree.delete(*old_items)
             
         count = 0
         for h, data in self.cache_data.items():
@@ -4297,7 +4846,7 @@ class TTSApp:
                 # -------------------------------------------------------------------------------
                 self.cache_tree.insert("", tk.END, iid=h, values=(h[:8]+"...", display_text, data.get("speaker", ""), data.get("usage_count", 0)))
                 count += 1
-                if count > 1000: break
+                if count >= 1000: break
 
     def delete_selected_cache(self):
         if self.is_synthesis_running():
@@ -4318,13 +4867,13 @@ class TTSApp:
             
         with open(cache_dir / "sentence_cache.json", 'w', encoding='utf-8') as f:
             json.dump(self.cache_data, f, ensure_ascii=False, indent=4)
-        self.load_cache_ui()
+        self.lbl_cache_count.config(text=f"Всего записей: {len(self.cache_data)}")
         messagebox.showinfo("Успех", "Записи удалены.")
 
     def is_synthesis_running(self):
         """Проверяет, запущен ли основной или прямой синтез в данный момент"""
         batch_active = bool(self.processing_thread and self.processing_thread.is_alive())
-        direct_active = bool(hasattr(self, 'direct_thread') and self.direct_thread and self.direct_thread.is_alive())
+        direct_active = bool(self.direct_thread and self.direct_thread.is_alive())
         return batch_active or direct_active
 
     def optimize_cache(self):
@@ -4336,22 +4885,29 @@ class TTSApp:
             return
             
         self.save_settings()
-        processor = TTSProcessor(self.config)
+        processor_config = self.config.copy()
+        input_dir = Path(processor_config["input_dir"])
+        processor = TTSProcessor(processor_config)
         
         # 1. Создаем модальное окно ожидания
         popup = self._create_wait_popup("Оптимизация", "Сканирование текстов и проверка кэша...\nПожалуйста, подождите.")
         
         def run_opt():
             try:
-                txt_files = list(Path(self.config["input_dir"]).glob("*.txt"))
+                txt_files = list(input_dir.glob("*.txt"))
                 
                 if not txt_files:
-                    self.root.after(0, lambda: messagebox.showwarning("Отмена", f"В папке '{self.config['input_dir']}' не найдено текстовых файлов (.txt).\nОптимизация отменена, чтобы защитить кэш."))
+                    self._post_to_ui(
+                        messagebox.showwarning,
+                        "Отмена",
+                        f"В папке '{input_dir}' не найдено текстовых файлов (.txt).\n"
+                        "Оптимизация отменена, чтобы защитить кэш.",
+                    )
                     return
 
                 processor.cache = processor._load_cache()
                 if not processor.cache:
-                    self.root.after(0, lambda: messagebox.showinfo("Информация", "Кэш пуст."))
+                    self._post_to_ui(messagebox.showinfo, "Информация", "Кэш пуст.")
                     return
 
                 required_hashes = set()
@@ -4367,7 +4923,7 @@ class TTSApp:
                         errors_occurred = True
 
                 if not required_hashes:
-                    self.root.after(0, lambda: messagebox.showerror("Ошибка", "Не удалось извлечь хэши из текстов. Оптимизация отменена."))
+                    self._post_to_ui(messagebox.showerror, "Ошибка", "Не удалось извлечь хэши из текстов. Оптимизация отменена.")
                     return
 
                 keys_to_delete = [k for k in processor.cache.keys() if k not in required_hashes]
@@ -4380,14 +4936,14 @@ class TTSApp:
                     processor._save_cache()
                     msg = f"Оптимизация завершена.\nУдалено неиспользуемых записей: {len(keys_to_delete)}"
                     if errors_occurred: msg += "\n\n(Внимание: во время чтения некоторых файлов возникли ошибки)"
-                    self.root.after(0, lambda: messagebox.showinfo("Успех", msg))
+                    self._post_to_ui(messagebox.showinfo, "Успех", msg)
                 else:
-                    self.root.after(0, lambda: messagebox.showinfo("Готово", "Оптимизация завершена. Лишних записей не найдено."))
+                    self._post_to_ui(messagebox.showinfo, "Готово", "Оптимизация завершена. Лишних записей не найдено.")
                     
             finally:
-                # 2. Гарантированно закрываем окно ожидания и обновляем UI
-                self.root.after(0, popup.destroy)
-                self.root.after(0, self.load_cache_ui)
+                # Закрываем окно ожидания. Таблица остаётся ленивой и читает
+                # индекс только после явного нажатия пользователем «Обновить».
+                self._post_to_ui(popup.destroy)
             
         threading.Thread(target=run_opt, daemon=True).start()
 
@@ -4411,8 +4967,12 @@ class TTSApp:
             index_path = cache_dir / "sentence_cache.json"
             with open(index_path, 'w', encoding='utf-8') as f:
                 json.dump({}, f)
-                
-            self.load_cache_ui()
+
+            self.cache_data = {}
+            old_items = self.cache_tree.get_children()
+            if old_items:
+                self.cache_tree.delete(*old_items)
+            self.lbl_cache_count.config(text="Всего записей: 0")
             messagebox.showinfo("Готово", "Кэш полностью очищен.")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось очистить кэш:\n{e}")
@@ -4425,6 +4985,8 @@ class TTSApp:
             
         out_zip = filedialog.asksaveasfilename(defaultextension=".zip", filetypes=[("ZIP Archive", "*.zip")], initialfile="cache_audio_backup.zip")
         if not out_zip: return
+
+        delete_after_zip = bool(self.del_after_zip.get())
         
         # Создаем окно ожидания
         popup = self._create_wait_popup("Архивация", "Создание ZIP-архива кэша...\nПожалуйста, подождите.")
@@ -4433,19 +4995,29 @@ class TTSApp:
             try:
                 base_name = out_zip.replace('.zip', '')
                 shutil.make_archive(base_name, 'zip', cache_dir)
-                if self.del_after_zip.get():
+                if delete_after_zip:
                     shutil.rmtree(cache_dir)
-                    Path(cache_dir).mkdir(exist_ok=True)
+                    Path(cache_dir).mkdir(parents=True, exist_ok=True)
                 
                 # Закрываем окно ожидания в главном потоке
-                self.root.after(0, popup.destroy)
-                self.root.after(0, lambda: messagebox.showinfo("Успех", f"Архив создан:\n{out_zip}"))
-                self.root.after(0, self.load_cache_ui)
+                self._post_to_ui(popup.destroy)
+                self._post_to_ui(messagebox.showinfo, "Успех", f"Архив создан:\n{out_zip}")
+                if delete_after_zip:
+                    self._post_to_ui(self._clear_cache_view)
             except Exception as e:
-                self.root.after(0, popup.destroy)
-                self.root.after(0, lambda: messagebox.showerror("Ошибка", f"Не удалось создать архив:\n{e}"))
+                error_message = f"Не удалось создать архив:\n{e}"
+                self._post_to_ui(popup.destroy)
+                self._post_to_ui(messagebox.showerror, "Ошибка", error_message)
                 
         threading.Thread(target=run_zip, daemon=True).start()
+
+    def _clear_cache_view(self):
+        """Очищает только RAM/Treeview, не перечитывая индекс кэша с диска."""
+        self.cache_data = {}
+        old_items = self.cache_tree.get_children()
+        if old_items:
+            self.cache_tree.delete(*old_items)
+        self.lbl_cache_count.config(text="Всего записей: 0")
 
     # --- Вкладка "Справка" ---
     def setup_help_tab(self):
@@ -4472,7 +5044,7 @@ class TTSApp:
         scrollbar.config(command=self.help_text_widget.yview)
         # ------------------------------
         
-        help_text = r"""Добро пожаловать в Silero TTS Studio v1.4!
+        help_text = r"""Добро пожаловать в Silero TTS Studio v1.4.1!
 
 Это профессиональная рабочая среда для генерации аудиокниг, подкастов и озвучки текста с помощью нейросети Silero. Программа разработана с акцентом на бережное отношение к API-лимитам, молниеносное O(1) RAM-кэширование, гибридную постобработку звука и автоматизацию сборки.
 
@@ -4650,15 +5222,17 @@ class TTSApp:
 
     # --- Логика работы приложения ---
     def on_tab_change(self, event):
-        #selected_tab = event.widget.select()
-        #if "glossary" in selected_tab.lower(): self.load_glossary_ui()
-        #elif "cache" in selected_tab.lower(): self.load_cache_ui()
+        """Не выполняет тяжёлый дисковый I/O при переключении вкладок."""
+        # Вкладка «Кэш» намеренно ленивая: индекс читается и Treeview строится
+        # только по кнопке «Обновить» (либо после явной операции с кэшем).
         pass
 
     def load_files(self):
         self.save_settings()
-        for item in self.tree.get_children(): self.tree.delete(item)
-        Path(self.config["input_dir"]).mkdir(exist_ok=True)
+        old_items = self.tree.get_children()
+        if old_items:
+            self.tree.delete(*old_items)
+        Path(self.config["input_dir"]).mkdir(parents=True, exist_ok=True)
         self.txt_files = sorted(list(Path(self.config["input_dir"]).glob("*.txt")), key=lambda x: x.name)
         for f in self.txt_files:
             self.tree.insert("", tk.END, iid=f.name, values=("⏳ В очереди", f.name), tags=('queued',))
@@ -4682,6 +5256,8 @@ class TTSApp:
         self.lbl_total_pct.config(text=f"0/{total}")
 
     def update_file_status(self, filename, status_code):
+        if not self.tree.exists(filename):
+            return
         status_map = {
             "processing": ("🔄 Синтез...", "processing"),
             "encoding": ("⚙️ Сборка аудиофайла...", "processing"), # <-- ВОЗВРАЩЕНО
@@ -4690,9 +5266,15 @@ class TTSApp:
             "error": ("❌ Ошибка", "error")
         }
         text, tag = status_map.get(status_code, ("?", "queued"))
-        self.tree.item(filename, values=(text, filename), tags=(tag,))
+        old_values = self.tree.item(filename, "values")
+        old_tags = self.tree.item(filename, "tags")
+        if tuple(old_values) != (text, filename) or tuple(old_tags) != (tag,):
+            self.tree.item(filename, values=(text, filename), tags=(tag,))
         
-        if status_code in ("processing", "encoding"):
+        # Только однопоточный синтез определяет «текущий» файл. Фоновые
+        # FFmpeg-сборки могут завершаться в любом порядке и не должны менять
+        # авто-прокрутку или указатель текущей строки.
+        if status_code == "processing":
             self.current_processing_file = filename
             try: self.btn_go_current.config(state=tk.NORMAL)
             except: pass
@@ -4717,6 +5299,9 @@ class TTSApp:
                 self.tree.see(self.current_processing_file)
     
     def start_processing(self, only_selected=False):
+        if self.batch_processor is not None:
+            return
+
         self.save_settings()
         if not self.config.get("api_token"):
             messagebox.showerror("Ошибка", "Введите API Token во вкладке Настройки!")
@@ -4743,35 +5328,62 @@ class TTSApp:
         self.lbl_file_pct.config(text="0%")
         self.lbl_total_pct.config(text=f"0/{len(items_to_process)}")
         self.lbl_current_text.config(text="Подготовка...", foreground=self.get_status_color("text"))
+        self._batch_hard_stop_requested = False
         
-        self.processor = TTSProcessor(self.config, shared_rate_limiter=self.shared_rate_limiter, error_callback=self.show_critical_error)
-        self.processing_thread = threading.Thread(target=self.process_queue, args=(items_to_process,))
+        processing_config = self.config.copy()
+        skip_existing = bool(self.settings_vars["skip_existing"].get())
+        try:
+            processor = self._create_synthesis_processor(processing_config)
+        except Exception as exc:
+            logging.error(f"Не удалось создать процессор синтеза: {exc}")
+            self.btn_start_all.config(state=tk.NORMAL)
+            self.btn_start_sel.config(state=tk.NORMAL)
+            self.btn_refresh.config(state=tk.NORMAL)
+            self.btn_remove_sel.config(state=tk.NORMAL)
+            self.btn_stop.config(state=tk.DISABLED)
+            self.btn_hard_stop.config(state=tk.DISABLED)
+            self.lbl_current_text.config(text="Ошибка подготовки.", foreground=self.STATUS_COLORS["error"])
+            messagebox.showerror("Ошибка", f"Не удалось подготовить синтез:\n{exc}")
+            return
+        self.batch_processor = processor
+        self.processor = processor
+        self.processing_thread = threading.Thread(
+            target=self.process_queue,
+            args=(processor, items_to_process, processing_config, skip_existing),
+            daemon=True,
+        )
         self.processing_thread.start()
 
     def stop_processing(self):
-        if self.processor: self.processor.is_stopped = True
+        if self.batch_processor:
+            self.batch_processor.is_stopped = True
+            # Снимок делается в worker, чтобы большой JSON не подвешивал Tk.
+            processor = self.batch_processor
+            threading.Thread(
+                target=processor._save_cache,
+                kwargs={"force": True},
+                daemon=True,
+            ).start()
         self.btn_stop.config(state=tk.DISABLED)
         self.lbl_current_text.config(text="Остановка (ожидание завершения текущего запроса)...", foreground=self.get_status_color("warning"))
 
     def hard_stop_processing(self):
-        if self.processor: 
-            self.processor.stop() # Мгновенно рвет сокеты и сохраняет кэш
-        
-        # Безопасно ждем завершения фонового потока до 1 секунды
-        if self.processing_thread and self.processing_thread.is_alive():
-            self.processing_thread.join(timeout=1.0)
-        
+        if self.batch_processor:
+            self.batch_processor.stop() # Мгновенно рвет сокеты и сохраняет кэш
+
+        # Не блокируем главный поток join(): рабочая очередь завершится сама и
+        # пришлёт финальное обновление через _post_to_ui().
+        self._batch_hard_stop_requested = True
         self.btn_stop.config(state=tk.DISABLED)
         self.btn_hard_stop.config(state=tk.DISABLED)
-        self.btn_start_all.config(state=tk.NORMAL)
-        self.btn_start_sel.config(state=tk.NORMAL)
-        self.btn_refresh.config(state=tk.NORMAL)
-        self.btn_remove_sel.config(state=tk.NORMAL)
-        
+
         self.lbl_current_text.config(text="Принудительно остановлено. Кэш сохранен.", foreground=self.get_status_color("error"))
         messagebox.showwarning("Принудительная остановка", "Процесс прерван. Текущее предложение не завершено, но весь накопленный кэш записан на диск.")
 
-    def finish_processing(self):
+    def finish_processing(self, processor, queue_failed=False):
+        if processor is not self.batch_processor:
+            return
+
         self.btn_start_all.config(state=tk.NORMAL)
         self.btn_start_sel.config(state=tk.NORMAL)
         self.btn_refresh.config(state=tk.NORMAL)
@@ -4779,156 +5391,287 @@ class TTSApp:
         self.btn_stop.config(state=tk.DISABLED)
         self.btn_hard_stop.config(state=tk.DISABLED)
         
-        self.lbl_current_text.config(text="Ожидание...", foreground=self.get_status_color("text"))
-        if self.processor and self.processor.is_stopped:
-            if self.lbl_current_text.cget("text") != "Принудительно остановлено. Кэш сохранен.":
+        if queue_failed:
+            self.lbl_current_text.config(text="Обработка завершилась с ошибкой.", foreground=self.get_status_color("error"))
+            messagebox.showerror("Ошибка", "Очередь синтеза завершилась с ошибкой. Подробности записаны в лог.")
+        elif processor.is_stopped:
+            if getattr(self, "_batch_hard_stop_requested", False):
+                self.lbl_current_text.config(
+                    text="Принудительно остановлено. Кэш сохранен.",
+                    foreground=self.get_status_color("error"),
+                )
+            else:
+                self.lbl_current_text.config(text="Остановлено.", foreground=self.get_status_color("warning"))
                 messagebox.showwarning("Остановлено", "Обработка была прервана.")
         else:
+            self.lbl_current_text.config(text="Ожидание...", foreground=self.get_status_color("text"))
             messagebox.showinfo("Готово", "Все выбранные файлы обработаны!")
 
-    def process_queue(self, items_to_process):
+        self._batch_hard_stop_requested = False
+        self.batch_processor = None
+        self.processing_thread = None
+        if self.processor is processor:
+            self.processor = self.direct_processor
+        self._release_shared_cache_if_idle()
+
+    def process_queue(self, processor, items_to_process, processing_config, skip_existing):
+        queue_failed = False
         try:
             total_files = len(items_to_process)
-            skip_existing = self.settings_vars["skip_existing"].get()
-            input_dir = Path(self.config["input_dir"])
+            input_dir = Path(processing_config["input_dir"])
+            output_dir = Path(processing_config["output_dir"])
+            output_format = processing_config["output_format"]
             
             for idx, item_id in enumerate(items_to_process):
-                if self.processor.is_stopped: break
+                if processor.is_stopped: break
                 
                 filepath = input_dir / item_id
+                out_filename = filepath.with_suffix(f'.{output_format}').name
+                out_filepath = output_dir / out_filename
                 
                 if not filepath.exists():
-                    self.root.after(0, self.update_file_status, item_id, "error")
+                    processor._mark_output_status(out_filepath, "error")
+                    self._post_to_ui(self.update_file_status, item_id, "error")
+                    self._post_to_ui(self.update_total_ui, idx + 1, total_files)
                     continue
-                
-                out_filename = filepath.with_suffix(f'.{self.config["output_format"]}').name
-                out_filepath = Path(self.config["output_dir"]) / out_filename
                 
                 # === ИЗМЕНЕНО: Читаем статусы прямо из RAM процессора ===
                 if skip_existing and out_filepath.exists():
-                    file_status = self.processor.processing_statuses_ram.get(str(out_filepath.resolve()), "success")
+                    file_status = processor.processing_statuses_ram.get(str(out_filepath.resolve()), "success")
                     if file_status == "success":
-                        self.root.after(0, self.update_file_status, filepath.name, "success")
-                        self.root.after(0, self.update_total_ui, idx + 1, total_files)
+                        self._post_to_ui(self.update_file_status, filepath.name, "success")
+                        self._post_to_ui(self.update_total_ui, idx + 1, total_files)
                         continue 
                 
-                self.root.after(0, self.update_file_status, filepath.name, "processing")
-                
+                self._post_to_ui(self.update_file_status, filepath.name, "processing")
+                # Общий счётчик показывает позицию именно однопоточного
+                # синтеза. Фоновые completion-события FFmpeg его не трогают.
+                self._post_to_ui(self.update_total_ui, idx + 1, total_files)
+
+                last_progress_post = 0.0
+                last_progress_value = None
+
                 def on_progress(current, total, text):
+                    nonlocal last_progress_post, last_progress_value
+                    now = time.monotonic()
                     pct = int((current / total) * 100) if total > 0 else 0
-                    self.root.after(0, self.update_progress_ui, pct, text)
+                    # На полном кэше фразы проходят быстрее, чем Tk способен их
+                    # рисовать. Финальный кадр всегда отправляется, промежуточные
+                    # ограничены 10 обновлениями/с без влияния на обработку.
+                    if current < total and (
+                        pct == last_progress_value or now - last_progress_post < 0.1
+                    ):
+                        return
+                    last_progress_post = now
+                    last_progress_value = pct
+                    self._post_to_ui(self.update_progress_ui, pct, text)
+
+                def on_encoding(filename):
+                    # Этот статус принадлежит завершившему синтез файлу. Общий
+                    # счётчик остаётся привязан к однопоточному синтезу.
+                    self._post_to_ui(self.update_file_status, filename, "encoding")
                     
-                def on_complete(filename, status):
-                    self.root.after(0, self.update_file_status, filename, status)
-                    self.root.after(0, self.update_total_ui, idx + 1, total_files)
+                def on_complete(filename, status, audio=None):
+                    self._post_to_ui(self.update_file_status, filename, status)
 
                 try:
-                    self.processor.process_text_file(filepath, progress_callback=on_progress, completion_callback=on_complete)
+                    processor.process_text_file(
+                        filepath,
+                        progress_callback=on_progress,
+                        completion_callback=on_complete,
+                        encoding_callback=on_encoding,
+                    )
                 except Exception as e:
                     logging.error(f"Ошибка при обработке файла {filepath.name}: {e}")
-                    self.root.after(0, self.update_file_status, filepath.name, "error")
+                    processor._mark_output_status(out_filepath, "error")
+                    self._post_to_ui(self.update_file_status, filepath.name, "error")
 
-                if not self.processor.is_stopped:
-                    self.root.after(0, self.update_file_status, filepath.name, "encoding")
-
-            for t in self.processor.active_threads: 
+            for t in processor.active_threads:
                 if t.is_alive():
                     t.join()
-            self.processor.active_threads.clear()
-            
-            # === НОВОЕ: Финальное сохранение статусов на диск после всей очереди ===
-            self.processor._save_cache()
+            processor.active_threads.clear()
             
         except Exception as e:
+            queue_failed = True
             logging.error(f"Критическая ошибка в очереди синтеза: {e}")
         finally:
-            # === ФИНАЛЬНОЕ СОХРАНЕНИЕ СТАТУСОВ НА ДИСК (Один раз за весь процесс) ===
-            if self.processor:
-                status_file = APP_DATA_DIR / "processing_statuses.json"
-                try:
-                    with open(status_file, 'w', encoding='utf-8') as f:
-                        json.dump(self.processor.processing_statuses_ram, f, ensure_ascii=False, indent=4)
-                except Exception as e:
-                    logging.error(f"Не удалось записать статусы на диск: {e}")
+            # Единственный финальный снимок сохраняет новые записи и RAM-only
+            # статистику cache hit даже после исключения в очереди.
+            processor._save_cache(force=True)
+            # На диске нужны только warning/error для resume. При пустом RAM-
+            # словаре старый файл удаляется, а пустой JSON не создаётся.
+            processor._save_processing_statuses()
                     
-            self.root.after(0, self.finish_processing)
+            self._post_to_ui(self.finish_processing, processor, queue_failed)
 
     def start_direct_processing(self):
-            # Явно копируем все локальные настройки прямого синтеза в config
-            self.config["fx_speed"] = self.dir_speed_var.get()
-            self.config["fx_pitch"] = self.dir_pitch_var.get()
-            self.config["fx_echo"] = self.dir_echo_var.get()
-            self.config["fx_echo_delay"] = self.dir_echo_delay_var.get()
-            self.config["fx_echo_decay"] = self.dir_echo_decay_var.get()
-    
-            self.save_settings()
-            if not self.config.get("api_token"):
-                messagebox.showerror("Ошибка", "Введите API Token во вкладке Настройки!")
-                return
-                
-            text = self.direct_text.get(1.0, tk.END).strip()
-            if not text: return
-            
-            filename = self.settings_vars["direct_filename"].get().strip()
-            if not filename: filename = "direct_output.mp3"
-            force = self.settings_vars["direct_force"].get()
-            save_file = self.settings_vars["direct_save"].get()
-            
-            self.btn_direct_start.config(state=tk.DISABLED)
-            self.btn_direct_stop.config(state=tk.NORMAL)
-            self.btn_direct_hard_stop.config(state=tk.NORMAL)
-            self.lbl_direct_status.config(text="Обработка...", foreground=self.get_status_color("text"))
-            
-            self.processor = TTSProcessor(self.config, shared_rate_limiter=self.shared_rate_limiter, error_callback=self.show_critical_error)
-            
-            def run_direct():
-                def on_progress(current, total, txt):
-                    self.root.after(0, lambda: self.lbl_direct_status.config(text=f"Синтез: {current}/{total}...", foreground=self.get_status_color("info")))
-                def on_complete(fname, status, audio=None):
-                    msg = f"Готово! Сохранено в {fname}" if save_file else "Готово! (Не сохранено)"
-                    self.root.after(0, lambda: self.lbl_direct_status.config(text=msg, foreground=self.get_status_color("success")))
-                    self.root.after(0, lambda: self.btn_direct_start.config(state=tk.NORMAL))
-                    self.root.after(0, lambda: self.btn_direct_stop.config(state=tk.DISABLED))
-                    self.root.after(0, lambda: self.btn_direct_hard_stop.config(state=tk.DISABLED))
-                    
-                    self.last_direct_audio = audio
-                    self.root.after(0, lambda: self.btn_direct_play.config(state=tk.NORMAL if audio else tk.DISABLED))
-                    
-                    if self.settings_vars["direct_autoplay"].get() and audio and os.path.exists(audio):
-                        self.play_audio_file(audio)
-                    
-                self.processor.process_raw_text(text, filename, force_new=force, save_to_disk=save_file, progress_callback=on_progress, completion_callback=on_complete)
-                # Дожидаемся завершения кодирования
-                for t in self.processor.active_threads: 
-                    if t.is_alive():
-                        t.join()
-                # Очищаем память от завершенных потоков сборки
-                self.processor.active_threads.clear()
-    
-            self.direct_thread = threading.Thread(target=run_direct, daemon=True)
-            self.direct_thread.start()
+        if self.direct_processor is not None:
+            return
+
+        # Явно копируем все локальные настройки прямого синтеза в config.
+        self.config["fx_speed"] = self.dir_speed_var.get()
+        self.config["fx_pitch"] = self.dir_pitch_var.get()
+        self.config["fx_echo"] = self.dir_echo_var.get()
+        self.config["fx_echo_delay"] = self.dir_echo_delay_var.get()
+        self.config["fx_echo_decay"] = self.dir_echo_decay_var.get()
+
+        self.save_settings()
+        if not self.config.get("api_token"):
+            messagebox.showerror("Ошибка", "Введите API Token во вкладке Настройки!")
+            return
+
+        text = self.direct_text.get(1.0, tk.END).strip()
+        if not text:
+            return
+
+        filename = Path(self.settings_vars["direct_filename"].get().strip() or "direct_output.mp3").name
+        expected_suffix = f".{str(self.config.get('output_format', 'mp3')).lower()}"
+        filename = str(Path(filename).with_suffix(expected_suffix))
+        self.settings_vars["direct_filename"].set(filename)
+        force = self.settings_vars["direct_force"].get()
+        save_file = self.settings_vars["direct_save"].get()
+        autoplay = bool(self.settings_vars["direct_autoplay"].get())
+        self._direct_hard_stop_requested = False
+
+        self.btn_direct_start.config(state=tk.DISABLED)
+        self.btn_direct_stop.config(state=tk.NORMAL)
+        self.btn_direct_hard_stop.config(state=tk.NORMAL)
+        self.lbl_direct_status.config(text="Обработка...", foreground=self.get_status_color("text"))
+
+        direct_config = self.config.copy()
+        try:
+            processor = self._create_synthesis_processor(direct_config)
+        except Exception as exc:
+            logging.error(f"Не удалось создать процессор прямого синтеза: {exc}")
+            self.btn_direct_start.config(state=tk.NORMAL)
+            self.btn_direct_stop.config(state=tk.DISABLED)
+            self.btn_direct_hard_stop.config(state=tk.DISABLED)
+            self.lbl_direct_status.config(text="Ошибка подготовки.", foreground=self.STATUS_COLORS["error"])
+            messagebox.showerror("Ошибка", f"Не удалось подготовить прямой синтез:\n{exc}")
+            return
+        self.direct_processor = processor
+        self.processor = processor
+
+        result = {"fname": filename, "status": None, "audio": None}
+
+        def run_direct():
+            last_progress_post = 0.0
+
+            def on_progress(current, total, _text):
+                nonlocal last_progress_post
+                now = time.monotonic()
+                if current < total and now - last_progress_post < 0.05:
+                    return
+                last_progress_post = now
+                self._post_to_ui(
+                    self.lbl_direct_status.config,
+                    text=f"Синтез: {current}/{total}...",
+                    foreground=self.STATUS_COLORS["info"],
+                )
+
+            def on_complete(fname, status, audio=None):
+                result.update(fname=fname, status=status, audio=audio)
+
+            try:
+                processor.process_raw_text(
+                    text,
+                    filename,
+                    force_new=force,
+                    save_to_disk=save_file,
+                    progress_callback=on_progress,
+                    completion_callback=on_complete,
+                )
+                # Дожидаемся завершения кодирования только в рабочем потоке.
+                for thread in processor.active_threads:
+                    if thread.is_alive():
+                        thread.join()
+            except Exception:
+                logging.exception("Ошибка прямого синтеза")
+                result["status"] = "error"
+            finally:
+                processor.active_threads.clear()
+                processor._save_cache(force=True)
+                # Прямой синтез использует тот же RAM-словарь статусов, поэтому
+                # он тоже должен сбросить warning/error после завершения.
+                processor._save_processing_statuses()
+                self._post_to_ui(
+                    self._finish_direct_processing,
+                    processor,
+                    result.copy(),
+                    save_file,
+                    autoplay,
+                )
+
+        self.direct_thread = threading.Thread(target=run_direct, daemon=True)
+        self.direct_thread.start()
 
     def stop_direct_processing(self):
-        if self.processor: self.processor.is_stopped = True
+        if self.direct_processor:
+            self.direct_processor.is_stopped = True
+            processor = self.direct_processor
+            threading.Thread(
+                target=processor._save_cache,
+                kwargs={"force": True},
+                daemon=True,
+            ).start()
         self.btn_direct_stop.config(state=tk.DISABLED)
         self.lbl_direct_status.config(text="Остановка...", foreground=self.get_status_color("warning"))
 
     def hard_stop_direct_processing(self):
-        if self.processor: 
-            self.processor.stop() # Мгновенно рвет HTTP-сокет и сохраняет кэш
-            
-        # Ждем завершения фонового потока прямого синтеза до 1 секунды
-        if hasattr(self, 'direct_thread') and self.direct_thread and self.direct_thread.is_alive():
-            self.direct_thread.join(timeout=1.0)
-            
+        if self.direct_processor:
+            self.direct_processor.stop() # Мгновенно рвет HTTP-сокет и сохраняет кэш
+
+        # Поток завершится самостоятельно; Tk mainloop остаётся отзывчивым.
+        self._direct_hard_stop_requested = True
         self.btn_direct_stop.config(state=tk.DISABLED)
         self.btn_direct_hard_stop.config(state=tk.DISABLED)
-        self.btn_direct_start.config(state=tk.NORMAL)
         self.lbl_direct_status.config(text="Принудительно остановлено. Кэш сохранен.", foreground=self.get_status_color("error"))
+
+    def _finish_direct_processing(self, processor, result, save_file, autoplay):
+        if processor is not self.direct_processor:
+            return
+
+        self.btn_direct_start.config(state=tk.NORMAL)
+        self.btn_direct_stop.config(state=tk.DISABLED)
+        self.btn_direct_hard_stop.config(state=tk.DISABLED)
+
+        status = result.get("status")
+        audio = result.get("audio")
+        if processor.is_stopped:
+            if self._direct_hard_stop_requested:
+                text = "Принудительно остановлено. Кэш сохранен."
+                color = self.get_status_color("error")
+            else:
+                text = "Остановлено."
+                color = self.get_status_color("warning")
+        elif status in ("success", "warning"):
+            text = f"Готово! Сохранено в {result.get('fname')}" if save_file else "Готово! (Не сохранено)"
+            color = self.get_status_color(status)
+        else:
+            text = "Ошибка синтеза. Подробности записаны в лог."
+            color = self.get_status_color("error")
+
+        self.lbl_direct_status.config(text=text, foreground=color)
+        self.last_direct_audio = audio if audio and os.path.exists(audio) else None
+        self.last_direct_audio_has_effects = bool(save_file and self.last_direct_audio)
+        self.btn_direct_play.config(state=tk.NORMAL if self.last_direct_audio else tk.DISABLED)
+
+        if autoplay and self.last_direct_audio and status in ("success", "warning"):
+            self.play_last_audio()
+
+        self._direct_hard_stop_requested = False
+        self.direct_processor = None
+        self.direct_thread = None
+        if self.processor is processor:
+            self.processor = self.batch_processor
+        self._release_shared_cache_if_idle()
     
     def update_progress_ui(self, pct, text):
-        self.file_progress['value'] = pct
-        self.lbl_file_pct.config(text=f"{pct}%")
+        pct_text = f"{pct}%"
+        if int(float(self.file_progress['value'])) != pct:
+            self.file_progress['value'] = pct
+        if self.lbl_file_pct.cget("text") != pct_text:
+            self.lbl_file_pct.config(text=pct_text)
         
         display_text = text.replace('\n', ' ')
         if len(display_text) > 90:
@@ -4936,18 +5679,22 @@ class TTSApp:
         else:
             display_text = display_text.ljust(90)
             
-        self.lbl_current_text.config(text=f"Синтез: {display_text}", foreground=self.get_status_color("info"))
+        label_text = f"Синтез: {display_text}"
+        if self.lbl_current_text.cget("text") != label_text:
+            self.lbl_current_text.config(text=label_text, foreground=self.get_status_color("info"))
 
     def update_total_ui(self, current, total):
         pct = int((current / total) * 100) if total > 0 else 0
-        self.total_progress['value'] = pct
-        self.lbl_total_pct.config(text=f"{current}/{total}")
+        count_text = f"{current}/{total}"
+        if int(float(self.total_progress['value'])) != pct:
+            self.total_progress['value'] = pct
+        if self.lbl_total_pct.cget("text") != count_text:
+            self.lbl_total_pct.config(text=count_text)
 
 
     def show_critical_error(self, message):
         """Показывает всплывающее окно с ошибкой, пришедшей из фонового потока"""
-        # Используем after(0, ...), чтобы безопасно вызвать messagebox из главного потока
-        self.root.after(0, lambda: messagebox.showerror("Критическая ошибка API", message))
+        self._post_to_ui(messagebox.showerror, "Критическая ошибка API", message)
 
     def export_config(self):
         self.update_config_from_ui()
@@ -4973,24 +5720,20 @@ class TTSApp:
             ttk.Checkbutton(dialog, text=text, variable=var).pack(anchor=tk.W, padx=30, pady=2)
             
         def do_export():
-            key_groups = {
-                "api": ["api_", "speaker", "max_retries"],
-                "folders": ["input_dir", "output_dir", "cache_dir", "export_dir", "import_outdir"],
-                "pauses": ["pause_", "separator_symbols", "default_group_pause"],
-                "cache": ["auto_", "silence_threshold", "use_cache", "cache_", "enable_cache_"],
-                "effects": ["fx_"],
-                "tags": ["output_", "synthesis_mode", "tag_", "default_group_name"]
-            }
-            export_data = {}
+            key_groups = self._config_group_rules()
+            selected_keys = set()
             for group_key, (var, _) in vars_dict.items():
                 if var.get():
-                    prefixes = key_groups[group_key]
-                    for k, v in self.config.items():
-                        if any(k.startswith(p) for p in prefixes):
-                            export_data[k] = v
+                    selected_keys.update(key_groups[group_key])
+
+            export_data = {
+                key: value
+                for key, value in self.config.items()
+                if key in selected_keys
+            }
                             
             dialog.destroy()
-            if len(export_data) <= 1:
+            if not export_data:
                 messagebox.showwarning("Пусто", "Ничего не выбрано для экспорта.")
                 return
                 

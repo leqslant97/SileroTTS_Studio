@@ -1,6 +1,6 @@
 # 🎙 Silero TTS Studio
 
-Профессиональная рабочая среда (GUI) для генерации аудиокниг, подкастов и озвучки текста с использованием нейросети Silero. 
+Профессиональная рабочая среда (GUI) для генерации аудиокниг, подкастов и озвучки текста с использованием нейросети Silero.
 
 Программа оптимизирована для создания длинных аудиокниг с минимальными затратами API-лимитов. Поддерживает молниеносное O(1) RAM-кэширование, локальную постобработку звука (FFmpeg), работу с глоссариями, извлечение текста из электронных книг (EPUB, FB2, DOCX) и пакетную сборку с редактированием ID3-тегов.
 
@@ -37,9 +37,12 @@
 
 ## ⚙️ Установка и запуск
 
-Для работы программы необходим **Python 3.8+** и системный пакет **FFmpeg** (для работы со звуком и извлечения обложек).
+Ниже описан запуск **из исходников**. Для него необходимы **Python 3.10+**, Tkinter и системные **FFmpeg/FFprobe**. Готовые полные сборки уже содержат FFmpeg/FFprobe и не требуют их отдельной установки. Официальные релизные артефакты собираются в GitHub Actions на **Python 3.13**.
 
-### Шаг 1. Установка FFmpeg (Обязательно)
+### Шаг 1. Установка FFmpeg/FFprobe для исходников и Portable-сборок
+
+Этот шаг можно пропустить для полной Windows-версии в ZIP, полных Linux-версий в ZIP и macOS `.app`.
+
 * **Windows:**
   1. Скачайте архив с FFmpeg (например, с [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)).
   2. Распакуйте его в удобное место (например, `C:\ffmpeg`).
@@ -56,6 +59,7 @@
   ```
 
 ### Шаг 2. Установка зависимостей Python
+
 Откройте терминал в папке с программой и выполните:
 ```bash
 pip install requests pydub razdel ru-normalizr EbookLib beautifulsoup4 python-docx lxml
@@ -64,9 +68,11 @@ pip install requests pydub razdel ru-normalizr EbookLib beautifulsoup4 python-do
 ```bash
 pip install -r requirements.txt
 ```
-*Примечание для Linux:* Убедитесь, что в системе установлена библиотека Tkinter (`sudo apt install python3-tk`).
+
+*Примечание для Linux:* Убедитесь, что в системе установлен Tkinter (`sudo apt install python3-tk`).
 
 ### Шаг 3. Запуск
+
 ```bash
 python3 SileroTTS_Studio.py
 ```
@@ -75,11 +81,26 @@ python3 SileroTTS_Studio.py
 
 ## 🖥 Особенности работы на разных ОС
 
-* **macOS (.app & .py):** Из-за ограничений безопасности Apple (Gatekeeper) скомпилированное приложение создает структуру проекта в `~/Documents/SileroTTS_Studio/`. Поддерживаются нативные горячие клавиши `⌘C`, `⌘V`, `⌘X`, `⌘A`, `⌘Z` и атомарный мультивыбор мышкой через `⌘-Click`.
-* **Windows:** Бесшумная работа фоновых утилит — окна командной строки не моргают при генерации и сборке (`CREATE_NO_WINDOW`).
-* **Portable-режим:** При запуске `.py` файла из консоли на любой ОС или `.exe` на Windows программа работает в полностью портативном режиме (все рабочие папки создаются строго рядом со скриптом).
+* **macOS (.app & .py):** Из-за ограничений безопасности Apple (Gatekeeper) скомпилированное приложение создаёт структуру проекта в `~/Documents/SileroTTS_Studio/`. Поддерживаются нативные горячие клавиши `⌘C`, `⌘V`, `⌘X`, `⌘A`, `⌘Z` и атомарный мультивыбор мышкой через `⌘-Click`. Готовая `.app` уже содержит FFmpeg/FFprobe.
+* **Windows:** Бесшумная работа фоновых утилит — окна командной строки не моргают при генерации и сборке (`CREATE_NO_WINDOW`). Полная версия поставляется папкой в ZIP и содержит FFmpeg/FFprobe; Portable-версия поставляется одним `.exe` и использует системные FFmpeg/FFprobe.
+* **Linux:** Полная версия поставляется папкой в ZIP и содержит FFmpeg/FFprobe; Portable `onefile` поставляется в ZIP и использует системные FFmpeg/FFprobe.
+* **Portable-режим:** При запуске `.py` из консоли на любой ОС, Windows Portable `.exe` или Linux Portable-бинарника рабочие папки создаются рядом с запущенным файлом. Для работы со звуком FFmpeg/FFprobe должны быть доступны в `PATH`.
 
 ---
 
 ## 📥 Готовые сборки
-Скачать готовые исполняемые файлы для Windows, macOS и Linux можно во вкладке **[Releases](../../releases)**.
+
+Скачать готовые файлы можно во вкладке **[Releases](../../releases)**:
+
+| Платформа | Артефакт | Формат | FFmpeg/FFprobe |
+|---|---|---|---|
+| Windows x64 | `SileroTTS_Studio_Windows.zip` | Полная `onedir`-версия | Включены |
+| Windows x64 | `SileroTTS_Studio_Windows_Portable.exe` | Portable `onefile` | Требуются в системе |
+| Linux x86_64 | `SileroTTS_Studio_Linux_x86_64.zip` | Полная `onedir`-версия | Включены |
+| Linux x86_64 | `SileroTTS_Studio_Linux_x86_64_Portable.zip` | Portable `onefile` | Требуются в системе |
+| Linux ARM64 | `SileroTTS_Studio_Linux_arm64.zip` | Полная `onedir`-версия | Включены |
+| Linux ARM64 | `SileroTTS_Studio_Linux_arm64_Portable.zip` | Portable `onefile` | Требуются в системе |
+| macOS Apple Silicon | `SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip` | Полная `.app` | Включены |
+| macOS Intel | `SileroTTS_Studio_macOS_Intel_x86_64.zip` | Полная `.app` | Включены |
+
+Для macOS отдельная Portable-сборка не выпускается. Portable-режим доступен при запуске `SileroTTS_Studio.py` из Терминала.
