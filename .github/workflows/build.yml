@@ -5,18 +5,20 @@ on:
     branches:
       - main
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  PYTHONOPTIMIZE: "1"
+  # Use a maintained CPython line with the current bundled Tcl/Tk fixes.
+  # setup-python resolves this to the newest available 3.13 patch release.
+  PYTHON_VERSION: "3.13"
 
 jobs:
   build:
-    name: Build (${{ matrix.name }})
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -24,28 +26,31 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
-            target_arch: x64
-            artifact_name: SileroTTS_Studio_Windows.zip
-            
-          - name: Linux-x86_64
+            app_name: SileroTTS_Studio_Windows
+            artifact_name: SileroTTS_Studio_Windows.exe
+            pyinstaller: .venv/Scripts/pyinstaller.exe
+          - name: Linux x86_64
             os: ubuntu-latest
-            target_arch: x86_64
+            app_name: SileroTTS_Studio_Linux_x86_64
             artifact_name: SileroTTS_Studio_Linux_x86_64.zip
-            
-          - name: Linux-ARM64
+            pyinstaller: .venv/bin/pyinstaller
+          - name: Linux ARM64
             os: ubuntu-24.04-arm
-            target_arch: arm64
+            app_name: SileroTTS_Studio_Linux_arm64
             artifact_name: SileroTTS_Studio_Linux_arm64.zip
-
-          - name: macOS-AppleSilicon-ARM64
-            os: macos-latest
-            target_arch: arm64
+            pyinstaller: .venv/bin/pyinstaller
+          - name: macOS Apple Silicon ARM64
+            os: macos-15
+            app_name: SileroTTS_Studio_macOS_arm64
             artifact_name: SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip
-
-          - name: macOS-Intel-x86_64
-            os: macos-latest
-            target_arch: x86_64
+            pyinstaller: .venv/bin/pyinstaller
+            target_arch: arm64
+          - name: macOS Intel x86_64
+            os: macos-15-intel
+            app_name: SileroTTS_Studio_macOS_x86_64
             artifact_name: SileroTTS_Studio_macOS_Intel_x86_64.zip
+            pyinstaller: .venv/bin/pyinstaller
+            target_arch: x86_64
 
     steps:
       - name: Checkout code
@@ -54,137 +59,132 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install Linux GUI dependencies
+      - name: Show Python and Tk versions
+        shell: bash
+        run: |
+          python - <<'PY'
+          import platform
+          import sys
+          import tkinter
+
+          tcl = tkinter.Tcl()
+          print("Python:", sys.version)
+          print("Architecture:", platform.machine())
+          print("Tcl/Tk:", tcl.call("info", "patchlevel"))
+          PY
+
+      - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk
+          sudo apt-get install -y python3-tk zip
 
-      - name: Install Python dependencies in venv
+      - name: Install Python dependencies
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
           python -m venv .venv
-          
-          if [ "${{ runner.os }}" = "Windows" ]; then
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
             source .venv/Scripts/activate
           else
             source .venv/bin/activate
           fi
-          
-          pip install --upgrade setuptools wheel
-          pip install pyinstaller
-          pip install -r requirements.txt
-        shell: bash
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install pyinstaller
+          python -m pip install -r requirements.txt
 
-      - name: Setup FFmpeg
+      - name: Set up FFmpeg
         uses: AnimMouse/setup-ffmpeg@v1
 
-      - name: Prepare FFmpeg Binaries (Windows)
+      - name: Copy FFmpeg tools on Windows
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          $ffmpegPath = (Get-Command ffmpeg.exe).Source
-          $ffprobePath = (Get-Command ffprobe.exe).Source
-          copy $ffmpegPath .\ffmpeg.exe
-          copy $ffprobePath .\ffprobe.exe
+          Copy-Item (Get-Command ffmpeg).Source ffmpeg.exe
+          Copy-Item (Get-Command ffprobe).Source ffprobe.exe
 
-      - name: Prepare FFmpeg Binaries (Linux / macOS)
+      - name: Copy FFmpeg tools on Unix
         if: runner.os != 'Windows'
+        shell: bash
         run: |
-          cp $(which ffmpeg) ./ffmpeg
-          cp $(which ffprobe) ./ffprobe
+          cp "$(command -v ffmpeg)" ffmpeg
+          cp "$(command -v ffprobe)" ffprobe
           chmod +x ffmpeg ffprobe
 
-      # Сборка Windows
-      - name: Build Windows
+      - name: Build Windows app
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          # 1. Полная версия (Папка с запеченным FFmpeg)
-          .\.venv\Scripts\pyinstaller --noconfirm --noconsole --onedir --add-binary "ffmpeg.exe;." --add-binary "ffprobe.exe;." --name "SileroTTS_Studio_Windows" SileroTTS_Studio.py
-          
-          # 2. Portable версия (Легковесный .exe ~27 МБ)
-          .\.venv\Scripts\pyinstaller --noconfirm --noconsole --onefile --name "SileroTTS_Studio_Windows_Portable" SileroTTS_Studio.py
+          & "${{ matrix.pyinstaller }}" `
+            --noconfirm `
+            --clean `
+            --noconsole `
+            --onefile `
+            --add-binary "ffmpeg.exe;." `
+            --add-binary "ffprobe.exe;." `
+            --name "${{ matrix.app_name }}" `
+            SileroTTS_Studio.py
 
-      # Сборка Linux
-      - name: Build Linux
+      - name: Build Linux app
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          # 1. Полная версия (Папка с запеченным FFmpeg)
-          ./.venv/bin/pyinstaller --noconfirm --noconsole --onedir --add-binary "ffmpeg:." --add-binary "ffprobe:." --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" SileroTTS_Studio.py
-          
-          # 2. Portable версия (Один файл)
-          ./.venv/bin/pyinstaller --noconfirm --noconsole --onefile --name "SileroTTS_Studio_Linux_${{ matrix.target_arch }}_Portable" SileroTTS_Studio.py
-
-      # Сборка macOS
-      - name: Build macOS
-        if: runner.os == 'macOS'
-        run: |
-          # 1. Полная версия (.app с запеченным FFmpeg)
-          ./.venv/bin/pyinstaller --noconfirm --windowed --onedir \
+          "${{ matrix.pyinstaller }}" \
+            --noconfirm \
+            --clean \
+            --onedir \
             --add-binary "ffmpeg:." \
             --add-binary "ffprobe:." \
-            --target-architecture=${{ matrix.target_arch }} \
-            --name "SileroTTS_Studio_macOS_${{ matrix.target_arch }}" \
+            --name "${{ matrix.app_name }}" \
             SileroTTS_Studio.py
-          
-          APP_FULL="dist/SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app"
-          chmod +x "$APP_FULL/Contents/Resources/ffmpeg" "$APP_FULL/Contents/Resources/ffprobe"
-          plutil -replace NSHighResolutionCapable -bool true "$APP_FULL/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_FULL/Contents/Info.plist"
-          codesign --force --sign - "$APP_FULL"
 
-          # 2. Portable версия (Создает .app пакет)
-          ./.venv/bin/pyinstaller --noconfirm --windowed --onefile \
-            --target-architecture=${{ matrix.target_arch }} \
-            --name "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable" \
+      - name: Build macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          "${{ matrix.pyinstaller }}" \
+            --noconfirm \
+            --clean \
+            --windowed \
+            --onedir \
+            --add-binary "ffmpeg:." \
+            --add-binary "ffprobe:." \
+            --target-architecture "${{ matrix.target_arch }}" \
+            --osx-bundle-identifier "ru.silero.tts-studio" \
+            --name "${{ matrix.app_name }}" \
             SileroTTS_Studio.py
-            
-          APP_PORTABLE="dist/SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable.app"
-          if [ -d "$APP_PORTABLE" ]; then
-            plutil -replace NSHighResolutionCapable -bool true "$APP_PORTABLE/Contents/Info.plist" || plutil -insert NSHighResolutionCapable -bool true "$APP_PORTABLE/Contents/Info.plist"
-            codesign --force --sign - "$APP_PORTABLE"
-          fi
 
-      # Упаковка артефактов
-      - name: Package Artifacts
+          app_path="dist/${{ matrix.app_name }}.app"
+          find "$app_path" -type f \( -name ffmpeg -o -name ffprobe \) -exec chmod +x {} \;
+          plutil -replace NSHighResolutionCapable -bool true "$app_path/Contents/Info.plist" || \
+            plutil -insert NSHighResolutionCapable -bool true "$app_path/Contents/Info.plist"
+          codesign --force --deep --sign - "$app_path"
+
+      - name: Package Linux app
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd dist
+          zip -r "${{ matrix.artifact_name }}" "${{ matrix.app_name }}"
+
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        shell: bash
         run: |
           cd dist
           export COPYFILE_DISABLE=1
-          
-          # --- Windows ---
-          if [ "${{ runner.os }}" = "Windows" ] && [ -d "SileroTTS_Studio_Windows" ]; then
-            tar -a -c -f SileroTTS_Studio_Windows.zip SileroTTS_Studio_Windows
-          fi
-          
-          # --- Linux ---
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            if [ -d "SileroTTS_Studio_Linux_${{ matrix.target_arch }}" ]; then
-              tar -a -c -f "SileroTTS_Studio_Linux_${{ matrix.target_arch }}.zip" "SileroTTS_Studio_Linux_${{ matrix.target_arch }}"
-            fi
-            if [ -f "SileroTTS_Studio_Linux_${{ matrix.target_arch }}_Portable" ]; then
-              tar -a -c -f "SileroTTS_Studio_Linux_${{ matrix.target_arch }}_Portable.zip" "SileroTTS_Studio_Linux_${{ matrix.target_arch }}_Portable"
-            fi
-          fi
-          
-          # --- macOS ---
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            # 1. Полная версия (.app)
-            if [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" ]; then
-              ditto -c -k --keepParent "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.app" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}.zip"
-            fi
-            
-            # 2. Portable версия (.app)
-            if [ -d "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable.app" ]; then
-              ditto -c -k --keepParent "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable.app" "SileroTTS_Studio_macOS_${{ matrix.target_arch }}_Portable.zip"
-            fi
-          fi
+          ditto -c -k --keepParent "${{ matrix.app_name }}.app" "${{ matrix.artifact_name }}"
 
-        shell: bash
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
 
-      # Релиз архивов и прямого .exe файла
-      - name: Upload Release Asset
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/*.zip
-            dist/*.exe
+          files: dist/${{ matrix.artifact_name }}
