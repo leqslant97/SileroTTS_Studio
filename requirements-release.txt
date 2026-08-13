@@ -1,0 +1,38 @@
+# Fully pinned cross-platform Python 3.13 release environment used by GitHub Actions.
+# Generated from and verified against the project's working Python 3.13 runtime;
+# platform-specific PyInstaller packages are guarded by environment markers.
+# Do not install this lock with Python 3.12/3.14. Update only after all CI smoke
+# tests and at least one local Python 3.13 application test pass.
+audioop-lts==0.2.2
+beautifulsoup4==4.15.0
+certifi==2026.7.22
+charset-normalizer==3.4.9
+DAWG2-Python==0.9.0
+docopt==0.6.2
+EbookLib==0.20
+eng_to_ipa==0.0.2
+altgraph==0.17.5
+macholib==1.16.4; sys_platform == "darwin"
+packaging==26.3
+pefile==2024.8.26; sys_platform == "win32"
+pywin32-ctypes==0.2.3; sys_platform == "win32"
+idna==3.18
+lxml==6.1.1
+num2words==0.5.14
+pydub==0.25.1
+pymorphy3==2.0.6
+pymorphy3-dicts-ru==2.4.417150.4580142
+python-docx==1.2.0
+razdel==0.5.0
+requests==2.34.2
+roman==5.2
+ru-normalizr==0.3.0
+setuptools==84.0.0
+six==1.17.0
+soupsieve==2.9.2
+typing_extensions==4.16.0
+urllib3==2.7.0
+
+# Release-only build toolchain.
+pyinstaller==6.22.0
+pyinstaller-hooks-contrib==2026.6

@@ -1,8 +1,13 @@
-requests
-pydub
-razdel
-ru-normalizr
-EbookLib
-beautifulsoup4
-python-docx
-lxml
+# Runtime dependencies for launching SileroTTS Studio from source.
+# Primary/tested runtime: Python 3.13. Python 3.12 is supported as legacy.
+# Python 3.14 and Python <= 3.11 are not part of the tested support matrix.
+requests==2.34.2
+pydub==0.25.1
+# Python 3.13 removed the stdlib audioop module used by pydub.
+audioop-lts==0.2.2; python_version >= "3.13" and python_version < "3.14"
+razdel==0.5.0
+ru-normalizr==0.3.0
+EbookLib==0.20
+beautifulsoup4==4.15.0
+python-docx==1.2.0
+lxml==6.1.1
