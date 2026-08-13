@@ -12,7 +12,6 @@ permissions:
   contents: write
 
 env:
-  # Use a maintained CPython line with the current bundled Tcl/Tk fixes.
   # setup-python resolves this to the newest available 3.13 patch release.
   PYTHON_VERSION: "3.13"
 
@@ -27,17 +26,23 @@ jobs:
           - name: Windows
             os: windows-latest
             app_name: SileroTTS_Studio_Windows
-            artifact_name: SileroTTS_Studio_Windows.exe
+            portable_name: SileroTTS_Studio_Windows_Portable
+            artifact_name: SileroTTS_Studio_Windows.zip
+            portable_artifact_name: SileroTTS_Studio_Windows_Portable.exe
             pyinstaller: .venv/Scripts/pyinstaller.exe
           - name: Linux x86_64
             os: ubuntu-latest
             app_name: SileroTTS_Studio_Linux_x86_64
+            portable_name: SileroTTS_Studio_Linux_x86_64_Portable
             artifact_name: SileroTTS_Studio_Linux_x86_64.zip
+            portable_artifact_name: SileroTTS_Studio_Linux_x86_64_Portable.zip
             pyinstaller: .venv/bin/pyinstaller
           - name: Linux ARM64
             os: ubuntu-24.04-arm
             app_name: SileroTTS_Studio_Linux_arm64
+            portable_name: SileroTTS_Studio_Linux_arm64_Portable
             artifact_name: SileroTTS_Studio_Linux_arm64.zip
+            portable_artifact_name: SileroTTS_Studio_Linux_arm64_Portable.zip
             pyinstaller: .venv/bin/pyinstaller
           - name: macOS Apple Silicon ARM64
             os: macos-15
@@ -62,6 +67,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Show Python and Tk versions
+        if: runner.os != 'Linux'
         shell: bash
         run: |
           python - <<'PY'
@@ -81,6 +87,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-tk zip
 
+      - name: Show Python and Tk versions on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import platform
+          import sys
+          import tkinter
+
+          tcl = tkinter.Tcl()
+          print("Python:", sys.version)
+          print("Architecture:", platform.machine())
+          print("Tcl/Tk:", tcl.call("info", "patchlevel"))
+          PY
+
       - name: Install Python dependencies
         shell: bash
         run: |
@@ -90,12 +111,83 @@ jobs:
           else
             source .venv/bin/activate
           fi
-          python -m pip install --upgrade pip setuptools wheel
-          python -m pip install pyinstaller
-          python -m pip install -r requirements.txt
+          # Install only the checked-in lock so release binaries do not depend
+          # on whichever transitive versions happen to be newest on build day.
+          python -m pip install -r requirements-release.txt
+          python -m pip check
+
+      - name: Verify Python runtime dependencies
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            py=.venv/Scripts/python.exe
+          else
+            py=.venv/bin/python
+          fi
+          "$py" - <<'PY'
+          import audioop
+          import ebooklib
+          import docx
+          import lxml
+          import pydub
+          import pydub.utils
+          import requests
+          import ru_normalizr
+          import sys
+          from bs4 import BeautifulSoup
+          from ebooklib import epub
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          assert pydub.utils.audioop is audioop
+          if sys.version_info >= (3, 13):
+              assert getattr(audioop, "__file__", None), "Python 3.13 must load audioop-lts"
+
+          book = epub.EpubBook()
+          book.set_identifier("ci-smoke")
+          book.set_title("CI smoke test")
+          book.set_language("ru")
+          book.add_author("Автор")
+          chapter = epub.EpubHtml(title="Глава", file_name="chapter.xhtml", lang="ru")
+          chapter.content = "<h1>Глава</h1><p>Привет</p>"
+          book.add_item(chapter)
+          book.toc = (epub.Link("chapter.xhtml", "Глава", "chapter"),)
+          book.spine = ["nav", chapter]
+          book.add_item(epub.EpubNcx())
+          book.add_item(epub.EpubNav())
+          with TemporaryDirectory() as directory:
+              path = Path(directory) / "smoke.epub"
+              epub.write_epub(str(path), book)
+              loaded = epub.read_epub(str(path))
+              assert list(loaded.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+
+          print("audioop:", getattr(audioop, "__file__", "built-in"))
+          print("pydub:", pydub.__file__)
+          print("EbookLib EPUB smoke test: OK")
+          PY
 
       - name: Set up FFmpeg
         uses: AnimMouse/setup-ffmpeg@v1
+
+      - name: Verify required FFmpeg codecs
+        shell: bash
+        run: |
+          encoders="$(ffmpeg -hide_banner -encoders 2>&1)"
+          decoders="$(ffmpeg -hide_banner -decoders 2>&1)"
+          grep -q 'libopus' <<< "$encoders"
+          grep -q 'libvorbis' <<< "$encoders"
+          grep -Eq '[[:space:]]opus([[:space:]]|$)' <<< "$decoders"
+          grep -Eq '[[:space:]]vorbis([[:space:]]|$)' <<< "$decoders"
+
+      - name: Run regression tests
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            py=.venv/Scripts/python.exe
+          else
+            py=.venv/bin/python
+          fi
+          "$py" -m unittest discover -s tests -v
 
       - name: Copy FFmpeg tools on Windows
         if: runner.os == 'Windows'
@@ -112,42 +204,69 @@ jobs:
           cp "$(command -v ffprobe)" ffprobe
           chmod +x ffmpeg ffprobe
 
-      - name: Build Windows app
+      - name: Build Windows apps
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          # Full onedir build with bundled FFmpeg/FFprobe.
           & "${{ matrix.pyinstaller }}" `
             --noconfirm `
             --clean `
             --noconsole `
-            --onefile `
+            --onedir `
+            --hidden-import audioop `
             --add-binary "ffmpeg.exe;." `
             --add-binary "ffprobe.exe;." `
             --name "${{ matrix.app_name }}" `
             SileroTTS_Studio.py
 
-      - name: Build Linux app
+          # Portable onefile build intentionally uses system FFmpeg/FFprobe.
+          & "${{ matrix.pyinstaller }}" `
+            --noconfirm `
+            --clean `
+            --noconsole `
+            --onefile `
+            --hidden-import audioop `
+            --name "${{ matrix.portable_name }}" `
+            SileroTTS_Studio.py
+
+      - name: Build Linux apps
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          # Full onedir build with bundled FFmpeg/FFprobe.
           "${{ matrix.pyinstaller }}" \
             --noconfirm \
             --clean \
+            --noconsole \
             --onedir \
+            --hidden-import audioop \
             --add-binary "ffmpeg:." \
             --add-binary "ffprobe:." \
             --name "${{ matrix.app_name }}" \
+            SileroTTS_Studio.py
+
+          # Portable onefile build intentionally uses system FFmpeg/FFprobe.
+          "${{ matrix.pyinstaller }}" \
+            --noconfirm \
+            --clean \
+            --noconsole \
+            --onefile \
+            --hidden-import audioop \
+            --name "${{ matrix.portable_name }}" \
             SileroTTS_Studio.py
 
       - name: Build macOS app
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          # macOS ships only the full onedir .app with bundled FFmpeg/FFprobe.
           "${{ matrix.pyinstaller }}" \
             --noconfirm \
             --clean \
             --windowed \
             --onedir \
+            --hidden-import audioop \
             --add-binary "ffmpeg:." \
             --add-binary "ffprobe:." \
             --target-architecture "${{ matrix.target_arch }}" \
@@ -160,13 +279,22 @@ jobs:
           plutil -replace NSHighResolutionCapable -bool true "$app_path/Contents/Info.plist" || \
             plutil -insert NSHighResolutionCapable -bool true "$app_path/Contents/Info.plist"
           codesign --force --deep --sign - "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
 
-      - name: Package Linux app
+      - name: Package Windows full app
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd dist
+          7z a -tzip "${{ matrix.artifact_name }}" "${{ matrix.app_name }}"
+
+      - name: Package Linux apps
         if: runner.os == 'Linux'
         shell: bash
         run: |
           cd dist
           zip -r "${{ matrix.artifact_name }}" "${{ matrix.app_name }}"
+          zip "${{ matrix.portable_artifact_name }}" "${{ matrix.portable_name }}"
 
       - name: Package macOS app
         if: runner.os == 'macOS'
@@ -176,15 +304,78 @@ jobs:
           export COPYFILE_DISABLE=1
           ditto -c -k --keepParent "${{ matrix.app_name }}.app" "${{ matrix.artifact_name }}"
 
-      - name: Upload build artifact
+      - name: Verify packaged artifacts
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            test -f "dist/${{ matrix.artifact_name }}"
+            test -f "dist/${{ matrix.portable_artifact_name }}"
+          elif [[ "$RUNNER_OS" == "Linux" ]]; then
+            test -f "dist/${{ matrix.artifact_name }}"
+            test -f "dist/${{ matrix.portable_artifact_name }}"
+          else
+            test -f "dist/${{ matrix.artifact_name }}"
+            test ! -e "dist/${{ matrix.app_name }}_Portable.app"
+          fi
+
+      - name: Verify portable onefile builds
+        if: runner.os == 'Windows' || runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            portable="dist/${{ matrix.portable_name }}.exe"
+          else
+            portable="dist/${{ matrix.portable_name }}"
+          fi
+          test -f "$portable"
+          test ! -d "$portable"
+
+      - name: Verify macOS bundle contents and architecture
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app_path="dist/${{ matrix.app_name }}.app"
+          executable="$app_path/Contents/MacOS/${{ matrix.app_name }}"
+          file "$executable"
+          lipo "$executable" -verify_arch "${{ matrix.target_arch }}"
+          ffmpeg_path="$(find "$app_path/Contents" -type f -name ffmpeg -perm -111 -print -quit)"
+          ffprobe_path="$(find "$app_path/Contents" -type f -name ffprobe -perm -111 -print -quit)"
+          test -n "$ffmpeg_path"
+          test -n "$ffprobe_path"
+          file "$ffmpeg_path"
+          file "$ffprobe_path"
+          lipo "$ffmpeg_path" -verify_arch "${{ matrix.target_arch }}"
+          lipo "$ffprobe_path" -verify_arch "${{ matrix.target_arch }}"
+          encoders="$("$ffmpeg_path" -hide_banner -encoders 2>&1)"
+          grep -q 'libopus' <<< "$encoders"
+          grep -q 'libvorbis' <<< "$encoders"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+
+      - name: Upload full build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          # Artifact names must not include the filename extension: the
+          # downloaded file itself retains the exact release name.
+          name: ${{ matrix.artifact_name }}-artifact
           path: dist/${{ matrix.artifact_name }}
           if-no-files-found: error
 
-      - name: Upload release asset
+      - name: Upload portable build artifact
+        if: runner.os == 'Windows' || runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.portable_artifact_name }}-artifact
+          path: dist/${{ matrix.portable_artifact_name }}
+          if-no-files-found: error
+
+      - name: Upload full release asset
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/${{ matrix.artifact_name }}
+
+      - name: Upload portable release asset
+        if: startsWith(github.ref, 'refs/tags/') && (runner.os == 'Windows' || runner.os == 'Linux')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.portable_artifact_name }}
