@@ -922,6 +922,49 @@ class BookImportTests(unittest.TestCase):
             )
 
 
+class MacSubprocessPolicyTests(unittest.TestCase):
+    def test_macos_wrapper_requests_posix_spawn_compatible_options(self):
+        with mock.patch.object(studio.platform, "system", return_value="Darwin"), \
+             mock.patch.object(studio.sys, "platform", "darwin"), \
+             mock.patch.object(studio, "_ORIGINAL_SUBPROCESS_POPEN") as original:
+            studio._patched_popen(
+                ["/usr/bin/true"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        kwargs = original.call_args.kwargs
+        self.assertIs(kwargs["close_fds"], False)
+        self.assertNotIn("preexec_fn", kwargs)
+
+    def test_macos_wrapper_resolves_bare_command_for_posix_spawn(self):
+        with mock.patch.object(studio.platform, "system", return_value="Darwin"), \
+             mock.patch.object(studio.sys, "platform", "darwin"), \
+             mock.patch.object(studio.shutil, "which", return_value="/usr/bin/pbpaste"), \
+             mock.patch.object(studio, "_ORIGINAL_SUBPROCESS_POPEN") as original:
+            studio._patched_popen(
+                ["pbpaste"], stdout=subprocess.PIPE
+            )
+
+        self.assertEqual(original.call_args.args[0][0], "/usr/bin/pbpaste")
+        self.assertIs(original.call_args.kwargs["close_fds"], False)
+
+    def test_macos_wrapper_rejects_preexec_fn(self):
+        with mock.patch.object(studio.platform, "system", return_value="Darwin"), \
+             mock.patch.object(studio.sys, "platform", "darwin"):
+            with self.assertRaises(ValueError):
+                studio._patched_popen(
+                    ["/usr/bin/true"], preexec_fn=lambda: None
+                )
+
+    def test_pydub_uses_the_same_wrapped_popen_policy(self):
+        import pydub.audio_segment
+        import pydub.utils
+
+        self.assertIs(pydub.audio_segment.subprocess.Popen, studio._patched_popen)
+        self.assertIs(pydub.utils.Popen, studio._patched_popen)
+
+
 class BuildWorkflowContractTests(unittest.TestCase):
     def test_release_matrix_keeps_required_portable_artifacts(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
