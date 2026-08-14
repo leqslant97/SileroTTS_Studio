@@ -957,12 +957,17 @@ class MacSubprocessPolicyTests(unittest.TestCase):
                     ["/usr/bin/true"], preexec_fn=lambda: None
                 )
 
-    def test_pydub_uses_the_same_wrapped_popen_policy(self):
+    def test_pydub_uses_the_platform_popen_policy(self):
         import pydub.audio_segment
         import pydub.utils
 
-        self.assertIs(pydub.audio_segment.subprocess.Popen, studio._patched_popen)
-        self.assertIs(pydub.utils.Popen, studio._patched_popen)
+        expected_popen = (
+            studio._patched_popen
+            if studio.platform.system() in {"Windows", "Darwin"}
+            else studio._ORIGINAL_SUBPROCESS_POPEN
+        )
+        self.assertIs(pydub.audio_segment.subprocess.Popen, expected_popen)
+        self.assertIs(pydub.utils.Popen, expected_popen)
 
 
 class BuildWorkflowContractTests(unittest.TestCase):
@@ -986,6 +991,49 @@ class BuildWorkflowContractTests(unittest.TestCase):
         self.assertIn("Verify required FFmpeg codecs", workflow)
         self.assertIn("libopus", workflow)
         self.assertIn("libvorbis", workflow)
+
+    def test_macos_bundle_version_is_set_before_codesigning(self):
+        workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('APP_VERSION_FALLBACK: "1.4.1"', workflow)
+        self.assertIn('version="${GITHUB_REF_NAME#v}"', workflow)
+
+        build_start = workflow.index("- name: Build macOS app")
+        verify_start = workflow.index("- name: Verify macOS bundle contents")
+        upload_start = workflow.index("- name: Upload full build artifact")
+        build_block = workflow[build_start:verify_start]
+        verify_block = workflow[verify_start:upload_start]
+        signing_position = build_block.index("codesign --force --deep --sign -")
+
+        for key in ("CFBundleShortVersionString", "CFBundleVersion"):
+            self.assertLess(
+                build_block.index(f"plutil -replace {key}"),
+                signing_position,
+            )
+            self.assertIn(f"plutil -extract {key}", verify_block)
+            self.assertNotIn(f"plutil -replace {key}", verify_block)
+            self.assertNotIn(f"plutil -insert {key}", verify_block)
+
+    def test_windows_binaries_embed_and_verify_release_version(self):
+        workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
+            encoding="utf-8"
+        )
+
+        resource_start = workflow.index("- name: Create Windows version resources")
+        linux_start = workflow.index("- name: Build Linux apps")
+        windows_block = workflow[resource_start:linux_start]
+
+        self.assertIn("windows-full-version.txt", windows_block)
+        self.assertIn("windows-portable-version.txt", windows_block)
+        self.assertEqual(windows_block.count('--version-file "windows-'), 2)
+        self.assertIn("StringStruct('FileVersion', '$env:APP_VERSION')", windows_block)
+        self.assertIn("StringStruct('ProductVersion', '$env:APP_VERSION')", windows_block)
+        self.assertIn("StringStruct('OriginalFilename', '$OriginalFilename')", windows_block)
+        self.assertIn("- name: Verify Windows executable versions", windows_block)
+        self.assertIn("$info.FileMajorPart", windows_block)
+        self.assertIn("$info.ProductVersion", windows_block)
 
 
 class AtomicOutputTests(unittest.TestCase):
