@@ -24,16 +24,66 @@ import unicodedata
 import queue
 import concurrent.futures
 
-# === ГЛОБАЛЬНЫЙ ПАТЧ ДЛЯ СКРЫТИЯ КОНСОЛИ НА WINDOWS ===
-# Запрещает pydub и ffmpeg моргать черными окнами
-if platform.system() == "Windows":
-    _original_popen = subprocess.Popen
-    def _patched_popen(*args, **kwargs):
-        if 'creationflags' not in kwargs:
-            kwargs['creationflags'] = 0x08000000  # Флаг CREATE_NO_WINDOW
-        return _original_popen(*args, **kwargs)
+# === КРОССПЛАТФОРМЕННЫЙ ЗАПУСК ДОЧЕРНИХ ПРОЦЕССОВ ===
+# Pydub импортирует Popen двумя способами: через модуль subprocess и напрямую
+# из него. Поэтому политика задаётся до импорта Pydub. В Windows она скрывает
+# консоль, а в многопоточном GUI macOS принудительно оставляет CPython на
+# posix_spawn: обычный fork после инициализации Tk/CoreFoundation небезопасен.
+_ORIGINAL_SUBPROCESS_POPEN = subprocess.Popen
+
+
+def _resolve_macos_popen_command(command, *, shell=False):
+    """Даёт posix_spawn абсолютный executable даже для ``ffprobe``/``pbcopy``."""
+    if shell or command is None:
+        return command
+
+    is_sequence = isinstance(command, (list, tuple))
+    executable = command[0] if is_sequence and command else command
+    if not isinstance(executable, (str, bytes, os.PathLike)):
+        return command
+
+    executable_text = os.fsdecode(executable)
+    if os.path.dirname(executable_text):
+        return command
+    resolved = shutil.which(executable_text)
+    if not resolved:
+        return command
+
+    if is_sequence:
+        updated = list(command)
+        updated[0] = resolved
+        return tuple(updated) if isinstance(command, tuple) else updated
+    return resolved
+
+
+def _patched_popen(*args, **kwargs):
+    if platform.system() == "Windows":
+        kwargs.setdefault("creationflags", 0x08000000)  # CREATE_NO_WINDOW
+    elif sys.platform == "darwin":
+        if kwargs.get("preexec_fn") is not None:
+            raise ValueError("preexec_fn небезопасен в многопоточном macOS GUI")
+        kwargs.setdefault("close_fds", False)
+
+        shell = bool(kwargs.get("shell", False))
+        if args:
+            args = (
+                _resolve_macos_popen_command(args[0], shell=shell),
+                *args[1:],
+            )
+        elif "args" in kwargs:
+            kwargs["args"] = _resolve_macos_popen_command(
+                kwargs["args"], shell=shell
+            )
+        if kwargs.get("executable") is not None:
+            kwargs["executable"] = _resolve_macos_popen_command(
+                kwargs["executable"], shell=shell
+            )
+    return _ORIGINAL_SUBPROCESS_POPEN(*args, **kwargs)
+
+
+if platform.system() in {"Windows", "Darwin"}:
     subprocess.Popen = _patched_popen
-# --------------------------
+# --------------------------------------------------------
 
 is_frozen_mac = (sys.platform == "darwin") and getattr(sys, 'frozen', False)
 
@@ -124,10 +174,9 @@ LOG_FILE = APP_DATA_DIR / "tts_processor.log"
 
 SAFE_LIMIT = 30000 # Лимит символов для авто-разрыва в режиме full
 
-# Экспериментальный параметр облачного API Silero. В актуальной OpenAPI-схеме
-# EnhancedTTS серверное значение по умолчанию равно 16. Верхняя граница в
-# схеме пока не описана, однако текущий endpoint отклоняет значения выше 72
-# с HTTP 422, поэтому не отправляем заведомо невалидный запрос.
+# Экспериментальный параметр облачного API Silero. На момент выпуска значение
+# 16 используется как базовый ориентир EnhancedTTS. Текущий endpoint отклоняет
+# значения выше 72 с HTTP 422, поэтому не отправляем заведомо невалидный запрос.
 API_STEPS_PRESETS = (4, 8, 12, 16)
 API_STEPS_MIN = 1
 API_STEPS_MAX = 72
@@ -9105,6 +9154,7 @@ class TTSApp:
 • Перепаковка и Разгруппировка: Выделите файлы и используйте кнопки "📦 В новую группу" или "📤 Разгруппировать" (кнопка перенесена на верхнюю панель для удобства).
 • Массовое применение настроек: Кнопка "⚙️ Применить ко всем группам..." открывает диалог, позволяющий в 1 клик применить параметры склейки, подпапок, пауз ко всем томам и сохранить их по умолчанию.
 • Склеивание в один трек: Склеивает все файлы группы в один большой аудиофайл с настройкой паузы между ними (в мс).
+• Наследование тегов при склейке: Если поля ID3 группы не заполнены, исполнитель, альбом, исполнитель альбома, жанр, композитор, год и обложка берутся из первого файла группы. Явно заданные значения группы имеют приоритет, а имя итогового файла и тег Title формируются из имени группы.
 • Авто-разбивка по времени: Работает как с уже созданными группами, так и только с файлами в корне. Нумерация адаптируется к последнему отображаемому номеру.
 • Безопасность сборки: Пока экспорт активен, дерево, перегруппировка и настройки блокируются. Перед стартом проверяются исчезнувшие исходники и совпадающие выходные имена.
 • [x] Только обновить теги (In-place tagging): Метаданные меняются без перекодирования аудио. Новая JPEG/PNG-обложка встраивается для MP3; для WAV/OGG она пропускается с записью в журнал вместо ошибки FFmpeg.
@@ -9146,15 +9196,14 @@ class TTSApp:
 ====================================================================
 Во вкладке "Настройки" -> "API и Лимиты" вы можете гибко управлять нагрузкой на сеть и процессор:
 
-• Штатный API URL: http://iq3g.silero.ai/enhanced_voice. Приложение не заменяет сохранённую схему HTTP на HTTPS.
 • Экспериментальный Steps (скорость/качество синтеза):
-  - Выключено [по умолчанию]: ключ steps не отправляется; это совместимо со старыми конфигами, а серверный default сейчас равен 16.
+  - Выключено [по умолчанию]: ключ steps не отправляется; это совместимо со старыми конфигами, а значение выбирается сервером.
   - 4: Ещё быстрее, но для большинства голосов качество заметно ухудшается.
   - 8: Быстрее 16, обычно с небольшим снижением качества.
   - 12: Промежуточный вариант для экспериментов.
-  - 16: Официальное значение EnhancedTTS по умолчанию и ориентир исходного качества; медленнее 8.
+  - 16: Базовый ориентир EnhancedTTS по качеству; медленнее 8.
   - «Другое»: Целое от 1 до 72. Выше 16 приложение предупреждает о сомнительном приросте, при 32+ — о возможной нестабильности; больше 72 не отправляется, чтобы не получать HTTP 422.
-  OpenAPI пока не фиксирует верхнюю границу, поэтому настройка остаётся экспериментальной. Сравнивайте пресеты на одном и том же коротком фрагменте и голосе.
+  Сравнивайте пресеты на одном и том же коротком фрагменте и голосе.
 • Сетевые лимиты API: Настройка частоты запросов защищает ваш токен от блокировки. Лимитер является Глобальным — он синхронизирует запросы между вкладкой папок и Прямым синтезом, гарантируя отсутствие банов.
 • Параллельных сборок FFmpeg (Аппаратный лимит CPU):
   - Значение [ 0 ]: Режим максимальной скорости (без ограничений). Задействует 100% ресурсов процессора для мгновенной сборки из кэша.
@@ -9168,6 +9217,7 @@ class TTSApp:
 📁 12. ОСОБЕННОСТИ РАБОТЫ НА РАЗНЫХ ОС
 ====================================================================
 • macOS (.app): Из-за системных ограничений Apple (Gatekeeper) скомпилированное приложение автоматически работает через папку Документы (`~/Documents/SileroTTS_Studio/`).
+  Дочерние FFmpeg/FFprobe и системные утилиты запускаются через безопасный для Tk/CoreFoundation механизм `posix_spawn`, без предупреждений `The process has forked ... You MUST exec()`.
 • Умный буфер обмена (Кроссплатформенный):
   - На macOS обрабатывает ⌘C, ⌘V, ⌘X, ⌘A, ⌘Z при русской и английской раскладках и декодирует явные пути Finder (`file://`, `%20`, NFC), не изменяя обычный текст.
   - На Windows и Linux обрабатывает Ctrl+C/V/X/A/Z при русской и английской раскладках, снимает внешние кавычки у явных путей Windows 11 и декодирует `file://`-пути.
