@@ -229,6 +229,66 @@ jobs:
           cp "$(command -v ffprobe)" ffprobe
           chmod +x ffmpeg ffprobe
 
+      - name: Create Windows version resources
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $parts = $env:APP_VERSION.Split('.')
+          if ($parts.Count -ne 3) {
+            throw "APP_VERSION must contain three numeric components: $env:APP_VERSION"
+          }
+          $versionTuple = "$($parts[0]), $($parts[1]), $($parts[2]), 0"
+
+          function New-PyInstallerVersionFile {
+            param(
+              [Parameter(Mandatory = $true)][string] $Path,
+              [Parameter(Mandatory = $true)][string] $InternalName,
+              [Parameter(Mandatory = $true)][string] $OriginalFilename
+            )
+
+            $content = @"
+          # UTF-8
+          VSVersionInfo(
+            ffi=FixedFileInfo(
+              filevers=($versionTuple),
+              prodvers=($versionTuple),
+              mask=0x3f,
+              flags=0x0,
+              OS=0x40004,
+              fileType=0x1,
+              subtype=0x0,
+              date=(0, 0)
+            ),
+            kids=[
+              StringFileInfo([
+                StringTable(
+                  '040904B0',
+                  [
+                    StringStruct('FileDescription', 'Silero TTS Studio'),
+                    StringStruct('FileVersion', '$env:APP_VERSION'),
+                    StringStruct('InternalName', '$InternalName'),
+                    StringStruct('OriginalFilename', '$OriginalFilename'),
+                    StringStruct('ProductName', 'Silero TTS Studio'),
+                    StringStruct('ProductVersion', '$env:APP_VERSION')
+                  ]
+                )
+              ]),
+              VarFileInfo([VarStruct('Translation', [1033, 1200])])
+            ]
+          )
+          "@
+            Set-Content -LiteralPath $Path -Value $content -Encoding utf8
+          }
+
+          New-PyInstallerVersionFile `
+            -Path "windows-full-version.txt" `
+            -InternalName "${{ matrix.app_name }}" `
+            -OriginalFilename "${{ matrix.app_name }}.exe"
+          New-PyInstallerVersionFile `
+            -Path "windows-portable-version.txt" `
+            -InternalName "${{ matrix.portable_name }}" `
+            -OriginalFilename "${{ matrix.portable_name }}.exe"
+
       - name: Build Windows apps
         if: runner.os == 'Windows'
         shell: pwsh
@@ -242,6 +302,7 @@ jobs:
             --hidden-import audioop `
             --add-binary "ffmpeg.exe;." `
             --add-binary "ffprobe.exe;." `
+            --version-file "windows-full-version.txt" `
             --name "${{ matrix.app_name }}" `
             SileroTTS_Studio.py
 
@@ -252,8 +313,33 @@ jobs:
             --noconsole `
             --onefile `
             --hidden-import audioop `
+            --version-file "windows-portable-version.txt" `
             --name "${{ matrix.portable_name }}" `
             SileroTTS_Studio.py
+
+      - name: Verify Windows executable versions
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $expected = [version] "$($env:APP_VERSION).0"
+          $binaries = @(
+            "dist/${{ matrix.app_name }}/${{ matrix.app_name }}.exe",
+            "dist/${{ matrix.portable_name }}.exe"
+          )
+
+          foreach ($binary in $binaries) {
+            $info = (Get-Item -LiteralPath $binary).VersionInfo
+            $actual = [version] "$($info.FileMajorPart).$($info.FileMinorPart).$($info.FileBuildPart).$($info.FilePrivatePart)"
+            if ($actual -ne $expected) {
+              throw "$binary has file version $actual; expected $expected"
+            }
+            if ($info.ProductVersion -ne $env:APP_VERSION) {
+              throw "$binary has product version '$($info.ProductVersion)'; expected '$env:APP_VERSION'"
+            }
+            if ($info.ProductName -ne "Silero TTS Studio") {
+              throw "$binary has unexpected product name '$($info.ProductName)'"
+            }
+          }
 
       - name: Build Linux apps
         if: runner.os == 'Linux'
