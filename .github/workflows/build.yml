@@ -12,9 +12,12 @@ permissions:
   contents: write
 
 env:
-  # Keep release artifacts reproducible instead of silently switching patch
-  # versions when runner tool caches are refreshed.
+  # setup-python pins this patch on Windows/Linux.
   PYTHON_VERSION: "3.13.15"
+  # Homebrew versioned formulae track a Python minor series rather than keeping
+  # every patch release installable. Record and verify the patch actually used
+  # by each macOS artifact below.
+  MACOS_PYTHON_SERIES: "3.13"
   # macOS uses Homebrew Python/Tk because setup-python's macOS distribution
   # currently embeds Tk 8.6. The Aqua build needs Tk 9 for reliable live
   # switching between the system light and dark appearances.
@@ -100,15 +103,16 @@ jobs:
       - name: Set up Homebrew Python and Tk on macOS
         if: runner.os == 'macOS'
         shell: bash
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: "1"
         run: |
           # setup-python's macOS build currently carries Tk 8.6. Use the
           # Homebrew split tkinter formula so PyInstaller collects Tcl/Tk 9.
-          # Do not update Homebrew in this job: moving formulae can silently
-          # change the pinned Python patch between otherwise identical reruns.
-          brew install "python@${PYTHON_VERSION%.*}" "python-tk@${PYTHON_VERSION%.*}"
-          python_series="${PYTHON_VERSION%.*}"
+          # GitHub runner images can have an older cached tap/bottle. Refresh
+          # formula metadata so the matching Python and python-tk patches are
+          # installed together, then keep the release contract fail-closed.
+          brew update
+          python_series="$MACOS_PYTHON_SERIES"
+          brew install "python@$python_series" "python-tk@$python_series"
+          brew upgrade "python@$python_series" "python-tk@$python_series"
           python_prefix="$(brew --prefix "python@$python_series")"
           python_bin="$python_prefix/bin/python$python_series"
           test -x "$python_bin"
@@ -116,9 +120,13 @@ jobs:
           echo "Homebrew Python: $python_bin"
           "$python_bin" --version
           installed_python_version="$($python_bin -c 'import platform; print(platform.python_version())')"
-          test "$installed_python_version" = "$PYTHON_VERSION"
-          brew list --versions "python@${PYTHON_VERSION%.*}" \
-            "python-tk@${PYTHON_VERSION%.*}" tcl-tk
+          if [[ "${installed_python_version%.*}" != "$MACOS_PYTHON_SERIES" ]]; then
+            echo "::error::Homebrew installed Python $installed_python_version; expected $MACOS_PYTHON_SERIES.x"
+            exit 1
+          fi
+          echo "MACOS_PYTHON_VERSION=$installed_python_version" >> "$GITHUB_ENV"
+          brew list --versions "python@$python_series" \
+            "python-tk@$python_series" tcl-tk
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -143,12 +151,7 @@ jobs:
           import tkinter
 
           tcl = tkinter.Tcl()
-          expected_python = tuple(map(int, os.environ["PYTHON_VERSION"].split(".")))
           actual_python = sys.version_info[:3]
-          if actual_python != expected_python:
-              raise SystemExit(
-                  f"Python {actual_python!r} does not match required {expected_python!r}"
-              )
 
           tk_patchlevel = str(tcl.call("info", "patchlevel"))
           print("Python:", sys.version)
@@ -157,6 +160,14 @@ jobs:
           print("_tkinter:", tkinter._tkinter.__file__)
 
           if sys.platform == "darwin":
+              expected_series = tuple(
+                  map(int, os.environ["MACOS_PYTHON_SERIES"].split("."))
+              )
+              if actual_python[:2] != expected_series:
+                  raise SystemExit(
+                      f"macOS Python {actual_python!r} is outside required "
+                      f"series {expected_series!r}"
+                  )
               expected_arch = os.environ["EXPECTED_MACOS_ARCH"]
               if platform.machine() != expected_arch:
                   raise SystemExit(
@@ -173,6 +184,15 @@ jobs:
                   raise SystemExit(
                       f"macOS release requires Tcl/Tk {expected_tk}.x; "
                       f"got {tk_patchlevel}"
+                  )
+          else:
+              expected_python = tuple(
+                  map(int, os.environ["PYTHON_VERSION"].split("."))
+              )
+              if actual_python != expected_python:
+                  raise SystemExit(
+                      f"Python {actual_python!r} does not match "
+                      f"required {expected_python!r}"
                   )
           PY
 
@@ -211,6 +231,7 @@ jobs:
           import lxml
           import pydub
           import pydub.utils
+          import platform
           import requests
           import ru_normalizr
           import sys
@@ -224,10 +245,11 @@ jobs:
           if sys.version_info >= (3, 13):
               assert getattr(audioop, "__file__", None), "Python 3.13 must load audioop-lts"
           if sys.platform == "darwin":
-              expected_python = tuple(
-                  map(int, os.environ["PYTHON_VERSION"].split("."))
+              expected_series = tuple(
+                  map(int, os.environ["MACOS_PYTHON_SERIES"].split("."))
               )
-              assert sys.version_info[:3] == expected_python
+              assert sys.version_info[:2] == expected_series
+              assert platform.python_version() == os.environ["MACOS_PYTHON_VERSION"]
               assert tkinter.TclVersion == 9.0
               assert tkinter.TkVersion == 9.0
               assert str(tkinter.Tcl().call("info", "patchlevel")).startswith(
@@ -552,7 +574,7 @@ jobs:
             -path '*/Resources/Info.plist' -print -quit)"
           test -n "$python_plist"
           test "$(plutil -extract CFBundleVersion raw -o - "$python_plist")" = \
-            "$PYTHON_VERSION"
+            "$MACOS_PYTHON_VERSION"
 
           tkinter_path="$(find "$app_path/Contents/Frameworks" \
             -type f -name '_tkinter*.so' -print -quit)"
