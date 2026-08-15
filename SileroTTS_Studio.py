@@ -23,6 +23,8 @@ import urllib.parse
 import unicodedata
 import queue
 import concurrent.futures
+import warnings
+from pathlib import Path
 
 # === КРОССПЛАТФОРМЕННЫЙ ЗАПУСК ДОЧЕРНИХ ПРОЦЕССОВ ===
 # Pydub импортирует Popen двумя способами: через модуль subprocess и напрямую
@@ -30,6 +32,23 @@ import concurrent.futures
 # консоль, а в многопоточном GUI macOS принудительно оставляет CPython на
 # posix_spawn: обычный fork после инициализации Tk/CoreFoundation небезопасен.
 _ORIGINAL_SUBPROCESS_POPEN = subprocess.Popen
+
+
+def _resolve_external_binary(bin_name):
+    """Находит внешний бинарник без зависимости от PATH Finder/macOS GUI."""
+    bin_name = os.fsdecode(bin_name)
+    resolved = shutil.which(bin_name)
+    if resolved:
+        return resolved
+
+    if sys.platform == "darwin":
+        # GUI и управляемые IDE могут запускать Python с минимальным PATH, в
+        # котором нет Homebrew. Поддерживаем обе стандартные архитектуры Mac.
+        for prefix in ("/opt/homebrew/bin", "/usr/local/bin"):
+            candidate = Path(prefix) / bin_name
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+    return None
 
 
 def _resolve_macos_popen_command(command, *, shell=False):
@@ -45,7 +64,7 @@ def _resolve_macos_popen_command(command, *, shell=False):
     executable_text = os.fsdecode(executable)
     if os.path.dirname(executable_text):
         return command
-    resolved = shutil.which(executable_text)
+    resolved = _resolve_external_binary(executable_text)
     if not resolved:
         return command
 
@@ -122,7 +141,6 @@ except Exception as exc:
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from pathlib import Path
 from collections import deque
 from razdel import sentenize
 
@@ -191,10 +209,10 @@ CACHE_VARIANT_KEEP_LEGACY = "keep_legacy"
 CACHE_VARIANT_KEEP_LEGACY_CURRENT = "keep_legacy_current"
 CACHE_VARIANT_KEEP_CURRENT = "keep_current"
 
-# Официальный рабочий endpoint EnhancedTTS использует HTTP. Не повышаем схему
-# до HTTPS автоматически: сервер и пользовательский конфиг должны получать
-# адрес ровно в поддерживаемом виде.
-DEFAULT_API_URL = "http://iq3g.silero.ai/enhanced_voice"
+# Официальный HTTPS endpoint используется только как значение по умолчанию.
+# Любой непустой адрес из настроек передаётся без скрытого переписывания:
+# пользователь может указать собственный сервер, прокси или HTTP endpoint.
+DEFAULT_API_URL = "https://iq3g.silero.ai/enhanced_voice"
 
 CACHE_OPERATION_LABELS = {
     "load": "обновление таблицы",
@@ -217,7 +235,8 @@ CACHE_AUDIO_SAMPLE_RATE = 48000
 CACHE_AUDIO_CHANNELS = 1
 
 _DIALOGUE_PREFIX_PATTERN = (
-    r"^[ \t]*(?:[-–—−]{2,}|-(?![ \t]*\d)|[–—−])[ \t]*"
+    r"^[ \t]*(?:[-–—−]{2,}|-(?=[ \t]+\d+[ \t]*-[А-Яа-яЁё]{1,4}\b)|"
+    r"-(?![ \t]*\d)|[–—]|−(?![ \t]*\d))[ \t]*"
 )
 
 # Кавычки, которыми может начинаться отдельный абзац с прямой речью или
@@ -225,6 +244,29 @@ _DIALOGUE_PREFIX_PATTERN = (
 # но полный набор нужен и для пользовательских RegEx, применяемых позднее.
 _QUOTED_SPEECH_OPENERS = frozenset('"\'«“„‟‹‘‚「『')
 _COLON_TRAILING_CLOSERS = frozenset('"\'»”’›」』)]}')
+
+
+_SILERO_SUPPORTED_TEXT_PATTERN = re.compile(r"[A-Za-zА-Яа-яЁё]")
+
+
+def contains_synthesizable_text(value):
+    """Проверяет, останется ли в тексте поддерживаемый API материал.
+
+    После нормализации отдельный чанк может состоять только из пунктуации,
+    символов или неподдерживаемой письменности. EnhancedTTS удаляет такой
+    материал и отвечает HTTP 422 ``Your text is empty!``. Поэтому после
+    нормализации нужна хотя бы одна русская или ASCII-латинская буква. Числа в
+    штатном пути уже записаны нормализатором словами; если нормализатор
+    недоступен, чанк только из цифр тоже не отправляется и не вызывает 422.
+    Смешанные фразы здесь не очищаются: их исходный Unicode-текст и ключ
+    кэша должны остаться неизменными.
+    """
+    return bool(_SILERO_SUPPORTED_TEXT_PATTERN.search(str(value or "")))
+
+
+def _log_text_preview(value, limit=180):
+    """Возвращает однострочное безопасное превью текста для журнала."""
+    return " ".join(str(value or "").split())[:limit]
 
 
 def _config_bool(value, default=False):
@@ -377,35 +419,39 @@ def effective_group_subfolder(merge_files, subfolder_requested):
 def normalize_dialogue_line_starts(text):
     """Унифицирует тире реплики, не превращая знак числа в тире диалога.
 
-    Обычный минус сохраняется перед цифрой как слитно, так и через пробелы.
-    Семантический Unicode-минус ``−`` в такой позиции приводится к ``-``, чтобы
-    его понимал ru-normalizr. Короткое/длинное тире остаётся оформлением прямой
-    речи. Строки-разделители к этому моменту уже защищены служебным токеном.
+    Обычный минус сохраняется перед количественным числом как слитно, так и
+    через пробелы. Неоднозначный ASCII-дефис перед порядковым числительным
+    считается маркером реплики только при явном пробеле (``- 62-й ранг``), а
+    слитное ``-62-й`` остаётся отрицательным числом. Семантический Unicode-минус
+    ``−`` перед цифрой всегда приводится к ``-`` уже после распознавания реплик,
+    поэтому не теряет смысл даже в ``− 62-й``. Короткое/длинное тире ``–``/``—``
+    всегда остаётся оформлением прямой речи. Строки-разделители к этому моменту
+    уже защищены служебным токеном.
     """
     text = re.sub(
-        r"^([ \t]*)−(?=[ \t]*\d)",
-        r"\1-",
+        _DIALOGUE_PREFIX_PATTERN,
+        "— ",
         str(text),
         flags=re.MULTILINE,
     )
     return re.sub(
-        _DIALOGUE_PREFIX_PATTERN,
-        "— ",
+        r"^([ \t]*)−(?=[ \t]*\d)",
+        r"\1-",
         text,
         flags=re.MULTILINE,
     )
 
 
 def strip_dialogue_prefix(text):
-    """Удаляет только распознанное тире реплики, сохраняя минус перед числом."""
+    """Удаляет тире реплики, сохраняя минус перед количественным числом."""
     text = re.sub(
-        r"^([ \t]*)−(?=[ \t]*\d)",
-        r"\1-",
+        _DIALOGUE_PREFIX_PATTERN,
+        "",
         str(text),
     )
     return re.sub(
-        _DIALOGUE_PREFIX_PATTERN,
-        "",
+        r"^([ \t]*)−(?=[ \t]*\d)",
+        r"\1-",
         text,
     )
 
@@ -987,10 +1033,6 @@ def cache_entry_matches_required_text(cache_info, required_hashes):
         return False
     return cache_content_hash(normalized_text, speaker) in required_hashes
 
-# === ИМПОРТ PYDUB И НАСТРОЙКА ПУТЕЙ FFMPEG ===
-from pydub import AudioSegment
-from pydub.silence import detect_nonsilent
-
 def _find_bundled_binary(bin_name):
     if not getattr(sys, 'frozen', False):
         return None
@@ -1010,27 +1052,43 @@ def _find_bundled_binary(bin_name):
             return str(candidate)
     return None
 
-def get_ffmpeg_path():
-    """Сначала ищет FFmpeg внутри пакета, затем в системе."""
-    if getattr(sys, 'frozen', False):
-        bin_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
+def _get_media_binary_path(tool_name):
+    """Сначала ищет FFmpeg/FFprobe внутри пакета, затем в системе."""
+    bin_name = f"{tool_name}.exe" if platform.system() == "Windows" else tool_name
+    if getattr(sys, "frozen", False):
         local_bin = _find_bundled_binary(bin_name)
         if local_bin:
             return local_bin
-            
-    sys_name = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
-    return shutil.which(sys_name) or ("/opt/homebrew/bin/ffmpeg" if sys.platform == "darwin" and os.path.exists("/opt/homebrew/bin/ffmpeg") else sys_name)
+    return _resolve_external_binary(bin_name) or bin_name
+
+
+def get_ffmpeg_path():
+    return _get_media_binary_path("ffmpeg")
+
 
 def get_ffprobe_path():
-    """Сначала ищет FFprobe внутри пакета, затем в системе."""
-    if getattr(sys, 'frozen', False):
-        bin_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
-        local_bin = _find_bundled_binary(bin_name)
-        if local_bin:
-            return local_bin
-            
-    sys_name = "ffprobe.exe" if platform.system() == "Windows" else "ffprobe"
-    return shutil.which(sys_name) or ("/opt/homebrew/bin/ffprobe" if sys.platform == "darwin" and os.path.exists("/opt/homebrew/bin/ffprobe") else sys_name)
+    return _get_media_binary_path("ffprobe")
+
+
+# === ИМПОРТ PYDUB И НАСТРОЙКА ПУТЕЙ FFMPEG ===
+# При импорте Pydub один раз проверяет только PATH и успевает вывести ложное
+# предупреждение в frozen/GUI-сборке, хотя встроенный FFmpeg уже найден нами по
+# абсолютному пути. Подавляем исключительно это сообщение и только когда файл
+# действительно существует; при реальном отсутствии зависимость по-прежнему
+# явно диагностируется.
+_PRE_RESOLVED_FFMPEG = get_ffmpeg_path()
+if Path(_PRE_RESOLVED_FFMPEG).is_file():
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Couldn't find ffmpeg or avconv.*",
+            category=RuntimeWarning,
+        )
+        from pydub import AudioSegment
+else:
+    from pydub import AudioSegment
+from pydub.silence import detect_nonsilent
+
 
 def _create_ffmpeg_concat_manifest(audio_files):
     """Создаёт закрытый перед запуском FFmpeg concat-манифест.
@@ -1109,8 +1167,17 @@ def _prepare_api_audio_file(
     """
     source_path = Path(source_path)
     destination_path = Path(destination_path)
+    source_codec, source_channels = _inspect_ogg_audio_header(source_path)
 
-    if not trim_silence and _detect_ogg_audio_codec(source_path) == CACHE_AUDIO_CODEC:
+    # Opus сам декодируется в 48 кГц, но число каналов берётся из OpusHead.
+    # Поэтому без повторного lossy-кодирования можно публиковать только уже
+    # канонический mono-ответ. Неожиданный stereo/multichannel Opus проходит
+    # обычный decode/downmix/encode ниже, даже когда автообрезка выключена.
+    if (
+        not trim_silence
+        and source_codec == CACHE_AUDIO_CODEC
+        and source_channels == CACHE_AUDIO_CHANNELS
+    ):
         destination_path.parent.mkdir(parents=True, exist_ok=True)
         if source_path.resolve() == destination_path.resolve():
             return destination_path
@@ -1119,12 +1186,13 @@ def _prepare_api_audio_file(
         )
         try:
             shutil.copyfile(source_path, temp_path)
+            _require_opus_audio_file(temp_path)
             os.replace(temp_path, destination_path)
             return destination_path
         finally:
             temp_path.unlink(missing_ok=True)
 
-    audio_segment = AudioSegment.from_file(source_path, format="ogg")
+    audio_segment = _load_audio_segment(source_path, known_codec=source_codec)
     prepared_segment = audio_segment
 
     if trim_silence:
@@ -1141,7 +1209,7 @@ def _prepare_api_audio_file(
     prepared_segment = prepared_segment.set_frame_rate(
         CACHE_AUDIO_SAMPLE_RATE
     ).set_channels(CACHE_AUDIO_CHANNELS)
-    return _export_audio_atomic(
+    result_path = _export_audio_atomic(
         prepared_segment,
         destination_path,
         format="ogg",
@@ -1153,20 +1221,95 @@ def _prepare_api_audio_file(
             "-application", "audio",
         ],
     )
+    _require_opus_audio_file(result_path)
+    return result_path
 
 
-def _detect_ogg_audio_codec(path):
-    """Быстро определяет Opus/Vorbis по идентификационному пакету Ogg."""
+def _inspect_ogg_audio_header(path):
+    """Читает кодек и число каналов из идентификационного пакета Ogg.
+
+    Разбор capture pattern и lacing-таблицы не позволяет случайной строке
+    ``OpusHead`` в комментариях или аудиоданных выдать повреждённый/другой Ogg
+    за канонический внутренний фрагмент. Читаются только первые 4 КиБ. Число
+    каналов нужно для безопасного byte-for-byte fast path ответа API: сам
+    контейнер Opus всегда декодируется в 48 кГц, но может быть не mono.
+    """
     try:
         with open(path, "rb") as audio_file:
             header = audio_file.read(4096)
     except OSError:
-        return None
-    if b"OpusHead" in header:
-        return "opus"
-    if b"\x01vorbis" in header:
-        return "vorbis"
-    return None
+        return None, None
+
+    if len(header) < 27 or header[:4] != b"OggS" or header[4] != 0:
+        return None, None
+    segment_count = header[26]
+    segment_table_end = 27 + segment_count
+    if len(header) < segment_table_end:
+        return None, None
+
+    first_packet_size = 0
+    packet_complete = False
+    for lace_value in header[27:segment_table_end]:
+        first_packet_size += lace_value
+        if lace_value < 255:
+            packet_complete = True
+            break
+    packet_end = segment_table_end + first_packet_size
+    if not packet_complete or packet_end > len(header):
+        return None, None
+
+    first_packet = header[segment_table_end:packet_end]
+    if first_packet.startswith(b"OpusHead"):
+        channels = first_packet[9] if len(first_packet) >= 10 else None
+        return "opus", channels if channels else None
+    if first_packet.startswith(b"\x01vorbis"):
+        channels = first_packet[11] if len(first_packet) >= 12 else None
+        return "vorbis", channels if channels else None
+    return None, None
+
+
+def _detect_ogg_audio_codec(path):
+    """Быстро определяет Opus/Vorbis по идентификационному пакету Ogg."""
+    codec, _channels = _inspect_ogg_audio_header(path)
+    return codec
+
+
+def _require_opus_audio_file(path):
+    """Проверяет физический кодек внутреннего фрагмента перед публикацией."""
+    path = Path(path)
+    codec = _detect_ogg_audio_codec(path)
+    if codec != CACHE_AUDIO_CODEC:
+        raise ValueError(
+            f"Внутренний фрагмент {path.name} должен быть Ogg/Opus, "
+            f"найден {codec or 'неизвестный/повреждённый формат'}"
+        )
+    return path
+
+
+def _require_opus_audio_files(paths):
+    """Не допускает смешанный Vorbis/Opus в concat внутреннего кэша."""
+    verified = tuple(Path(path) for path in paths)
+    for path in verified:
+        _require_opus_audio_file(path)
+    return verified
+
+
+def _load_audio_segment(path, *, known_codec=None):
+    """Декодирует известный Ogg без отдельного запуска FFprobe.
+
+    FFmpeg сам читает контейнер, а явный decoder позволяет Pydub не вызывать
+    ``mediainfo_json``. Чтение Vorbis здесь предназначено для legacy-миграции,
+    предпрослушивания и пользовательских файлов; внутренний concat принимает
+    только уже канонизированный Opus. Для прочих форматов сохраняется обычное
+    автоопределение.
+    """
+    path = Path(path)
+    codec = str(known_codec or "").strip().lower()
+    if not codec and path.suffix.lower() in {".ogg", ".oga", ".opus"}:
+        codec = _detect_ogg_audio_codec(path) or ""
+    if codec in {"opus", "vorbis"}:
+        return AudioSegment.from_file(path, format="ogg", codec=codec)
+    return AudioSegment.from_file(path)
 
 
 def _cache_file_identity(path):
@@ -1463,17 +1606,16 @@ def _canonicalize_cached_audio_if_needed(
     смешанного/частично мигрированного кэша и никогда не меняет уже готовый Opus.
     """
     path = Path(path)
-    known_codec = str(known_codec or "").strip().lower()
-    if known_codec == CACHE_AUDIO_CODEC:
-        return CACHE_AUDIO_CODEC
     # Заголовок является источником истины: метаданные индекса могут отставать,
-    # если приложение завершили после атомарной замены файла, но до записи JSON.
+    # если приложение завершили после атомарной замены файла, но до записи JSON,
+    # либо ошибочно утверждать ``audio_codec: opus`` для старого Vorbis.
     codec = _detect_ogg_audio_codec(path)
     if codec == CACHE_AUDIO_CODEC:
         return CACHE_AUDIO_CODEC
     if codec != "vorbis":
         raise ValueError(f"Не удалось определить кодек Ogg-файла {path.name}")
     _transcode_cache_audio_to_opus(path, publish_lock=publish_lock)
+    _require_opus_audio_file(path)
     return CACHE_AUDIO_CODEC
 
 
@@ -1492,14 +1634,23 @@ def _write_text_atomic(path, content):
     finally:
         temp_path.unlink(missing_ok=True)
 
-# Принудительно скармливаем пути библиотеке Pydub
-AudioSegment.converter = get_ffmpeg_path()
+# Pydub использует ``AudioSegment.converter`` для декодера, но путь к
+# ffprobe в pydub 0.25.1 каждый раз ищет функцией utils.get_prober_name().
+# Поэтому одного исторического атрибута ``AudioSegment.ffprobe`` недостаточно:
+# передаём обоим путям абсолютные бинарники, не меняя глобальный PATH процесса.
+AudioSegment.converter = _PRE_RESOLVED_FFMPEG
 AudioSegment.ffprobe = get_ffprobe_path()
 
-# Если запущены под macOS из Finder (.app) — добавляем Homebrew в PATH для subprocess
-if is_frozen_mac:
-    extra_paths = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
-    os.environ["PATH"] = ":".join(extra_paths) + ":" + os.environ.get("PATH", "")
+import pydub.utils as _pydub_utils
+
+_PYDUB_ORIGINAL_GET_PROBER_NAME = _pydub_utils.get_prober_name
+
+
+def _pydub_get_prober_name():
+    return get_ffprobe_path()
+
+
+_pydub_utils.get_prober_name = _pydub_get_prober_name
 # -------------------------------------------------------------------------
 
 # ================= НАСТРОЙКА ЛОГИРОВАНИЯ =================
@@ -2253,6 +2404,11 @@ class TTSProcessor:
 
     def process_sentence_text(self, text):
         """Полный цикл обработки одного предложения (сохраняет чистый исходник отдельно)"""
+        # Обычно это уже выполнено для всего абзаца, но повторяем защиту здесь:
+        # функция также используется напрямую при тестировании и из старых
+        # интеграций. Иначе ru-normalizr успеет принять ``- 62-й`` за минус.
+        text = normalize_dialogue_line_starts(text)
+
         # 1. Запоминаем знак препинания в конце
         term_punct = ""
         m = re.search(r'([.!?…]+)["\'»”]*$', text.strip())
@@ -2293,6 +2449,11 @@ class TTSProcessor:
                 text = normalizer.normalize(text)
             except Exception as e:
                 logging.warning(f"Ошибка нормализации для фразы '{text[:30]}...': {e}")
+
+        # Защитный маркер ru-normalizr не должен попадать ни в API, ни в ключ
+        # кэша. В нормальном пути он относится лишь к настоящему минусу:
+        # дефис реплики перед ``62-й`` заменяется на тире ещё до нормализации.
+        text = text.replace("\ue001", "минус ")
 
         # 7. Очистка спецсимволов (не трогаем +, так как он уже для ударений)
         text = re.sub(r'[*|\\/_\#~^()\[\]{}<>"\'«»„“”]', '', text)
@@ -2399,6 +2560,7 @@ class TTSProcessor:
                     raise OSError(
                         f"Кодировщик не создал временный файл {temp_path.name}"
                     )
+                _require_opus_audio_file(temp_path)
                 os.replace(temp_path, filepath)
             finally:
                 if exported is not None and hasattr(exported, "close"):
@@ -2411,13 +2573,14 @@ class TTSProcessor:
         return filepath
 
     def _run_ffmpeg_concat(self, audio_files):
-        """Склеивает список аудиофайлов через FFmpeg (для Прямого синтеза)"""
+        """Склеивает только канонические Opus-фрагменты внутреннего кэша."""
         SESSION_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
         list_path = None
         temp_out = SESSION_TEMP_DIR / f"out_{uuid.uuid4().hex}.ogg"
 
         try:
+            audio_files = _require_opus_audio_files(audio_files)
             list_path = _create_ffmpeg_concat_manifest(audio_files)
 
             # Временный direct-результат использует тот же кодек, что и кэш.
@@ -2451,6 +2614,7 @@ class TTSProcessor:
                 if temp_out.exists():
                     temp_out.unlink(missing_ok=True)
                 return None
+            _require_opus_audio_file(temp_out)
             return temp_out
         except Exception:
             logging.exception("Не удалось выполнить временную склейку FFmpeg")
@@ -2520,6 +2684,7 @@ class TTSProcessor:
         for attempt in range(1, int(self.cfg["max_retries"]) + 1):
             temp_ogg = None
             prepared_ogg = None
+            audio_response_received = False
             if self.is_stopped:
                 return None, False
             if not self.rate_limiter.wait(lambda: self.is_stopped):
@@ -2530,6 +2695,7 @@ class TTSProcessor:
                 r = self.session.post(self.cfg["api_url"], json=payload, timeout=30)
                 r.raise_for_status()
                 audio_data = base64.b64decode(r.json()['results'][0]['audio'])
+                audio_response_received = True
                 
                 temp_ogg = self.cache_audio_dir / f"temp_{uuid.uuid4().hex}.ogg"
                 prepared_ogg = self.cache_audio_dir / f"prepared_{uuid.uuid4().hex}.ogg"
@@ -2544,6 +2710,7 @@ class TTSProcessor:
                     ),
                     silence_threshold=float(self.cfg["silence_threshold"]),
                 )
+                _require_opus_audio_file(prepared_ogg)
 
                 # Читатели видят либо старый полный файл, либо новый полный файл —
                 # но никогда частично записанный OGG.
@@ -2597,8 +2764,22 @@ class TTSProcessor:
                 if self.is_stopped:
                     return None, False
                 if r.status_code == 422:
+                    detail = ""
                     try:
-                        detail = r.json().get("detail", "")
+                        response_data = r.json()
+                        detail = (
+                            response_data.get("detail", "")
+                            if isinstance(response_data, dict)
+                            else response_data
+                        )
+                        if not isinstance(detail, str):
+                            detail = json.dumps(detail, ensure_ascii=False)
+                        # FastAPI validation details can include rejected input.
+                        # Never let the API token appear in the local log.
+                        api_token = str(self.cfg.get("api_token", ""))
+                        if api_token:
+                            detail = detail.replace(api_token, "[REDACTED]")
+                        detail = " ".join(detail.split())[:1000]
                         if "unknown api token" in detail.lower():
                             msg = "КРИТИЧЕСКАЯ ОШИБКА: Неверный API Token!"
                             logging.error(msg)
@@ -2617,7 +2798,25 @@ class TTSProcessor:
                             "Не удалось разобрать detail HTTP 422: %s",
                             detail_error,
                         )
-                logging.warning(f"HTTP Ошибка (попытка {attempt}): {e}")
+                    normalized_preview = _log_text_preview(normalized_text)
+                    source_preview = _log_text_preview(original_text)
+                    logging.warning(
+                        "HTTP 422: сервер отклонил фрагмент без повторной "
+                        "попытки; detail=%r; source=%r; normalized=%r",
+                        detail or "причина не указана",
+                        source_preview,
+                        normalized_preview,
+                    )
+                    return self._get_silence_file(
+                        int(self.cfg["pause_sentence"])
+                    ), False
+                logging.warning(
+                    "HTTP ошибка (попытка %d): %s; source=%r; normalized=%r",
+                    attempt,
+                    e,
+                    _log_text_preview(original_text),
+                    _log_text_preview(normalized_text),
+                )
                 if attempt < int(self.cfg["max_retries"]):
                     time.sleep(2)
                 else: return self._get_silence_file(int(self.cfg["pause_sentence"])), False
@@ -2628,7 +2827,24 @@ class TTSProcessor:
                     prepared_ogg.unlink(missing_ok=True)
                 if self.is_stopped:
                     return None, False
-                logging.error(f"Ошибка сети (попытка {attempt}): {e}")
+                if audio_response_received:
+                    logging.exception(
+                        "Ошибка локальной подготовки ответа API; повторный "
+                        "сетевой запрос не выполняется; source=%r; "
+                        "normalized=%r",
+                        _log_text_preview(original_text),
+                        _log_text_preview(normalized_text),
+                    )
+                    return self._get_silence_file(
+                        int(self.cfg["pause_sentence"])
+                    ), False
+                logging.error(
+                    "Ошибка сети/API (попытка %d): %s; source=%r; normalized=%r",
+                    attempt,
+                    e,
+                    _log_text_preview(original_text),
+                    _log_text_preview(normalized_text),
+                )
                 if attempt < int(self.cfg["max_retries"]):
                     time.sleep(2)
                 else: return self._get_silence_file(int(self.cfg["pause_sentence"])), False
@@ -2684,7 +2900,17 @@ class TTSProcessor:
             processed_sentences = []
             for sent_raw in sentences:
                 sent_clean = self.process_sentence_text(sent_raw)
-                if not re.search(r'[а-яА-ЯёЁa-zA-Z0-9]', sent_clean): continue
+                # После нормализации самостоятельный фрагмент из одних
+                # неподдерживаемых символов для API эквивалентен пустоте.
+                # Смешанный текст не чистим: это сохраняет payload и ключ кэша.
+                if not contains_synthesizable_text(sent_clean):
+                    logging.info(
+                        "Пропущен самостоятельный фрагмент без поддерживаемого "
+                        "текста; source=%r; normalized=%r",
+                        _log_text_preview(sent_raw),
+                        _log_text_preview(sent_clean),
+                    )
+                    continue
                 processed_sentences.append((sent_raw, sent_clean))
 
             if not processed_sentences: continue
@@ -2863,7 +3089,8 @@ class TTSProcessor:
             res = None
             temp_out = None
             try:
-                list_path = _create_ffmpeg_concat_manifest(audio_files)
+                audio_files_verified = _require_opus_audio_files(audio_files)
+                list_path = _create_ffmpeg_concat_manifest(audio_files_verified)
 
                 cmd = [
                     get_ffmpeg_path(), "-y", "-f", "concat", "-safe", "0",
@@ -3084,7 +3311,7 @@ class TTSProcessor:
             
             for sent_raw in sentences:
                 sent_clean = self.process_sentence_text(sent_raw)
-                if not re.search(r'[а-яА-ЯёЁa-zA-Z0-9]', sent_clean): 
+                if not contains_synthesizable_text(sent_clean):
                     continue
                 processed_sentences.append(sent_clean)
 
@@ -3626,6 +3853,20 @@ class TTSApp:
         self._mac_startup_focus_done = False
         self._mac_startup_focus_after_id = None
         self._mac_startup_map_bind_id = self.root.bind("<Map>", self._on_mac_initial_map, add="+")
+        # Повторный Map корневого toplevel после сворачивания не должен снова
+        # перехватывать фокус, но Aqua иногда оставляет themed controls в
+        # неактивном сером состоянии до следующей активации приложения.
+        self._mac_restore_map_bind_id = self.root.bind(
+            "<Map>", self._on_mac_restore_map, add="+"
+        )
+        # На Aqua активность окна и фокус — разные состояния. После возврата
+        # свёрнутого приложения Tk может уже иметь state == normal, но нативные
+        # Scale/Progressbar всё ещё нарисованы как элементы неактивного окна.
+        # <Activate> приходит именно при возврате NSWindow в активное состояние
+        # и потому дополняет (но не заменяет) <Map>.
+        self._mac_restore_activate_bind_id = self.root.bind(
+            "<Activate>", self._on_mac_restore_activate, add="+"
+        )
         # update_idletasks() во время построения большого интерфейса иногда успевает
         # отобразить root до установки bind. after_idle служит одноразовой страховкой.
         self.root.after_idle(self._schedule_mac_startup_focus)
@@ -3635,6 +3876,81 @@ class TTSApp:
         if event.widget is not self.root or self._mac_startup_focus_done:
             return
         self._schedule_mac_startup_focus()
+
+    def _on_mac_restore_map(self, event):
+        """Перерисовывает Aqua после восстановления, не отбирая фокус."""
+        if event.widget is not self.root or not self._mac_startup_focus_done:
+            return
+        self._schedule_mac_restore_refresh()
+
+    def _on_mac_restore_activate(self, event):
+        """Повторяет redraw, когда восстановленное Aqua-окно стало активным."""
+        if event.widget is not self.root or not self._mac_startup_focus_done:
+            return
+        self._schedule_mac_restore_refresh()
+
+    def _schedule_mac_restore_refresh(self):
+        """Объединяет близкие Map/Activate в одну отложенную перерисовку."""
+        after_id = getattr(self, "_mac_restore_refresh_after_id", None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self._mac_restore_refresh_after_id = self.root.after(
+            25, self._refresh_mac_after_restore
+        )
+
+    def _invalidate_mac_aqua_widgets(self):
+        """Просит все ttk-потомки перечитать нативное состояние Aqua."""
+        # ttk::ThemeChanged — штатный механизм Tk, который рассылает
+        # <<ThemeChanged>> всем потомкам. Некоторые версии Aqua не
+        # инвалидируют нативный drawing state Scale/Progressbar только от
+        # виртуального события, поэтому дополнительно переустанавливаем уже
+        # выбранную тему: это не меняет оформление или значения виджетов, но
+        # заставляет theme engine пересоздать системные controls.
+        theme_reloaded = False
+        try:
+            style = ttk.Style(self.root)
+            current_theme = style.theme_use()
+            if current_theme:
+                style.theme_use(current_theme)
+                theme_reloaded = True
+        except tk.TclError:
+            pass
+        if not theme_reloaded:
+            try:
+                self.root.tk.call("ttk::ThemeChanged")
+            except tk.TclError:
+                try:
+                    self.root.event_generate("<<ThemeChanged>>", when="tail")
+                except tk.TclError:
+                    pass
+        try:
+            self.root.event_generate("<Expose>", when="tail")
+            self.root.after_idle(self.root.update_idletasks)
+        except tk.TclError:
+            pass
+
+    def _refresh_mac_after_restore(self):
+        """Даёт Aqua один idle-цикл и инвалидирует отрисовку всех потомков."""
+        self._mac_restore_refresh_after_id = None
+        try:
+            if not self.root.winfo_exists() or self.root.state() != "normal":
+                return
+            # На Tk 9 explicit auto заставляет NSWindow повторно применить
+            # текущий appearance. На Tk 8.6 опция отсутствует и безопасно
+            # пропускается, после чего Expose обновляет обычные виджеты.
+            try:
+                self.root.tk.call(
+                    "wm", "attributes", self.root._w, "-appearance", "auto"
+                )
+            except tk.TclError:
+                pass
+            self._invalidate_mac_aqua_widgets()
+            self._check_system_appearance(reschedule=False)
+        except tk.TclError:
+            pass
 
     def _schedule_mac_startup_focus(self):
         """Планирует единственную активацию после завершения отрисовки окна."""
@@ -3910,9 +4226,10 @@ class TTSApp:
                 continue
         return False
 
-    def _check_system_appearance(self):
-        """Обновляет только статусные цвета при смене темы macOS на лету."""
-        self._appearance_check_after_id = None
+    def _check_system_appearance(self, *, reschedule=True):
+        """Обновляет статусные цвета при смене темы macOS на лету."""
+        if reschedule:
+            self._appearance_check_after_id = None
         if self._is_closing:
             return
 
@@ -3920,11 +4237,17 @@ class TTSApp:
         if is_dark != self._is_dark_appearance:
             self._is_dark_appearance = is_dark
             self._refresh_status_colors()
+            # Tk 9 обычно обновляет native controls сам, но принудительная
+            # рассылка нужна для уже открытых/недавно восстановленных окон.
+            self._invalidate_mac_aqua_widgets()
 
-        try:
-            self._appearance_check_after_id = self.root.after(1500, self._check_system_appearance)
-        except tk.TclError:
-            pass
+        if reschedule:
+            try:
+                self._appearance_check_after_id = self.root.after(
+                    1500, self._check_system_appearance
+                )
+            except tk.TclError:
+                pass
         
     def reset_global_fx(self):
         """Сброс эффектов во вкладке Настройки к дефолтным значениям"""
@@ -4351,6 +4674,14 @@ class TTSApp:
             except tk.TclError:
                 pass
             self._appearance_check_after_id = None
+
+        restore_after_id = getattr(self, "_mac_restore_refresh_after_id", None)
+        if restore_after_id is not None:
+            try:
+                self.root.after_cancel(restore_after_id)
+            except tk.TclError:
+                pass
+            self._mac_restore_refresh_after_id = None
 
         settings_after_id = getattr(self, "_settings_save_after_id", None)
         if settings_after_id is not None:
@@ -5246,7 +5577,7 @@ class TTSApp:
     def play_audio_file(self, filepath):
         if not os.path.exists(filepath): return
         try:
-            seg = AudioSegment.from_file(filepath)
+            seg = _load_audio_segment(filepath)
             self.play_audio_segment(seg)
         except Exception as e:
             logging.error(f"Ошибка чтения файла для плеера: {e}")
@@ -5269,7 +5600,7 @@ class TTSApp:
 
         def _prepare_and_play():
             try:
-                segment = AudioSegment.from_file(audio_path)
+                segment = _load_audio_segment(audio_path)
                 if not already_processed:
                     segment = AudioEffects.apply_effects(
                         segment,
@@ -6857,7 +7188,7 @@ class TTSApp:
                                 for i, f_id in enumerate(files):
                                     if self.is_export_stopped: break
                                     fp = export_files[f_id]["path"]
-                                    final_audio += AudioSegment.from_file(fp)
+                                    final_audio += _load_audio_segment(fp)
                                     if i < len(files) - 1 and pause_ms > 0: final_audio += pause_seg
                                     
                                     processed_files += 1
@@ -6919,7 +7250,7 @@ class TTSApp:
                                     cov = f_set.get("cover") or g_set.get("cover")
                                     
                                     self._post_status_label(self.lbl_export_status, f"Конвертация: {f_set['title']}...", "warning")
-                                    audio = AudioSegment.from_file(fp)
+                                    audio = _load_audio_segment(fp)
                                     
                                     if apply_fx:
                                         audio = AudioEffects.apply_effects(
@@ -6960,7 +7291,7 @@ class TTSApp:
                             cov = f_set.get("cover")
                             
                             self._post_status_label(self.lbl_export_status, f"Конвертация: {f_set['title']}...", "text")
-                            audio = AudioSegment.from_file(fp)
+                            audio = _load_audio_segment(fp)
                             
                             if apply_fx:
                                 audio = AudioEffects.apply_effects(
@@ -7831,7 +8162,7 @@ class TTSApp:
 
             def prepare_and_play():
                 try:
-                    segment = AudioSegment.from_file(filepath)
+                    segment = _load_audio_segment(filepath)
                     processed_segment = AudioEffects.apply_effects(
                         segment,
                         speed=effect_settings[0],
@@ -9086,7 +9417,7 @@ class TTSApp:
   Управление разделителями осуществляется через динамические поля (добавление строчки кнопкой "➕ Добавить", удаление — "❌"). Когда программа встречает указанный символ в тексте, она полностью вырезает его и вставляет на его место чистую тишину заданной длины ("Пауза разделителя"). Разделитель срабатывает только на отдельной строке: кроме него там допустимы лишь пробелы и табуляции. Строки --- и ––– защищаются до нормализации тире, поэтому не превращаются в начало диалога.
   В прогрессе такая строка явно показывается как [ПАУЗА РАЗДЕЛИТЕЛЯ], чтобы намеренная тишина не выглядела зависанием.
   Два и более разделителя подряд не схлопываются: каждый добавляет полную настроенную паузу. С правилом максимума объединяется только структурная пауза между последним разделителем и следующим обычным абзацем.
-• Минус перед числом: Обычный дефис сохраняется и слитно, и через пробел (-5, - 5), чтобы ru-normalizr произнёс его как «минус». Unicode-минус (−5, − 5) приводится к обычному дефису. Короткое и длинное тире в начале строки остаются маркерами реплики.
+• Минус перед числом: Обычный дефис сохраняется и слитно, и через пробел (-5, - 5), чтобы ru-normalizr произнёс его как «минус». Unicode-минус (−5, − 5) приводится к обычному дефису. Короткое и длинное тире в начале строки остаются маркерами реплики; дефис перед порядковым числительным в начале отдельной строки (- 62-й ранг) также считается началом реплики, а не отрицательным числом.
 
 ====================================================================
 ⚙️ 5. ПОЛНЫЙ ЦИКЛ ОБРАБОТКИ И НОРМАЛИЗАЦИИ ТЕКСТА
@@ -9102,6 +9433,13 @@ class TTSApp:
 7. Нормализация (ru-normalizr): Преобразует числа, даты и числительные в пропись ("10" -> "десять").
 8. Защита пунктуации: Если после обработки у предложения пропала финальная точка, программа насильно возвращает её, гарантируя правильную интонацию.
 9. Очистка: Удаляются только уже предусмотренные лишние кавычки, скобки и спецсимволы, после чего чистая фраза уходит в API. Дополнительная агрессивная очистка всей начальной пунктуации не выполняется: это сохраняет знаки чисел, формулы и ручные ударения.
+   После нормализации самостоятельный чанк, в котором нет ни русских, ни
+   ASCII-букв, пропускается: EnhancedTTS считает состоящий только из
+   неподдерживаемых символов фрагмент пустым и возвращает HTTP 422
+   «Your text is empty!».
+   Unicode внутри поддерживаемой фразы не очищается, поэтому её payload и ключ
+   кэша не меняются. Ожидаемый пропуск пишется в журнал на уровне INFO, а
+   предупреждения API содержат короткие source и normalized для диагностики.
 
 ====================================================================
 📖 6. ИМПОРТ И НАРЕЗКА КНИГ (EPUB, FB2, DOCX, TXT)
@@ -9171,6 +9509,8 @@ class TTSApp:
 • O(1) RAM-Архитектура: Чтение из кэша происходит исключительно в оперативной памяти без блокировки жесткого диска. Сборка готовой книги на сотни часов занимает считанные минуты, полностью загружая процессор для параллельного рендера!
 • Steps и ключ кэша: Сам Steps по умолчанию выключен и не отправляется. Если его включить, флажок учёта Steps в ключе кэша по умолчанию активен, поэтому один текст/голос с разными Steps хранится отдельно. Если снять этот флажок, используется общий старый ключ: legacy-записи доступны, но при известном несовпадении Steps общий файл заменяется последним вариантом и смена значения может потребовать нового запроса.
 • Компактный Ogg/Opus-кэш: Новые ответы API и локальные паузы сохраняются как Ogg/Opus 48 кГц mono (целевой битрейт 48 кбит/с). Если автообрезка выключена и API уже вернул совместимый Opus, байты публикуются без повторного lossy-кодирования.
+• Обрезка без Vorbis: При включённой автообрезке цепочка имеет вид Opus → PCM в памяти → Opus. Промежуточные WAV и Vorbis в кэше не создаются; PCM — несжатое рабочее представление Pydub для точной обрезки тишины.
+• Проверка физического кодека: Перед публикацией и склейкой приложение читает только первые 4 КиБ каждого внутреннего OGG и проверяет реальный OpusHead, а не доверяет одному полю audio_codec в JSON. FFprobe и декодирование для этой проверки не запускаются, поэтому она защищает от смешанного/повреждённого кэша без заметного замедления сборки.
 • Миграция старого кэша: Кнопка «Перекодировать Vorbis → Opus» в фоне и атомарно переводит прежние речевые фрагменты из cache/audio, перечисленные в sentence_cache.json, не меняя имён, хэшей и привязки книги. Операцию можно остановить после текущих файлов и позднее продолжить; готовый Opus будет пропущен. Сами заменённые OGG являются контрольными точками, а большой индекс записывается один раз при завершении/остановке. Число процессов берётся из настройки параллельных FFmpeg-сборок; автоматический режим использует до 24. Это необратимое перекодирование между lossy-кодеками, поэтому перед запуском показывается предупреждение.
 • Смешанный кэш: Если массовую миграцию не запускать, «Старт (Все)» по исходным TXT преобразует при первом cache-hit только реально встреченные старые Vorbis-фрагменты. Весь остальной каталог не сканируется, поэтому предварительная миграция большого кэша быстрее первой полной пересборки.
 • Паузы при миграции: Массовая операция не сканирует cache/silences. При первом использовании старый файл паузы не пережимается из Vorbis, а заново создаётся как чистая тишина той же длительности сразу в Opus и атомарно заменяет прежний файл; настройки пауз не теряются.
@@ -9196,6 +9536,10 @@ class TTSApp:
 ====================================================================
 Во вкладке "Настройки" -> "API и Лимиты" вы можете гибко управлять нагрузкой на сеть и процессор:
 
+• API URL: По умолчанию используется официальный HTTPS-адрес Silero. Любой
+  непустой адрес, введённый пользователем, сохраняется и отправляется без
+  скрытой замены протокола или endpoint — это позволяет использовать свой
+  сервер или прокси с ожидаемым поведением.
 • Экспериментальный Steps (скорость/качество синтеза):
   - Выключено [по умолчанию]: ключ steps не отправляется; это совместимо со старыми конфигами, а значение выбирается сервером.
   - 4: Ещё быстрее, но для большинства голосов качество заметно ухудшается.
@@ -9217,7 +9561,9 @@ class TTSApp:
 📁 12. ОСОБЕННОСТИ РАБОТЫ НА РАЗНЫХ ОС
 ====================================================================
 • macOS (.app): Из-за системных ограничений Apple (Gatekeeper) скомпилированное приложение автоматически работает через папку Документы (`~/Documents/SileroTTS_Studio/`).
+  Проверенная и рекомендуемая связка для исходника — Python 3.13.15 + Tcl/Tk 9.0.x. Это не жёсткое требование для синтеза: Python 3.12/Tk 8.6 поддерживается, но после смены системной светлой/тёмной темы может потребоваться перезапуск. Официальная macOS `.app` собирается и проверяется с Tk 9; Windows/Linux поддерживают штатный Tk 8.6.
   Дочерние FFmpeg/FFprobe и системные утилиты запускаются через безопасный для Tk/CoreFoundation механизм `posix_spawn`, без предупреждений `The process has forked ... You MUST exec()`.
+  После восстановления свёрнутого окна события Map/Activate повторно применяют системное оформление, переустанавливают текущую ttk-тему и инвалидируют системные виджеты; прогрессбары и ползунки не должны оставаться серыми до переключения на другое приложение.
 • Умный буфер обмена (Кроссплатформенный):
   - На macOS обрабатывает ⌘C, ⌘V, ⌘X, ⌘A, ⌘Z при русской и английской раскладках и декодирует явные пути Finder (`file://`, `%20`, NFC), не изменяя обычный текст.
   - На Windows и Linux обрабатывает Ctrl+C/V/X/A/Z при русской и английской раскладках, снимает внешние кавычки у явных путей Windows 11 и декодирует `file://`-пути.
@@ -9764,7 +10110,7 @@ class TTSApp:
             text = f"Готово! Сохранено в {saved_path}" if save_file else "Готово! (Не сохранено)"
             status_kind = status
         elif status == "empty":
-            text = "Нет текста для синтеза: введите буквы или цифры."
+            text = "Нет поддерживаемого текста для синтеза."
             status_kind = "warning"
         else:
             text = "Ошибка синтеза. Подробности записаны в лог."
