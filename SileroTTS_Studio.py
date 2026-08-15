@@ -269,6 +269,18 @@ def _log_text_preview(value, limit=180):
     return " ".join(str(value or "").split())[:limit]
 
 
+def strip_leading_text_bom(value):
+    """Удаляет только служебный BOM в начале текста.
+
+    UTF-8 с BOM декодируется в начальный ``U+FEFF``, который способен сломать
+    пользовательские RegEx с якорем ``^``. Такой маркер не является частью
+    текста, но внутренние ``U+FEFF`` не трогаются: они могут появиться после
+    склейки источников или быть осознанным символом.
+    """
+    text = str(value or "")
+    return text.removeprefix("\ufeff")
+
+
 def _config_bool(value, default=False):
     """Безопасно читает bool из JSON, импортированных профилей и Tk."""
     if value is None:
@@ -2319,10 +2331,16 @@ class TTSProcessor:
 
     def _prepare_raw_text(self, raw_text, separator_token):
         """Единая предварительная обработка для синтеза и оптимизации кэша."""
+        raw_text = strip_leading_text_bom(raw_text)
         raw_text = self._protect_separator_lines(raw_text, separator_token)
         raw_text = re.sub(r'[«»“”„]', '"', raw_text)
         raw_text = normalize_dialogue_line_starts(raw_text)
-        return self.apply_regex_rules(raw_text)
+        raw_text = self.apply_regex_rules(raw_text)
+        # Пользовательские правила глоссария могут добавлять новые строки
+        # разделителей, например ``\n***`` после заголовка. Их тоже нужно
+        # превратить в токен до sentenize(), иначе такая строка ошибочно
+        # проходит как пустой фрагмент вместо настроенной паузы.
+        return self._protect_separator_lines(raw_text, separator_token)
 
     def load_glossary_file(self):
         backup_path = self.glossary_path.with_suffix(
@@ -3352,7 +3370,7 @@ class TTSProcessor:
     ):
         filepath = Path(filepath)
         try:
-            with open(filepath, 'r', encoding='utf-8') as f: raw_text = f.read()
+            with open(filepath, 'r', encoding='utf-8-sig') as f: raw_text = f.read()
         except Exception as e:
             logging.error(f"Не удалось прочитать файл {filepath.name}: {e}")
             if completion_callback: completion_callback(filepath.name, "error", None)
@@ -3522,7 +3540,7 @@ class BookExtractor:
 
     @staticmethod
     def split_txt_by_regex(filepath, pattern):
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open(filepath, 'r', encoding='utf-8-sig') as f:
             text = f.read()
             
         if not pattern:
@@ -5727,7 +5745,7 @@ class TTSApp:
                     elif ext == ".docx": 
                         chapters = [("Книга", "\n\n".join([c[1] for c in BookExtractor.extract_docx(filepath)]))]
                     elif ext == ".txt": 
-                        with open(filepath, 'r', encoding='utf-8') as f: chapters = [("Книга", f.read())]
+                        with open(filepath, 'r', encoding='utf-8-sig') as f: chapters = [("Книга", f.read())]
                 else:
                     if ext == ".epub": chapters, author = BookExtractor.extract_epub(filepath)
                     elif ext == ".fb2": chapters, author = BookExtractor.extract_fb2(filepath)
@@ -9066,7 +9084,7 @@ class TTSApp:
                 
                 for f in txt_files:
                     try:
-                        with open(f, 'r', encoding='utf-8') as file: raw_text = file.read()
+                        with open(f, 'r', encoding='utf-8-sig') as file: raw_text = file.read()
                         file_hashes = processor.get_all_possible_hashes(raw_text)
                         required_hashes.update(file_hashes)
                     except Exception as e:
@@ -9424,6 +9442,7 @@ class TTSApp:
 ====================================================================
 Чтобы нейросеть правильно озвучила текст, программа бережно обрабатывает каждую фразу строго в следующем порядке:
 
+0. UTF-8 BOM: Служебный BOM в самом начале TXT бесшумно удаляется до RegEx и вычисления ключа кэша, поэтому шаблоны с ^ работают одинаково для UTF-8 с BOM и без него. Внутренние U+FEFF не удаляются как обычный текст.
 1. Математика и плюсы: Математические плюсы (1 + 1) и одиночные плюсы заменяются на слово "плюс". Плюсы внутри и в начале слов (з+амок, +аура) маскируются для защиты ручных ударений.
 2. RegEx-правила: Применяются шаблоны замены из Глоссария (ДО разбивки на предложения).
 3. Сегментация: Текст разбивается на предложения с помощью библиотеки Razdel.
@@ -9561,7 +9580,7 @@ class TTSApp:
 📁 12. ОСОБЕННОСТИ РАБОТЫ НА РАЗНЫХ ОС
 ====================================================================
 • macOS (.app): Из-за системных ограничений Apple (Gatekeeper) скомпилированное приложение автоматически работает через папку Документы (`~/Documents/SileroTTS_Studio/`).
-  Проверенная и рекомендуемая связка для исходника — Python 3.13.15 + Tcl/Tk 9.0.x. Это не жёсткое требование для синтеза: Python 3.12/Tk 8.6 поддерживается, но после смены системной светлой/тёмной темы может потребоваться перезапуск. Официальная macOS `.app` собирается и проверяется с Tk 9; Windows/Linux поддерживают штатный Tk 8.6.
+  Проверенная и рекомендуемая связка для исходника — Python 3.13.x + Tcl/Tk 9.0.x (локально проверены Python 3.13.15 и Tk 9.0.4). Это не жёсткое требование для синтеза: Python 3.12/Tk 8.6 поддерживается, но после смены системной светлой/тёмной темы может потребоваться перезапуск. Официальная macOS `.app` собирается на актуальном Homebrew Python 3.13.x и проверяется с Tk 9; Windows/Linux поддерживают штатный Tk 8.6.
   Дочерние FFmpeg/FFprobe и системные утилиты запускаются через безопасный для Tk/CoreFoundation механизм `posix_spawn`, без предупреждений `The process has forked ... You MUST exec()`.
   После восстановления свёрнутого окна события Map/Activate повторно применяют системное оформление, переустанавливают текущую ttk-тему и инвалидируют системные виджеты; прогрессбары и ползунки не должны оставаться серыми до переключения на другое приложение.
 • Умный буфер обмена (Кроссплатформенный):
