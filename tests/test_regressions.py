@@ -30,6 +30,16 @@ def load_studio_module():
 studio = load_studio_module()
 
 
+def fake_ogg_first_page(codec_packet, *, trailing=b""):
+    """Builds the minimum first Ogg page needed by header-only unit tests."""
+    if len(codec_packet) > 254:
+        raise ValueError("test packet must fit one lacing segment")
+    return (
+        b"OggS" + b"\x00" + b"\x02" + b"\x00" * 20
+        + b"\x01" + bytes([len(codec_packet)]) + codec_packet + trailing
+    )
+
+
 class ApiStepsTests(unittest.TestCase):
     def test_disabled_and_legacy_config_omit_steps(self):
         for config in ({}, {"api_steps_enabled": False, "api_steps": 16}):
@@ -447,13 +457,28 @@ class ConfigurationProfileTests(unittest.TestCase):
 
 
 class ConfigurationValidationTests(unittest.TestCase):
+    def test_default_api_url_uses_https(self):
+        config = studio.normalize_config({"api_url": ""})
+
+        self.assertEqual(
+            studio.DEFAULT_API_URL,
+            "https://iq3g.silero.ai/enhanced_voice",
+        )
+        self.assertEqual(config["api_url"], studio.DEFAULT_API_URL)
+
     def test_official_http_api_url_is_preserved_verbatim(self):
-        api_url = "http://iq3g.silero.ai/enhanced_voice"
+        user_url = "http://iq3g.silero.ai/enhanced_voice"
 
-        config = studio.normalize_config({"api_url": api_url})
+        config = studio.normalize_config({"api_url": user_url})
 
-        self.assertEqual(studio.DEFAULT_API_URL, api_url)
-        self.assertEqual(config["api_url"], api_url)
+        self.assertEqual(config["api_url"], user_url)
+
+    def test_custom_http_api_url_is_preserved_verbatim(self):
+        custom_url = "http://127.0.0.1:8000/enhanced_voice"
+
+        config = studio.normalize_config({"api_url": custom_url})
+
+        self.assertEqual(config["api_url"], custom_url)
 
     def test_invalid_numeric_values_fall_back_without_losing_unknown_keys(self):
         with self.assertLogs(level=logging.WARNING):
@@ -738,14 +763,92 @@ class CacheFileSafetyTests(unittest.TestCase):
 
 class TextNormalizationTests(unittest.TestCase):
     def test_numeric_minus_variants_are_kept_or_normalized_safely(self):
-        text = "-5\n- 5\n−5\n− 5\n– 5\n— 5"
+        text = (
+            "-5\n- 5\n−5\n− 5\n– 5\n— 5\n"
+            "-62-й\n- 62-й\n−62-й\n− 62-й\n–62-й\n—62-й"
+        )
 
         normalized = studio.normalize_dialogue_line_starts(text)
 
         self.assertEqual(
             normalized,
-            "-5\n- 5\n-5\n- 5\n— 5\n— 5",
+            "-5\n- 5\n-5\n- 5\n— 5\n— 5\n"
+            "-62-й\n— 62-й\n-62-й\n- 62-й\n— 62-й\n— 62-й",
         )
+
+    def test_ordinal_at_dialogue_start_is_not_spoken_as_negative(self):
+        processor = object.__new__(studio.TTSProcessor)
+        processor.cfg = {
+            "auto_abbreviations": True,
+            "auto_short_words": True,
+        }
+        processor.compiled_strict_case = []
+        processor.compiled_ignore_case = []
+
+        prepared = studio.normalize_dialogue_line_starts("- 62-й ранг.")
+        normalized = processor.process_sentence_text(prepared)
+
+        self.assertNotIn("\ue001", normalized)
+        self.assertEqual(normalized, "шестьдесят второй ранг.")
+
+    def test_true_negative_ordinal_keeps_negative_semantics_inside_sentence(self):
+        processor = object.__new__(studio.TTSProcessor)
+        processor.cfg = {
+            "auto_abbreviations": True,
+            "auto_short_words": True,
+        }
+        processor.compiled_strict_case = []
+        processor.compiled_ignore_case = []
+
+        normalized = processor.process_sentence_text("Температура -62-я.")
+
+        self.assertNotIn("\ue001", normalized)
+        self.assertEqual(normalized, "Температура минус шестьдесят вторая.")
+
+    def test_compact_negative_ordinal_at_line_start_remains_negative(self):
+        processor = object.__new__(studio.TTSProcessor)
+        processor.cfg = {
+            "auto_abbreviations": True,
+            "auto_short_words": True,
+        }
+        processor.compiled_strict_case = []
+        processor.compiled_ignore_case = []
+
+        normalized = processor.process_sentence_text("-62-я температура.")
+
+        self.assertNotIn("\ue001", normalized)
+        self.assertEqual(normalized, "минус шестьдесят вторая температура.")
+
+    def test_synthesizable_text_accepts_supported_and_mixed_scripts(self):
+        for text in ("Тест", "Test", "囧...... было такое лицо"):
+            with self.subTest(text=text):
+                self.assertTrue(studio.contains_synthesizable_text(text))
+        for text in ("", "...", "—", "***", "123", "王", "火焰领主", "狐狸"):
+            with self.subTest(text=text):
+                self.assertFalse(studio.contains_synthesizable_text(text))
+
+    def test_real_chinese_footnotes_keep_only_speakable_phrases(self):
+        processor = object.__new__(studio.TTSProcessor)
+        processor.cfg = {
+            "auto_abbreviations": True,
+            "auto_short_words": True,
+        }
+        processor.compiled_strict_case = []
+        processor.compiled_ignore_case = []
+
+        cases = (
+            ("(王)", "王.", False),
+            ("[4] (火焰领主)", "火焰领主.", False),
+            ("[6] (狐狸)", "狐狸.", False),
+            ('[3] (焱) "пламя"', "焱 пламя.", True),
+        )
+        for raw_text, expected, accepted in cases:
+            with self.subTest(raw_text=raw_text):
+                normalized = processor.process_sentence_text(raw_text)
+                self.assertEqual(normalized, expected)
+                self.assertEqual(
+                    studio.contains_synthesizable_text(normalized), accepted
+                )
 
     def test_dialogue_and_separator_lines_keep_their_roles(self):
         processor = object.__new__(studio.TTSProcessor)
@@ -923,6 +1026,9 @@ class BookImportTests(unittest.TestCase):
 
 
 class MacSubprocessPolicyTests(unittest.TestCase):
+    def test_pydub_converter_uses_the_pre_resolved_ffmpeg_path(self):
+        self.assertEqual(studio.AudioSegment.converter, studio.get_ffmpeg_path())
+
     def test_macos_wrapper_requests_posix_spawn_compatible_options(self):
         with mock.patch.object(studio.platform, "system", return_value="Darwin"), \
              mock.patch.object(studio.sys, "platform", "darwin"), \
@@ -949,6 +1055,26 @@ class MacSubprocessPolicyTests(unittest.TestCase):
         self.assertEqual(original.call_args.args[0][0], "/usr/bin/pbpaste")
         self.assertIs(original.call_args.kwargs["close_fds"], False)
 
+    def test_macos_binary_lookup_falls_back_to_both_homebrew_prefixes(self):
+        arm_binary = Path("/opt/homebrew/bin/ffprobe")
+        with mock.patch.object(studio.sys, "platform", "darwin"), \
+             mock.patch.object(studio.shutil, "which", return_value=None), \
+             mock.patch.object(Path, "is_file", autospec=True, side_effect=lambda path: path == arm_binary), \
+             mock.patch.object(studio.os, "access", return_value=True):
+            self.assertEqual(
+                studio._resolve_external_binary("ffprobe"), str(arm_binary)
+            )
+
+    def test_pydub_prober_uses_resolved_absolute_path(self):
+        import pydub.utils
+
+        with mock.patch.object(
+            studio, "get_ffprobe_path", return_value="/absolute/ffprobe"
+        ):
+            self.assertEqual(
+                pydub.utils.get_prober_name(), "/absolute/ffprobe"
+            )
+
     def test_macos_wrapper_rejects_preexec_fn(self):
         with mock.patch.object(studio.platform, "system", return_value="Darwin"), \
              mock.patch.object(studio.sys, "platform", "darwin"):
@@ -970,7 +1096,156 @@ class MacSubprocessPolicyTests(unittest.TestCase):
         self.assertIs(pydub.utils.Popen, expected_popen)
 
 
+class MacAquaRestoreTests(unittest.TestCase):
+    def make_app(self):
+        app = object.__new__(studio.TTSApp)
+        app.root = mock.Mock()
+        app.root.winfo_exists.return_value = True
+        app.root.state.return_value = "normal"
+        app.root.after.return_value = "restore-after"
+        app._mac_startup_focus_done = True
+        app._mac_restore_refresh_after_id = None
+        app._is_closing = False
+        app._check_system_appearance = mock.Mock()
+        return app
+
+    def test_setup_observes_map_and_aqua_activation(self):
+        app = self.make_app()
+        app.root.bind.side_effect = ("initial-map", "restore-map", "activate")
+
+        with mock.patch.object(studio.sys, "platform", "darwin"):
+            app._setup_mac_startup_focus()
+
+        sequences = [call.args[0] for call in app.root.bind.call_args_list]
+        self.assertEqual(sequences, ["<Map>", "<Map>", "<Activate>"])
+        self.assertEqual(app._mac_restore_activate_bind_id, "activate")
+
+    def test_map_and_activate_share_one_debounced_refresh(self):
+        app = self.make_app()
+        event = mock.Mock(widget=app.root)
+
+        app._on_mac_restore_map(event)
+        app._on_mac_restore_activate(event)
+
+        app.root.after_cancel.assert_called_once_with("restore-after")
+        self.assertEqual(app.root.after.call_count, 2)
+        self.assertEqual(
+            app.root.after.call_args.args,
+            (25, app._refresh_mac_after_restore),
+        )
+
+    @mock.patch.object(studio.ttk, "Style")
+    def test_restore_reapplies_auto_appearance_and_redraws_all_ttk_widgets(
+        self, style_class
+    ):
+        app = self.make_app()
+        style = style_class.return_value
+        style.theme_use.side_effect = ("aqua", None)
+
+        app._refresh_mac_after_restore()
+
+        style_class.assert_called_once_with(app.root)
+        self.assertEqual(
+            style.theme_use.call_args_list,
+            [mock.call(), mock.call("aqua")],
+        )
+        app.root.tk.call.assert_any_call(
+            "wm", "attributes", app.root._w, "-appearance", "auto"
+        )
+        app.root.event_generate.assert_called_with("<Expose>", when="tail")
+        app.root.after_idle.assert_called_once_with(app.root.update_idletasks)
+        app._check_system_appearance.assert_called_once_with(reschedule=False)
+
+    @mock.patch.object(studio.ttk, "Style")
+    def test_appearance_change_redraws_ttk_descendants(self, style_class):
+        app = self.make_app()
+        style = style_class.return_value
+        style.theme_use.side_effect = ("aqua", None)
+        app._is_dark_appearance = False
+        app._detect_dark_appearance = mock.Mock(return_value=True)
+        app._refresh_status_colors = mock.Mock()
+        app._check_system_appearance = (
+            studio.TTSApp._check_system_appearance.__get__(app, studio.TTSApp)
+        )
+
+        app._check_system_appearance(reschedule=False)
+
+        self.assertTrue(app._is_dark_appearance)
+        app._refresh_status_colors.assert_called_once_with()
+        self.assertEqual(
+            style.theme_use.call_args_list,
+            [mock.call(), mock.call("aqua")],
+        )
+
+
 class BuildWorkflowContractTests(unittest.TestCase):
+    def test_release_python_and_macos_tk_are_pinned_and_verified(self):
+        workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('PYTHON_VERSION: "3.13.15"', workflow)
+        self.assertIn('MACOS_TK_SERIES: "9.0"', workflow)
+        self.assertIn(
+            'brew install "python@${PYTHON_VERSION%.*}" '
+            '"python-tk@${PYTHON_VERSION%.*}"',
+            workflow,
+        )
+        self.assertIn('HOMEBREW_NO_AUTO_UPDATE: "1"', workflow)
+        self.assertNotIn("brew update", workflow)
+        self.assertIn('test "$installed_python_version" = "$PYTHON_VERSION"', workflow)
+        self.assertIn('"$py" -m venv .venv', workflow)
+        self.assertIn("actual_python != expected_python", workflow)
+        self.assertIn("platform.machine() != expected_arch", workflow)
+        self.assertIn("tkinter.TclVersion != 9.0", workflow)
+        self.assertIn("tkinter.TkVersion != 9.0", workflow)
+
+        runtime_start = workflow.index("- name: Verify Python runtime dependencies")
+        ffmpeg_start = workflow.index("- name: Set up FFmpeg")
+        runtime_block = workflow[runtime_start:ffmpeg_start]
+        self.assertIn("import tkinter", runtime_block)
+        self.assertIn("sys.version_info[:3] == expected_python", runtime_block)
+        self.assertIn("assert tkinter.TclVersion == 9.0", runtime_block)
+        self.assertIn("assert tkinter.TkVersion == 9.0", runtime_block)
+
+        verify_start = workflow.index("- name: Verify macOS bundle contents")
+        upload_start = workflow.index("- name: Upload full build artifact")
+        verify_block = workflow[verify_start:upload_start]
+        self.assertIn("Python.framework", verify_block)
+        self.assertIn("CFBundleVersion", verify_block)
+        self.assertIn("_tkinter*.so", verify_block)
+        self.assertIn("libtcl9.0.dylib", verify_block)
+        self.assertIn("libtcl9tk9.0.dylib", verify_block)
+        self.assertIn("otool -L \"$media_binary\"", verify_block)
+        self.assertIn("Homebrew paths", verify_block)
+        self.assertIn(
+            'for media_binary in "$ffmpeg_path" "$ffprobe_path"; do',
+            verify_block,
+        )
+        self.assertGreaterEqual(verify_block.count("lipo"), 4)
+
+    def test_help_and_release_docs_describe_audio_and_macos_contracts(self):
+        readme = (PROJECT_DIR / "README.md").read_text(encoding="utf-8")
+        release_notes = (PROJECT_DIR / "release notes.md").read_text(
+            encoding="utf-8"
+        )
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        help_start = source.index('help_text = r"""')
+        help_end = source.index(
+            '"""\n\n        self.help_text_widget.insert', help_start
+        )
+        help_text = source[help_start:help_end]
+
+        for document in (readme, release_notes, help_text):
+            self.assertIn("Opus → PCM", document)
+            self.assertIn("Python 3.13.15", document)
+            self.assertIn("Tk 9", document)
+            self.assertIn("FFprobe", document)
+
+        self.assertIn("первую страницу контейнера", readme)
+        self.assertIn("первую страницу контейнера", release_notes)
+        self.assertIn("Промежуточные WAV и Vorbis", help_text)
+
     def test_release_matrix_keeps_required_portable_artifacts(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
@@ -1037,6 +1312,89 @@ class BuildWorkflowContractTests(unittest.TestCase):
 
 
 class AtomicOutputTests(unittest.TestCase):
+    def test_codec_detector_reads_only_the_ogg_header(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            source = Path(tempdir) / "cached.ogg"
+            source.write_bytes(fake_ogg_first_page(b"OpusHead") + b"x" * 10000)
+
+            wrapped_file = mock.MagicMock()
+            wrapped_file.__enter__.return_value = wrapped_file
+            wrapped_file.read.return_value = fake_ogg_first_page(b"OpusHead")
+            wrapped_file.__exit__.return_value = False
+
+            with mock.patch("builtins.open", return_value=wrapped_file) as opened:
+                codec = studio._detect_ogg_audio_codec(source)
+
+            self.assertEqual(codec, "opus")
+            opened.assert_called_once_with(source, "rb")
+            wrapped_file.read.assert_called_once_with(4096)
+
+    def test_codec_detector_rejects_marker_outside_identification_packet(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            source = Path(tempdir) / "misleading.ogg"
+            source.write_bytes(
+                fake_ogg_first_page(b"not-a-codec", trailing=b"OpusHead")
+            )
+
+            self.assertIsNone(studio._detect_ogg_audio_codec(source))
+
+    def test_codec_detector_rejects_truncated_or_invalid_ogg_page(self):
+        invalid_headers = (
+            b"not-ogg OpusHead",
+            b"OggS\x01" + b"\x00" * 40 + b"OpusHead",
+            b"OggS\x00\x02" + b"\x00" * 20 + b"\x01\xffOpusHead",
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            source = Path(tempdir) / "broken.ogg"
+            for header in invalid_headers:
+                with self.subTest(header=header[:8]):
+                    source.write_bytes(header)
+                    self.assertIsNone(studio._detect_ogg_audio_codec(source))
+
+    def test_physical_opus_check_rejects_stale_vorbis_metadata(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            source = Path(tempdir) / "cached.ogg"
+            source.write_bytes(fake_ogg_first_page(b"\x01vorbis"))
+
+            with self.assertRaisesRegex(ValueError, "Ogg/Opus"):
+                studio._require_opus_audio_file(source)
+
+    def test_known_ogg_codec_decodes_without_ffprobe(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            source = Path(tempdir) / "cached.ogg"
+            source.write_bytes(fake_ogg_first_page(b"OpusHead"))
+            sentinel = object()
+
+            with mock.patch.object(
+                studio.AudioSegment,
+                "from_file",
+                return_value=sentinel,
+            ) as from_file:
+                decoded = studio._load_audio_segment(source)
+
+            self.assertIs(decoded, sentinel)
+            from_file.assert_called_once_with(
+                source, format="ogg", codec="opus"
+            )
+
+    def test_known_vorbis_codec_decodes_without_ffprobe(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            source = Path(tempdir) / "legacy.ogg"
+            source.write_bytes(fake_ogg_first_page(b"\x01vorbis"))
+            sentinel = object()
+
+            with mock.patch.object(
+                studio.AudioSegment,
+                "from_file",
+                return_value=sentinel,
+            ) as from_file:
+                decoded = studio._load_audio_segment(source)
+
+            self.assertIs(decoded, sentinel)
+            from_file.assert_called_once_with(
+                source, format="ogg", codec="vorbis"
+            )
+
     def test_failed_audio_export_preserves_existing_destination(self):
         with tempfile.TemporaryDirectory() as tempdir:
             output = Path(tempdir) / "result.wav"
@@ -1255,6 +1613,84 @@ class EmptySynthesisTests(unittest.TestCase):
 
             self.assertEqual(pauses, [1200])
 
+    def test_hyphen_before_ordinal_at_line_start_is_dialogue(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            processor = self.make_processor(Path(tempdir))
+            self.set_pause_config(processor)
+            speech_texts = []
+
+            pauses = self.collect_silence_durations(
+                processor,
+                "Авторский текст.\n- 62-й ранг.",
+                speech_texts=speech_texts,
+            )
+
+            self.assertEqual(pauses, [700])
+            self.assertEqual(speech_texts[-1], "шестьдесят второй ранг.")
+
+    def test_standalone_unsupported_chunk_is_removed_after_sentence_split(self):
+        raw_text = (
+            "Светлые волосы в мгновение ока сменились на белые и чёрные, "
+            "белых было больше, но чёрные локоны были видны особенно чётко. "
+            "На его лбу появились четыре линии, три горизонтальные и одна "
+            "вертикальная, как раз, чтобы образовывать иероглиф \"король\". "
+            "(王)"
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            processor = self.make_processor(Path(tempdir))
+            speech_texts = []
+
+            with self.assertLogs(level=logging.INFO) as captured:
+                self.collect_silence_durations(
+                    processor, raw_text, speech_texts=speech_texts
+                )
+
+        self.assertEqual(len(speech_texts), 2)
+        self.assertTrue(all("王" not in text for text in speech_texts))
+        self.assertTrue(any("иероглиф король" in text for text in speech_texts))
+        log_text = "\n".join(captured.output)
+        self.assertIn("source='(王)'", log_text)
+        self.assertIn("normalized='王.'", log_text)
+
+    def test_standalone_unsupported_chunk_is_skipped_but_mixed_text_is_kept(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            processor = self.make_processor(Path(tempdir))
+            speech_texts = []
+
+            self.collect_silence_durations(
+                processor,
+                'Слово «король».\n(王)\nВнутри фразы 王 остаётся.',
+                speech_texts=speech_texts,
+            )
+
+            self.assertEqual(
+                speech_texts,
+                ["Слово король.", "Внутри фразы 王 остаётся."],
+            )
+            self.assertNotIn("王.", speech_texts)
+
+    def test_hash_scan_skips_same_unsupported_chunk_as_synthesis(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            processor = self.make_processor(Path(tempdir))
+            raw_text = (
+                'Слово «король».\n(王)\n'
+                'Внутри фразы 王 остаётся.'
+            )
+
+            hashes = processor.get_all_possible_hashes(raw_text)
+            unsupported_hash = studio.cache_content_hash(
+                "王.", processor.cfg["speaker"]
+            )
+
+            self.assertNotIn(unsupported_hash, hashes)
+            self.assertIn(
+                studio.cache_content_hash(
+                    "Внутри фразы 王 остаётся.",
+                    processor.cfg["speaker"],
+                ),
+                hashes,
+            )
+
     def test_full_mode_keeps_paragraphs_in_one_request_without_fake_pause(self):
         with tempfile.TemporaryDirectory() as tempdir:
             processor = self.make_processor(Path(tempdir))
@@ -1463,7 +1899,10 @@ class FfmpegSaveCommandTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
         self.audio_file = self.root / "input.ogg"
-        self.audio_file.write_bytes(b"audio")
+        # Финальная сборка принимает только внутренние канонические фрагменты.
+        # Для теста построения команды достаточно сигнатуры Ogg/Opus: сам
+        # subprocess ниже подменён и содержимое декодироваться не будет.
+        self.audio_file.write_bytes(fake_ogg_first_page(b"OpusHead-test-audio"))
         self.cover_file = self.root / "cover.png"
         self.cover_file.write_bytes(b"image")
 
@@ -1575,12 +2014,26 @@ class CacheBehaviorTests(unittest.TestCase):
             }
 
     class FakeSession:
-        def __init__(self):
+        def __init__(self, response=None):
             self.calls = []
+            self.response = response or CacheBehaviorTests.FakeResponse()
 
         def post(self, url, json, timeout):
             self.calls.append((url, json, timeout))
-            return CacheBehaviorTests.FakeResponse()
+            return self.response
+
+    class Fake422Response:
+        status_code = 422
+
+        def raise_for_status(self):
+            raise studio.requests.exceptions.HTTPError(
+                "422 Client Error: Unprocessable Entity",
+                response=self,
+            )
+
+        @staticmethod
+        def json():
+            return {"detail": "Your text is empty!"}
 
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -1611,9 +2064,10 @@ class CacheBehaviorTests(unittest.TestCase):
 
     def synthesize_without_decoding(self, processor, *, force_new=False):
         def fake_prepare(source, destination, **_kwargs):
-            source = Path(source)
             destination = Path(destination)
-            destination.write_bytes(source.read_bytes())
+            # Имитируем контракт реального _prepare_api_audio_file: наружу
+            # публикуется только физический Ogg/Opus, а не произвольный ответ.
+            destination.write_bytes(fake_ogg_first_page(b"OpusHead-new audio"))
             return destination
 
         with mock.patch.object(
@@ -1636,7 +2090,7 @@ class CacheBehaviorTests(unittest.TestCase):
         returned_file, success = self.synthesize_without_decoding(processor)
 
         self.assertTrue(success)
-        self.assertEqual(returned_file.read_bytes(), b"new audio")
+        self.assertEqual(returned_file.read_bytes(), fake_ogg_first_page(b"OpusHead-new audio"))
         self.assertNotEqual(returned_file, cache_file)
         self.assertEqual(cache_file.read_bytes(), b"old audio")
         self.assertEqual(len(processor.session.calls), 1)
@@ -1659,10 +2113,64 @@ class CacheBehaviorTests(unittest.TestCase):
         )
 
         self.assertTrue(success)
-        self.assertEqual(returned_file.read_bytes(), b"new audio")
+        self.assertEqual(returned_file.read_bytes(), fake_ogg_first_page(b"OpusHead-new audio"))
         self.assertEqual(len(processor.session.calls), 1)
         self.assertEqual(processor.cache[text_hash]["usage_count"], 1)
         self.assertEqual(processor.unsaved_cache_items, 1)
+
+    def test_synthesis_uses_configured_api_url_verbatim(self):
+        processor = self.make_processor(use_cache=False)
+        configured_url = "http://127.0.0.1:8000/enhanced_voice"
+        processor.cfg["api_url"] = configured_url
+
+        returned_file, success = self.synthesize_without_decoding(processor)
+
+        self.assertTrue(success)
+        self.assertTrue(returned_file.exists())
+        self.assertEqual(len(processor.session.calls), 1)
+        self.assertEqual(processor.session.calls[0][0], configured_url)
+
+    def test_local_decode_failure_does_not_repeat_successful_api_request(self):
+        processor = self.make_processor(use_cache=True)
+        processor.cfg["max_retries"] = 5
+        fallback = self.root / "fallback.ogg"
+        processor._get_silence_file = mock.Mock(return_value=fallback)
+
+        with mock.patch.object(
+            studio,
+            "_prepare_api_audio_file",
+            side_effect=FileNotFoundError("ffprobe"),
+        ), self.assertLogs(level=logging.ERROR) as captured:
+            returned_file, success = processor.synthesize_sentence(
+                "Фраза.", "Фраза."
+            )
+
+        self.assertFalse(success)
+        self.assertEqual(returned_file, fallback)
+        self.assertEqual(len(processor.session.calls), 1)
+        self.assertIn(
+            "Ошибка локальной подготовки ответа API",
+            "\n".join(captured.output),
+        )
+
+    def test_http_422_logs_detail_and_is_not_retried(self):
+        processor = self.make_processor(use_cache=True)
+        processor.cfg["max_retries"] = 5
+        processor.session = self.FakeSession(self.Fake422Response())
+        fallback = self.root / "fallback.ogg"
+        processor._get_silence_file = mock.Mock(return_value=fallback)
+
+        with self.assertLogs(level=logging.WARNING) as captured:
+            returned_file, success = processor.synthesize_sentence("王.", "(王)")
+
+        self.assertFalse(success)
+        self.assertEqual(returned_file, fallback)
+        self.assertEqual(len(processor.session.calls), 1)
+        log_text = "\n".join(captured.output)
+        self.assertIn("Your text is empty!", log_text)
+        self.assertIn("source='(王)'", log_text)
+        self.assertIn("normalized='王.'", log_text)
+        self.assertIn("без повторной попытки", log_text)
 
 
 class CacheOpusMigrationTests(unittest.TestCase):
@@ -1673,8 +2181,8 @@ class CacheOpusMigrationTests(unittest.TestCase):
             audio_dir.mkdir()
             vorbis = audio_dir / ("a" * 32 + ".ogg")
             opus = audio_dir / ("b" * 32 + ".ogg")
-            vorbis.write_bytes(b"OggS\x00\x01vorbis-old")
-            opus.write_bytes(b"OggS\x00OpusHead-new")
+            vorbis.write_bytes(fake_ogg_first_page(b"\x01vorbis-old"))
+            opus.write_bytes(fake_ogg_first_page(b"OpusHead-new"))
             cache_data = {
                 "first": {"file_name": vorbis.name},
                 "second": {"file_name": opus.name, "audio_codec": "opus"},
@@ -1686,7 +2194,7 @@ class CacheOpusMigrationTests(unittest.TestCase):
                     size = path.stat().st_size
                     return "already_opus", size, size, size, size
                 old_size = path.stat().st_size
-                path.write_bytes(b"OggS\x00OpusHead-converted")
+                path.write_bytes(fake_ogg_first_page(b"OpusHead-converted"))
                 new_size = path.stat().st_size
                 return "converted", old_size, new_size, old_size, new_size
 
@@ -1715,7 +2223,7 @@ class CacheOpusMigrationTests(unittest.TestCase):
             cache_data = {}
             for index in range(10):
                 filename = f"{index:032x}.ogg"
-                (audio_dir / filename).write_bytes(b"OggS\x00\x01vorbis")
+                (audio_dir / filename).write_bytes(fake_ogg_first_page(b"\x01vorbis"))
                 cache_data[str(index)] = {"file_name": filename}
             cancel_event = studio.threading.Event()
             calls = []
@@ -1748,7 +2256,7 @@ class CacheOpusMigrationTests(unittest.TestCase):
             audio_dir.mkdir()
             filename = "c" * 32 + ".ogg"
             audio_file = audio_dir / filename
-            audio_file.write_bytes(b"OggS\x00\x01vorbis")
+            audio_file.write_bytes(fake_ogg_first_page(b"\x01vorbis"))
             cache_data = {
                 "one": {"file_name": filename},
                 "two": {"file_name": filename},
@@ -1776,7 +2284,7 @@ class CacheOpusMigrationTests(unittest.TestCase):
             audio_dir.mkdir()
             filename = "d" * 32 + ".ogg"
             audio_file = audio_dir / filename
-            audio_file.write_bytes(b"OggS\x00\x01vorbis")
+            audio_file.write_bytes(fake_ogg_first_page(b"\x01vorbis"))
             cache_data = {"one": {"file_name": filename}}
             checkpoints = []
             size = audio_file.stat().st_size
@@ -1805,7 +2313,7 @@ class CacheOpusMigrationTests(unittest.TestCase):
             audio_dir = cache_dir / "audio"
             audio_dir.mkdir()
             filename = "e" * 32 + ".ogg"
-            (audio_dir / filename).write_bytes(b"OggS\x00\x01vorbis")
+            (audio_dir / filename).write_bytes(fake_ogg_first_page(b"\x01vorbis"))
             cache_data = {"one": {"file_name": filename}}
             cancel_event = studio.threading.Event()
             cancel_event.set()
@@ -1825,7 +2333,8 @@ class CacheOpusMigrationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    studio.shutil.which("ffmpeg") and studio.shutil.which("ffprobe"),
+    Path(studio.get_ffmpeg_path()).is_file()
+    and Path(studio.get_ffprobe_path()).is_file(),
     "FFmpeg and FFprobe are required for the integration test",
 )
 class FfmpegIntegrationTests(unittest.TestCase):
@@ -1935,6 +2444,49 @@ class FfmpegIntegrationTests(unittest.TestCase):
             self.assertEqual(stream["channels"], 1)
             self.assertEqual(source.read_bytes(), destination.read_bytes())
 
+    def test_stereo_api_opus_is_downmixed_even_without_trimming(self):
+        """Fast path must not let a non-canonical Opus layout into cache."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "api-stereo.ogg"
+            destination = root / "cache-mono.ogg"
+
+            subprocess.run(
+                [
+                    studio.get_ffmpeg_path(), "-y", "-loglevel", "error",
+                    "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=0.1:sample_rate=48000",
+                    "-filter_complex", "[0:a]pan=stereo|c0=c0|c1=c0[out]",
+                    "-map", "[out]", "-c:a", "libopus", str(source),
+                ],
+                check=True,
+            )
+
+            self.assertEqual(
+                studio._inspect_ogg_audio_header(source), ("opus", 2)
+            )
+            studio._prepare_api_audio_file(
+                source,
+                destination,
+                trim_silence=False,
+            )
+
+            probe = subprocess.run(
+                [
+                    studio.get_ffprobe_path(), "-v", "error", "-of", "json",
+                    "-show_entries", "stream=codec_name,sample_rate,channels",
+                    str(destination),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            stream = json.loads(probe.stdout)["streams"][0]
+            self.assertEqual(stream["codec_name"], "opus")
+            self.assertEqual(stream["sample_rate"], "48000")
+            self.assertEqual(stream["channels"], 1)
+            self.assertNotEqual(source.read_bytes(), destination.read_bytes())
+
     def test_vorbis_transcode_reduces_real_speech_sample_and_keeps_duration(self):
         with tempfile.TemporaryDirectory() as tempdir:
             cache_file = Path(tempdir) / "speech.ogg"
@@ -2030,7 +2582,8 @@ class FfmpegIntegrationTests(unittest.TestCase):
                 [
                     studio.get_ffmpeg_path(), "-y", "-loglevel", "error",
                     "-f", "lavfi", "-i", "sine=frequency=440:duration=0.05",
-                    "-c:a", "libvorbis", str(audio),
+                    "-ar", "48000", "-ac", "1", "-c:a", "libopus",
+                    str(audio),
                 ],
                 check=True,
             )
