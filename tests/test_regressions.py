@@ -762,6 +762,22 @@ class CacheFileSafetyTests(unittest.TestCase):
 
 
 class TextNormalizationTests(unittest.TestCase):
+    def test_leading_bom_is_removed_before_regex_but_internal_bom_is_kept(self):
+        processor = object.__new__(studio.TTSProcessor)
+        processor.separators = []
+        processor.compiled_strict_case = []
+        processor.compiled_ignore_case = []
+        processor.glossary_regex = [
+            {"pattern": r"^Глава", "repl": "Раздел"}
+        ]
+
+        prepared = processor._prepare_raw_text(
+            "\ufeffГлава 1. Текст\ufeffвнутри.",
+            "___SEPARATOR_TOKEN___",
+        )
+
+        self.assertEqual(prepared, "Раздел 1. Текст\ufeffвнутри.")
+
     def test_numeric_minus_variants_are_kept_or_normalized_safely(self):
         text = (
             "-5\n- 5\n−5\n− 5\n– 5\n— 5\n"
@@ -1005,6 +1021,19 @@ class AtomicWriteTests(unittest.TestCase):
 
 
 class BookImportTests(unittest.TestCase):
+    def test_txt_chapter_regex_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            source = Path(tempdir) / "book.txt"
+            source.write_bytes(
+                b"\xef\xbb\xbf" + "Глава 1\nТекст главы.".encode("utf-8")
+            )
+
+            chapters = studio.BookExtractor.split_txt_by_regex(
+                source, r"^Глава \d+"
+            )
+
+            self.assertEqual(chapters, [("Глава 1", "Глава 1\nТекст главы.")])
+
     def test_duplicate_chapter_names_do_not_overwrite(self):
         with tempfile.TemporaryDirectory() as tempdir:
             saved = studio.BookExtractor.save_chapters(
@@ -1185,17 +1214,22 @@ class BuildWorkflowContractTests(unittest.TestCase):
         )
 
         self.assertIn('PYTHON_VERSION: "3.13.15"', workflow)
+        self.assertIn('MACOS_PYTHON_SERIES: "3.13"', workflow)
         self.assertIn('MACOS_TK_SERIES: "9.0"', workflow)
         self.assertIn(
-            'brew install "python@${PYTHON_VERSION%.*}" '
-            '"python-tk@${PYTHON_VERSION%.*}"',
+            'brew install "python@$python_series" "python-tk@$python_series"',
             workflow,
         )
-        self.assertIn('HOMEBREW_NO_AUTO_UPDATE: "1"', workflow)
-        self.assertNotIn("brew update", workflow)
-        self.assertIn('test "$installed_python_version" = "$PYTHON_VERSION"', workflow)
+        self.assertIn("brew update", workflow)
+        self.assertIn(
+            'brew upgrade "python@$python_series" "python-tk@$python_series"',
+            workflow,
+        )
+        self.assertNotIn("brew link --overwrite", workflow)
+        self.assertNotIn("python-tk@3.13 --overwrite", workflow)
+        self.assertIn('MACOS_PYTHON_VERSION=$installed_python_version', workflow)
         self.assertIn('"$py" -m venv .venv', workflow)
-        self.assertIn("actual_python != expected_python", workflow)
+        self.assertIn("actual_python[:2] != expected_series", workflow)
         self.assertIn("platform.machine() != expected_arch", workflow)
         self.assertIn("tkinter.TclVersion != 9.0", workflow)
         self.assertIn("tkinter.TkVersion != 9.0", workflow)
@@ -1204,7 +1238,11 @@ class BuildWorkflowContractTests(unittest.TestCase):
         ffmpeg_start = workflow.index("- name: Set up FFmpeg")
         runtime_block = workflow[runtime_start:ffmpeg_start]
         self.assertIn("import tkinter", runtime_block)
-        self.assertIn("sys.version_info[:3] == expected_python", runtime_block)
+        self.assertIn("sys.version_info[:2] == expected_series", runtime_block)
+        self.assertIn(
+            'platform.python_version() == os.environ["MACOS_PYTHON_VERSION"]',
+            runtime_block,
+        )
         self.assertIn("assert tkinter.TclVersion == 9.0", runtime_block)
         self.assertIn("assert tkinter.TkVersion == 9.0", runtime_block)
 
@@ -1213,6 +1251,7 @@ class BuildWorkflowContractTests(unittest.TestCase):
         verify_block = workflow[verify_start:upload_start]
         self.assertIn("Python.framework", verify_block)
         self.assertIn("CFBundleVersion", verify_block)
+        self.assertIn('"$MACOS_PYTHON_VERSION"', verify_block)
         self.assertIn("_tkinter*.so", verify_block)
         self.assertIn("libtcl9.0.dylib", verify_block)
         self.assertIn("libtcl9tk9.0.dylib", verify_block)
@@ -1224,11 +1263,8 @@ class BuildWorkflowContractTests(unittest.TestCase):
         )
         self.assertGreaterEqual(verify_block.count("lipo"), 4)
 
-    def test_help_and_release_docs_describe_audio_and_macos_contracts(self):
+    def test_help_and_readme_describe_audio_and_macos_contracts(self):
         readme = (PROJECT_DIR / "README.md").read_text(encoding="utf-8")
-        release_notes = (PROJECT_DIR / "release notes.md").read_text(
-            encoding="utf-8"
-        )
         source = MODULE_PATH.read_text(encoding="utf-8")
         help_start = source.index('help_text = r"""')
         help_end = source.index(
@@ -1236,14 +1272,14 @@ class BuildWorkflowContractTests(unittest.TestCase):
         )
         help_text = source[help_start:help_end]
 
-        for document in (readme, release_notes, help_text):
+        for document in (readme, help_text):
             self.assertIn("Opus → PCM", document)
+            self.assertIn("Python 3.13.x", document)
             self.assertIn("Python 3.13.15", document)
             self.assertIn("Tk 9", document)
             self.assertIn("FFprobe", document)
 
         self.assertIn("первую страницу контейнера", readme)
-        self.assertIn("первую страницу контейнера", release_notes)
         self.assertIn("Промежуточные WAV и Vorbis", help_text)
 
     def test_release_matrix_keeps_required_portable_artifacts(self):
@@ -1868,6 +1904,46 @@ class EmptySynthesisTests(unittest.TestCase):
             )
 
             self.assertEqual(prepared, "___SEPARATOR_TOKEN___")
+
+    def test_regex_generated_separator_becomes_pause_not_empty_fragment(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            processor = self.make_processor(Path(tempdir))
+            processor.separators = ["***"]
+            processor.cfg["separator_symbols"] = "***"
+            processor.cfg["pause_separator"] = 1234
+            processor.glossary_regex = [
+                {
+                    "pattern": r"^(Глава\s+\d+\.)\s*(.+)$",
+                    "repl": r"\1\n- \2\n***",
+                }
+            ]
+            speech_texts = []
+
+            with mock.patch.object(studio.logging, "info") as app_info:
+                pauses = self.collect_silence_durations(
+                    processor,
+                    "Глава 1. Заголовок",
+                    speech_texts=speech_texts,
+                )
+
+            self.assertFalse(
+                any(
+                    call.args
+                    and "Пропущен самостоятельный фрагмент" in str(call.args[0])
+                    for call in app_info.call_args_list
+                )
+            )
+            # Первая пауза относится к оформленной RegEx реплике, вторая —
+            # к самому разделителю. Важно, что ``***`` не был отброшен как
+            # неподдерживаемый текст и сохранил настроенную длительность.
+            self.assertEqual(pauses, [processor.cfg["pause_speech"], 1234])
+            self.assertEqual(speech_texts, ["Глава первая.", "Заголовок."])
+            self.assertEqual(
+                processor._prepare_raw_text(
+                    "Глава 1. Заголовок", "___SEPARATOR_TOKEN___"
+                ),
+                "Глава 1.\n- Заголовок\n___SEPARATOR_TOKEN___",
+            )
 
     def test_hash_collection_uses_one_content_identity_for_all_steps(self):
         with tempfile.TemporaryDirectory() as tempdir:
