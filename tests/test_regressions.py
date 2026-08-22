@@ -3,6 +3,8 @@ import importlib.util
 import json
 import logging
 import subprocess
+import base64
+import struct
 import sys
 import tempfile
 import unittest
@@ -457,6 +459,39 @@ class ConfigurationProfileTests(unittest.TestCase):
 
 
 class ConfigurationValidationTests(unittest.TestCase):
+    def test_export_audio_profile_defaults_are_auto(self):
+        config = studio.normalize_config({})
+
+        self.assertEqual(config["export_bitrate"], "auto")
+        self.assertEqual(config["export_sample_rate"], "auto")
+        self.assertEqual(config["export_channels"], "auto")
+
+    def test_export_audio_profile_values_are_normalized(self):
+        config = studio.normalize_config(
+            {
+                "export_bitrate": " 192K ",
+                "export_sample_rate": " 44100 ",
+                "export_channels": " STEREO ",
+            }
+        )
+
+        self.assertEqual(config["export_bitrate"], "192k")
+        self.assertEqual(config["export_sample_rate"], "44100")
+        self.assertEqual(config["export_channels"], "stereo")
+
+    def test_invalid_export_audio_profile_values_fall_back_to_auto(self):
+        config = studio.normalize_config(
+            {
+                "export_bitrate": "lossless",
+                "export_sample_rate": "12345",
+                "export_channels": "surround",
+            }
+        )
+
+        self.assertEqual(config["export_bitrate"], "auto")
+        self.assertEqual(config["export_sample_rate"], "auto")
+        self.assertEqual(config["export_channels"], "auto")
+
     def test_default_api_url_uses_https(self):
         config = studio.normalize_config({"api_url": ""})
 
@@ -516,6 +551,11 @@ class ConfigurationValidationTests(unittest.TestCase):
         self.assertEqual(config["input_dir"], studio.DEFAULT_INPUT_DIR)
         self.assertEqual(config["cache_dir"], studio.DEFAULT_CACHE_DIR)
 
+    def test_opus_is_a_supported_output_format(self):
+        config = studio.normalize_config({"output_format": " OPUS "})
+
+        self.assertEqual(config["output_format"], "opus")
+
     def test_string_booleans_are_normalized(self):
         config = studio.normalize_config(
             {"use_cache": "false", "direct_save": "true"}
@@ -523,6 +563,53 @@ class ConfigurationValidationTests(unittest.TestCase):
 
         self.assertFalse(config["use_cache"])
         self.assertTrue(config["direct_save"])
+
+    def test_valid_missing_user_directory_is_created_and_preserved(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            custom_input = Path(tempdir) / "new" / "texts"
+            config = {"input_dir": str(custom_input)}
+
+            returned, recovered = studio.ensure_config_directories(
+                config, keys=("input_dir",)
+            )
+
+            self.assertIs(returned, config)
+            self.assertEqual(recovered, {})
+            self.assertEqual(config["input_dir"], str(custom_input))
+            self.assertTrue(custom_input.is_dir())
+
+    def test_unusable_user_directory_falls_back_only_that_key(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            blocked_parent = Path(tempdir) / "not_a_directory"
+            blocked_parent.write_text("file", encoding="utf-8")
+            output_dir = Path(tempdir) / "valid-output"
+            config = {
+                "input_dir": str(blocked_parent / "texts"),
+                "output_dir": str(output_dir),
+            }
+
+            _, recovered = studio.ensure_config_directories(
+                config, keys=("input_dir", "output_dir")
+            )
+
+            self.assertIn("input_dir", recovered)
+            self.assertNotIn("output_dir", recovered)
+            self.assertEqual(config["input_dir"], studio.DEFAULT_INPUT_DIR)
+            self.assertEqual(config["output_dir"], str(output_dir))
+            self.assertTrue(output_dir.is_dir())
+
+    def test_processor_propagates_recovered_paths_to_gui_config(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            blocked_parent = Path(tempdir) / "not_a_directory"
+            blocked_parent.write_text("file", encoding="utf-8")
+            config = studio.DEFAULT_CONFIG.copy()
+            config["input_dir"] = str(blocked_parent / "texts")
+
+            studio.TTSProcessor(
+                config, shared_cache={}, shared_processing_statuses={}
+            )
+
+            self.assertEqual(config["input_dir"], studio.DEFAULT_INPUT_DIR)
 
     def test_config_bool_handles_json_tk_and_invalid_strings(self):
         truthy = (True, 1, "1", "TRUE", " yes ", "on")
@@ -626,6 +713,708 @@ class ClipboardNormalizationTests(unittest.TestCase):
 
 
 class ExportGroupingTests(unittest.TestCase):
+    def test_xiph_cover_uses_signature_and_flac_picture_block(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            cover = Path(tempdir) / "cover.bin"
+            image = b"\x89PNG\r\n\x1a\n" + b"picture-data"
+            cover.write_bytes(image)
+
+            block = base64.b64decode(
+                studio._xiph_metadata_block_picture(cover)
+            )
+
+        offset = 0
+
+        def read_u32():
+            nonlocal offset
+            value = struct.unpack_from(">I", block, offset)[0]
+            offset += 4
+            return value
+
+        self.assertEqual(read_u32(), 3)
+        mime_length = read_u32()
+        self.assertEqual(block[offset:offset + mime_length], b"image/png")
+        offset += mime_length
+        description_length = read_u32()
+        offset += description_length
+        self.assertEqual(tuple(read_u32() for _ in range(4)), (0, 0, 0, 0))
+        image_length = read_u32()
+        self.assertEqual(block[offset:offset + image_length], image)
+
+    def test_xiph_cover_is_passed_via_file_not_command_line(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            cover = root / "cover.png"
+            cover.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+            with mock.patch.object(studio, "SESSION_TEMP_DIR", root):
+                metadata_path = studio._create_xiph_cover_metadata_file(
+                    cover, "book.opus"
+                )
+            self.addCleanup(metadata_path.unlink, missing_ok=True)
+
+            contents = metadata_path.read_text(encoding="ascii")
+            self.assertTrue(contents.startswith(";FFMETADATA1\n"))
+            self.assertIn("METADATA_BLOCK_PICTURE=", contents)
+
+    def test_auto_merge_profile_preserves_uniform_mono_inputs(self):
+        sources = (Path("one.ogg"), Path("two.wav"))
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            side_effect=(
+                {"sample_rate": 44100, "channels": 1},
+                {"sample_rate": 44100, "channels": 1},
+            ),
+        ):
+            profile = studio._select_merge_audio_profile(sources, "wav")
+
+        self.assertEqual(
+            profile,
+            {
+                "sample_rate": 44100,
+                "channels": 1,
+                "channel_layout": "mono",
+                "bitrate": None,
+            },
+        )
+
+    def test_probe_treats_vorbis_unknown_bitrate_sentinel_as_unknown(self):
+        response = mock.Mock(
+            stdout=json.dumps(
+                {
+                    "streams": [
+                        {
+                            "codec_name": "vorbis",
+                            "sample_rate": "96000",
+                            "channels": 2,
+                            "bit_rate": "4294967294",
+                        }
+                    ]
+                }
+            )
+        )
+        with mock.patch.object(studio.subprocess, "run", return_value=response):
+            profile = studio._probe_audio_stream_profile(Path("music.ogg"))
+
+        self.assertEqual(profile["codec"], "vorbis")
+        self.assertEqual(profile["sample_rate"], 96000)
+        self.assertEqual(profile["channels"], 2)
+        self.assertIsNone(profile["bitrate"])
+
+    def test_auto_merge_profile_uses_highest_rate_and_stereo_when_needed(self):
+        sources = (Path("speech.ogg"), Path("music.wav"))
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            side_effect=(
+                {"sample_rate": 44100, "channels": 1},
+                {"sample_rate": 96000, "channels": 2},
+            ),
+        ):
+            profile = studio._select_merge_audio_profile(sources, "wav")
+
+        self.assertEqual(profile["sample_rate"], 96000)
+        self.assertEqual(profile["channels"], 2)
+        self.assertEqual(profile["channel_layout"], "stereo")
+
+    def test_auto_mp3_profile_uses_nearest_supported_sample_rate(self):
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            return_value={"sample_rate": 37800, "channels": 1},
+        ):
+            profile = studio._select_merge_audio_profile(
+                [Path("speech.wav")], "mp3"
+            )
+
+        self.assertEqual(profile["sample_rate"], 44100)
+        self.assertEqual(profile["channels"], 1)
+
+    def test_auto_ogg_profile_preserves_high_sample_rate_in_quality_mode(self):
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            return_value={"sample_rate": 96000, "channels": 2},
+        ):
+            profile = studio._select_merge_audio_profile(
+                [Path("music.wav")], "ogg"
+            )
+
+        self.assertEqual(profile["sample_rate"], 96000)
+        self.assertEqual(profile["channels"], 2)
+        self.assertIsNone(profile["bitrate"])
+
+    def test_auto_opus_profile_preserves_supported_rate_and_channels(self):
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            return_value={
+                "codec": "opus",
+                "sample_rate": 48000,
+                "channels": 1,
+                "bitrate": 96000,
+            },
+        ):
+            profile = studio._select_merge_audio_profile(
+                [Path("speech.opus")], "opus"
+            )
+
+        self.assertEqual(profile["sample_rate"], 48000)
+        self.assertEqual(profile["channels"], 1)
+        self.assertEqual(profile["bitrate"], "96k")
+
+    def test_explicit_ogg_high_sample_rate_requires_auto_bitrate(self):
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            return_value={"sample_rate": 44100, "channels": 1},
+        ):
+            profile = studio._select_merge_audio_profile(
+                [Path("speech.wav")], "ogg", sample_rate="96000"
+            )
+            with self.assertRaisesRegex(ValueError, "quality-режим"):
+                studio._select_merge_audio_profile(
+                    [Path("speech.wav")],
+                    "ogg",
+                    sample_rate="96000",
+                    bitrate="128k",
+                )
+
+        self.assertEqual(profile["sample_rate"], 96000)
+        self.assertEqual(profile["channels"], 1)
+
+    def test_explicit_mp3_high_sample_rate_is_not_silently_changed(self):
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            return_value={"sample_rate": 44100, "channels": 2},
+        ):
+            with self.assertRaisesRegex(ValueError, "не поддерживает"):
+                studio._select_merge_audio_profile(
+                    [Path("music.wav")], "mp3", sample_rate="96000"
+                )
+
+    def test_auto_drops_uniform_bitrate_incompatible_with_codec_profile(self):
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            return_value={
+                "codec": "vorbis",
+                "sample_rate": 22050,
+                "channels": 1,
+                "bitrate": 128000,
+            },
+        ):
+            profile = studio._select_merge_audio_profile(
+                [Path("speech.ogg")], "ogg"
+            )
+
+        self.assertEqual(profile["sample_rate"], 22050)
+        self.assertEqual(profile["channels"], 1)
+        self.assertIsNone(profile["bitrate"])
+
+    def test_explicit_incompatible_vorbis_profile_has_clear_error(self):
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            return_value={"sample_rate": 22050, "channels": 1},
+        ):
+            with self.assertRaisesRegex(ValueError, "не выше 64 кбит/с"):
+                studio._select_merge_audio_profile(
+                    [Path("speech.wav")],
+                    "ogg",
+                    sample_rate="22050",
+                    channels="mono",
+                    bitrate="128k",
+                )
+
+    def test_explicit_merge_bitrate_overrides_uniform_source_metadata(self):
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            return_value={
+                "sample_rate": 48000,
+                "channels": 2,
+                "bitrate": 128000,
+            },
+        ):
+            profile = studio._select_merge_audio_profile(
+                [Path("music.mp3")],
+                "mp3",
+                bitrate="192k",
+            )
+
+        self.assertEqual(profile["bitrate"], "192k")
+
+    def test_auto_profile_preserves_uniform_lossy_bitrate(self):
+        sources = (Path("one.mp3"), Path("two.mp3"))
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            side_effect=(
+                {"sample_rate": 44100, "channels": 1, "bitrate": 128000},
+                {"sample_rate": 44100, "channels": 1, "bitrate": 128000},
+            ),
+        ):
+            profile = studio._select_merge_audio_profile(sources, "mp3")
+
+        self.assertEqual(profile["sample_rate"], 44100)
+        self.assertEqual(profile["channels"], 1)
+        self.assertEqual(profile["channel_layout"], "mono")
+        self.assertEqual(profile["bitrate"], "128k")
+
+    def test_auto_profile_does_not_claim_a_mixed_or_unknown_bitrate(self):
+        cases = (
+            (128000, 192000),
+            (128000, None),
+        )
+        for first_bitrate, second_bitrate in cases:
+            with self.subTest(
+                first_bitrate=first_bitrate,
+                second_bitrate=second_bitrate,
+            ), mock.patch.object(
+                studio,
+                "_probe_audio_stream_profile",
+                side_effect=(
+                    {
+                        "sample_rate": 44100,
+                        "channels": 1,
+                        "bitrate": first_bitrate,
+                    },
+                    {
+                        "sample_rate": 44100,
+                        "channels": 1,
+                        "bitrate": second_bitrate,
+                    },
+                ),
+            ):
+                profile = studio._select_merge_audio_profile(
+                    (Path("one.ogg"), Path("two.ogg")), "ogg"
+                )
+
+            self.assertIsNone(profile["bitrate"])
+
+    def test_explicit_profile_overrides_probed_rate_channels_and_bitrate(self):
+        with mock.patch.object(
+            studio,
+            "_probe_audio_stream_profile",
+            return_value={
+                "sample_rate": 96000,
+                "channels": 2,
+                "bitrate": 320000,
+            },
+        ):
+            profile = studio._select_merge_audio_profile(
+                [Path("music.wav")],
+                "ogg",
+                sample_rate="32000",
+                channels="mono",
+                bitrate="96k",
+            )
+
+        self.assertEqual(
+            profile,
+            {
+                "sample_rate": 32000,
+                "channels": 1,
+                "channel_layout": "mono",
+                "bitrate": "96k",
+            },
+        )
+
+    def test_streaming_merge_normalizes_mixed_inputs_in_filter_complex(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sources = (root / "mono.ogg", root / "stereo.mp3")
+            for source in sources:
+                source.write_bytes(b"audio")
+            destination = root / "book.mp3"
+
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            process.stderr.read.return_value = b""
+
+            def fake_popen(command, **kwargs):
+                Path(command[-1]).write_bytes(b"mp3")
+                return process
+
+            with mock.patch.object(
+                studio.subprocess, "Popen", side_effect=fake_popen
+            ) as popen:
+                studio._export_merged_audio_ffmpeg(
+                    sources,
+                    destination,
+                    output_format="mp3",
+                    bitrate="192k",
+                    pause_ms=250,
+                )
+
+            command = popen.call_args.args[0]
+            self.assertEqual(command.count("-i"), 2)
+            self.assertIn("-filter_complex", command)
+            graph = command[command.index("-filter_complex") + 1]
+            for index in range(2):
+                self.assertIn(
+                    f"[{index}:a:0]aresample={studio.CACHE_AUDIO_SAMPLE_RATE}",
+                    graph,
+                )
+            self.assertIn("channel_layouts=stereo", graph)
+            self.assertIn("anullsrc=r=48000:cl=stereo", graph)
+            self.assertIn("atrim=duration=0.250000", graph)
+            self.assertIn("[a0][p0][a1]concat=n=3:v=0:a=1[merged]", graph)
+            self.assertEqual(
+                command[command.index("-c:a") + 1], "libmp3lame"
+            )
+            self.assertEqual(command[command.index("-b:a") + 1], "192k")
+            self.assertNotIn("copy", command)
+            self.assertEqual(destination.read_bytes(), b"mp3")
+
+    def test_mp3_cover_is_written_as_windows_compatible_jpeg_apic(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "source.ogg"
+            cover = root / "cover.png"
+            destination = root / "book.mp3"
+            source.write_bytes(b"audio")
+            cover.write_bytes(b"png")
+
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            process.stderr.read.return_value = b""
+
+            def fake_popen(command, **kwargs):
+                Path(command[-1]).write_bytes(b"mp3")
+                return process
+
+            with mock.patch.object(
+                studio.subprocess, "Popen", side_effect=fake_popen
+            ) as popen:
+                studio._export_merged_audio_ffmpeg(
+                    [source],
+                    destination,
+                    output_format="mp3",
+                    cover=cover,
+                )
+
+            command = popen.call_args.args[0]
+            self.assertEqual(command.count("-i"), 2)
+            self.assertEqual(
+                command[command.index("-c:v") + 1], "mjpeg"
+            )
+            self.assertEqual(
+                command[command.index("-id3v2_version") + 1], "3"
+            )
+            self.assertEqual(
+                command[command.index("-disposition:v:0") + 1],
+                "attached_pic",
+            )
+            self.assertIn(
+                "comment=Cover (front)",
+                [
+                    command[index + 1]
+                    for index, value in enumerate(command[:-1])
+                    if value == "-metadata:s:v"
+                ],
+            )
+
+    def test_streaming_merge_scales_pause_with_speed_only_once(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sources = (root / "one.ogg", root / "two.ogg")
+            for source in sources:
+                source.write_bytes(b"audio")
+            destination = root / "book.ogg"
+
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            process.stderr.read.return_value = b""
+
+            def fake_popen(command, **kwargs):
+                Path(command[-1]).write_bytes(b"ogg")
+                return process
+
+            with mock.patch.object(
+                studio.subprocess, "Popen", side_effect=fake_popen
+            ) as popen:
+                studio._export_merged_audio_ffmpeg(
+                    sources,
+                    destination,
+                    output_format="ogg",
+                    pause_ms=1000,
+                    speed=2.0,
+                )
+
+            command = popen.call_args.args[0]
+            graph = command[command.index("-filter_complex") + 1]
+            self.assertIn("atrim=duration=1.000000", graph)
+            self.assertIn("[merged]atempo=2[processed]", graph)
+            self.assertNotIn("atrim=duration=0.500000", graph)
+
+    def test_streaming_merge_applies_explicit_export_profile(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "source.wav"
+            destination = root / "result.ogg"
+            source.write_bytes(b"audio")
+
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            process.stderr.read.return_value = b""
+
+            def fake_popen(command, **kwargs):
+                Path(command[-1]).write_bytes(b"ogg")
+                return process
+
+            with mock.patch.object(
+                studio.subprocess, "Popen", side_effect=fake_popen
+            ) as popen:
+                studio._export_merged_audio_ffmpeg(
+                    [source],
+                    destination,
+                    output_format="ogg",
+                    sample_rate="32000",
+                    channels="mono",
+                    bitrate_mode="96k",
+                )
+
+            command = popen.call_args.args[0]
+            graph = command[command.index("-filter_complex") + 1]
+            self.assertIn("aresample=32000", graph)
+            self.assertIn("channel_layouts=mono", graph)
+            self.assertEqual(command[command.index("-ar") + 1], "32000")
+            self.assertEqual(command[command.index("-ac") + 1], "1")
+            self.assertEqual(command[command.index("-b:a") + 1], "96k")
+
+    def test_streaming_opus_export_uses_libopus_and_opus_extension(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "source.wav"
+            destination = root / "result.opus"
+            source.write_bytes(b"audio")
+
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            process.stderr.read.return_value = b""
+
+            def fake_popen(command, **kwargs):
+                Path(command[-1]).write_bytes(b"opus")
+                return process
+
+            with mock.patch.object(
+                studio.subprocess, "Popen", side_effect=fake_popen
+            ) as popen:
+                studio._export_merged_audio_ffmpeg(
+                    [source],
+                    destination,
+                    output_format="opus",
+                    sample_rate="48000",
+                    channels="mono",
+                    bitrate_mode="96k",
+                )
+
+            command = popen.call_args.args[0]
+            self.assertEqual(command[command.index("-c:a") + 1], "libopus")
+            self.assertEqual(command[command.index("-b:a") + 1], "96k")
+            self.assertTrue(str(command[-1]).endswith(".opus"))
+            self.assertEqual(destination.read_bytes(), b"opus")
+
+    def test_streaming_opus_export_embeds_cover_and_keeps_album(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "source.wav"
+            cover = root / "cover.png"
+            destination = root / "result.opus"
+            source.write_bytes(b"audio")
+            cover.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            process.stderr.read.return_value = b""
+
+            def fake_popen(command, **kwargs):
+                Path(command[-1]).write_bytes(b"opus")
+                return process
+
+            with mock.patch.object(
+                studio.subprocess, "Popen", side_effect=fake_popen
+            ) as popen:
+                studio._export_merged_audio_ffmpeg(
+                    [source],
+                    destination,
+                    output_format="opus",
+                    bitrate_mode="32k",
+                    tags={"title": "Part 01", "album": "Book"},
+                    cover=cover,
+                )
+
+            command = popen.call_args.args[0]
+            metadata = [
+                command[index + 1]
+                for index, option in enumerate(command[:-1])
+                if option == "-metadata"
+            ]
+            self.assertEqual(command.count("-i"), 2)
+            self.assertIn("ffmetadata", command)
+            self.assertEqual(command[command.index("-b:a") + 1], "32k")
+            self.assertIn("title=Part 01", metadata)
+            self.assertIn("album=Book", metadata)
+            self.assertNotIn("METADATA_BLOCK_PICTURE", " ".join(command))
+            self.assertEqual([
+                command[index + 1]
+                for index, option in enumerate(command[:-1])
+                if option == "-map_metadata"
+            ], ["-1", "1"])
+
+    def test_single_file_export_uses_the_same_profile_pipeline(self):
+        source = Path("source.mp3")
+        destination = Path("result.ogg")
+
+        with mock.patch.object(
+            studio,
+            "_export_merged_audio_ffmpeg",
+            return_value=destination,
+        ) as export:
+            result = studio._export_single_audio_ffmpeg(
+                source,
+                destination,
+                output_format="ogg",
+                sample_rate="44100",
+                channels="stereo",
+                bitrate_mode="192k",
+                speed=1.25,
+            )
+
+        self.assertEqual(result, destination)
+        export.assert_called_once_with(
+            [source],
+            destination,
+            output_format="ogg",
+            sample_rate="44100",
+            channels="stereo",
+            bitrate_mode="192k",
+            speed=1.25,
+        )
+
+    def test_export_mode_controls_disable_bitrate_for_wav_only(self):
+        app = object.__new__(studio.TTSApp)
+        app._export_running = False
+        app.export_tags_only_var = mock.Mock(get=mock.Mock(return_value=False))
+        app.export_fmt_var = mock.Mock(get=mock.Mock(return_value="wav"))
+        widget_names = (
+            "btn_export_dir",
+            "ent_export_dir",
+            "cb_export_fmt",
+            "cb_export_bitrate",
+            "cb_export_sample_rate",
+            "cb_export_channels",
+            "chk_export_fx",
+            "btn_export_start",
+            "btn_export_stop",
+            "chk_export_tags_only",
+        )
+        for name in widget_names:
+            setattr(app, name, mock.Mock())
+
+        app._sync_export_mode_controls()
+
+        app.cb_export_bitrate.configure.assert_called_with(
+            state=studio.tk.DISABLED
+        )
+        app.cb_export_sample_rate.configure.assert_called_with(state="readonly")
+        app.cb_export_channels.configure.assert_called_with(state="readonly")
+
+        app.export_fmt_var.get.return_value = "mp3"
+        app._sync_export_mode_controls()
+
+        app.cb_export_bitrate.configure.assert_called_with(state="readonly")
+
+    def test_update_config_from_ui_persists_export_profile_selections(self):
+        app = object.__new__(studio.TTSApp)
+        app.config = {}
+        app.settings_vars = {}
+        app.export_fmt_var = mock.Mock(get=mock.Mock(return_value=" OGG "))
+        app.export_bitrate_var = mock.Mock(get=mock.Mock(return_value=" 96K "))
+        app.export_sample_rate_var = mock.Mock(
+            get=mock.Mock(return_value=" 32000 ")
+        )
+        app.export_channels_var = mock.Mock(
+            get=mock.Mock(return_value=" MONO ")
+        )
+
+        app.update_config_from_ui()
+
+        self.assertEqual(app.config["output_format"], "ogg")
+        self.assertEqual(app.config["export_bitrate"], "96k")
+        self.assertEqual(app.config["export_sample_rate"], "32000")
+        self.assertEqual(app.config["export_channels"], "mono")
+
+    def test_tags_only_disables_all_export_profile_controls(self):
+        app = object.__new__(studio.TTSApp)
+        app._export_running = False
+        app.export_tags_only_var = mock.Mock(get=mock.Mock(return_value=True))
+        app.export_fmt_var = mock.Mock(get=mock.Mock(return_value="mp3"))
+        widget_names = (
+            "btn_export_dir",
+            "ent_export_dir",
+            "cb_export_fmt",
+            "cb_export_bitrate",
+            "cb_export_sample_rate",
+            "cb_export_channels",
+            "chk_export_fx",
+            "btn_export_start",
+            "btn_export_stop",
+            "chk_export_tags_only",
+        )
+        for name in widget_names:
+            setattr(app, name, mock.Mock())
+
+        app._sync_export_mode_controls()
+
+        for control in (
+            app.cb_export_bitrate,
+            app.cb_export_sample_rate,
+            app.cb_export_channels,
+        ):
+            control.configure.assert_called_with(state=studio.tk.DISABLED)
+
+    def test_streaming_merge_uses_rf64_auto_for_wav(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "source.mp3"
+            destination = root / "book.wav"
+            source.write_bytes(b"audio")
+
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            process.stderr.read.return_value = b""
+
+            def fake_popen(command, **kwargs):
+                Path(command[-1]).write_bytes(b"RF64")
+                return process
+
+            with mock.patch.object(
+                studio.subprocess, "Popen", side_effect=fake_popen
+            ) as popen:
+                studio._export_merged_audio_ffmpeg(
+                    [source], destination, output_format="wav"
+                )
+
+            command = popen.call_args.args[0]
+            self.assertIn("-filter_complex", command)
+            graph = command[command.index("-filter_complex") + 1]
+            self.assertIn("channel_layouts=stereo", graph)
+            self.assertEqual(
+                command[command.index("-rf64") + 1], "auto"
+            )
+            self.assertEqual(destination.read_bytes(), b"RF64")
+
     def test_new_export_paths_are_deduplicated_before_batching(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -705,6 +1494,12 @@ class ExportGroupingTests(unittest.TestCase):
             "_CON.mp3",
         )
 
+    def test_direct_output_name_supports_opus_extension(self):
+        self.assertEqual(
+            studio.normalize_output_filename("chapter.ogg", "opus"),
+            "chapter.opus",
+        )
+
     def test_cover_is_only_forwarded_to_mp3_export(self):
         with tempfile.TemporaryDirectory() as tempdir:
             cover = Path(tempdir) / "cover.png"
@@ -712,11 +1507,22 @@ class ExportGroupingTests(unittest.TestCase):
 
             mp3 = studio.audio_export_kwargs("mp3", "128k", {"title": "A"}, cover)
             ogg = studio.audio_export_kwargs("ogg", "128k", {"title": "A"}, cover)
+            opus = studio.audio_export_kwargs(
+                "opus", "96k", {"title": "A"}, cover
+            )
 
             self.assertEqual(mp3["cover"], str(cover))
             self.assertEqual(mp3["bitrate"], "128k")
             self.assertNotIn("cover", ogg)
-            self.assertNotIn("bitrate", ogg)
+            self.assertEqual(ogg["bitrate"], "128k")
+            self.assertNotIn("cover", opus)
+            self.assertEqual(opus["format"], "opus")
+            self.assertEqual(opus["bitrate"], "96k")
+
+    def test_wav_export_never_forwards_a_lossy_bitrate(self):
+        kwargs = studio.audio_export_kwargs("wav", "320k")
+
+        self.assertEqual(kwargs, {"format": "wav"})
 
 
 class CacheFileSafetyTests(unittest.TestCase):
@@ -1125,6 +1931,96 @@ class MacSubprocessPolicyTests(unittest.TestCase):
         self.assertIs(pydub.utils.Popen, expected_popen)
 
 
+class AppClickFocusTests(unittest.TestCase):
+    def make_app(self, current_focus=None):
+        app = object.__new__(studio.TTSApp)
+        app.root = mock.Mock()
+        app.root.focus_get.return_value = current_focus
+        app._is_closing = False
+        return app
+
+    def test_click_restores_missing_local_focus_to_clicked_widget(self):
+        app = self.make_app()
+        widget = mock.Mock()
+        widget.winfo_toplevel.return_value = app.root
+
+        app._restore_focus_on_app_click(mock.Mock(widget=widget))
+
+        widget.focus_set.assert_called_once_with()
+        app.root.focus_force.assert_not_called()
+
+    def test_click_preserves_existing_widget_focus(self):
+        focused = mock.Mock()
+        app = self.make_app(focused)
+        widget = mock.Mock()
+        widget.winfo_toplevel.return_value = app.root
+
+        app._restore_focus_on_app_click(mock.Mock(widget=widget))
+
+        widget.focus_set.assert_not_called()
+
+    def test_click_in_child_toplevel_is_not_redirected_to_root(self):
+        app = self.make_app()
+        widget = mock.Mock()
+        widget.winfo_toplevel.return_value = mock.Mock()
+
+        app._restore_focus_on_app_click(mock.Mock(widget=widget))
+
+        widget.focus_set.assert_not_called()
+
+
+class MessageboxFocusTests(unittest.TestCase):
+    def make_app(self, previous_focus=None):
+        app = object.__new__(studio.TTSApp)
+        app.root = mock.Mock()
+        app.root.focus_get.return_value = previous_focus
+        app.root.winfo_exists.return_value = True
+        app._is_closing = False
+        return app
+
+    def test_dialog_has_root_owner_and_preserves_result(self):
+        previous_focus = mock.Mock()
+        previous_focus.winfo_exists.return_value = True
+        app = self.make_app(previous_focus)
+        dialog_function = mock.Mock(return_value=False)
+
+        result = app._run_messagebox(
+            dialog_function, "Подтверждение", "Продолжить?", icon="question"
+        )
+
+        self.assertFalse(result)
+        dialog_function.assert_called_once_with(
+            "Подтверждение",
+            "Продолжить?",
+            icon="question",
+            parent=app.root,
+        )
+        restore_focus = app.root.after_idle.call_args.args[0]
+        restore_focus()
+        previous_focus.focus_set.assert_called_once_with()
+        app.root.focus_force.assert_not_called()
+
+    def test_destroyed_previous_widget_falls_back_to_root(self):
+        previous_focus = mock.Mock()
+        previous_focus.winfo_exists.return_value = False
+        app = self.make_app(previous_focus)
+
+        app._schedule_focus_after_messagebox(previous_focus)
+        restore_focus = app.root.after_idle.call_args.args[0]
+        restore_focus()
+
+        app.root.focus_set.assert_called_once_with()
+
+    def test_dialog_exception_still_schedules_focus_restore(self):
+        app = self.make_app()
+        dialog_function = mock.Mock(side_effect=studio.tk.TclError("dialog failed"))
+
+        with self.assertRaises(studio.tk.TclError):
+            app._run_messagebox(dialog_function, "Ошибка", "Текст")
+
+        app.root.after_idle.assert_called_once()
+
+
 class MacAquaRestoreTests(unittest.TestCase):
     def make_app(self):
         app = object.__new__(studio.TTSApp)
@@ -1207,6 +2103,223 @@ class MacAquaRestoreTests(unittest.TestCase):
         )
 
 
+class CanvasThemeTests(unittest.TestCase):
+    @mock.patch.object(studio.ttk, "Style")
+    def test_export_canvas_uses_current_ttk_frame_background(self, style_class):
+        app = studio.TTSApp.__new__(studio.TTSApp)
+        app.root = mock.Mock()
+        app.grp_basic_canvas = mock.Mock()
+        style_class.return_value.lookup.return_value = "system-background"
+
+        app._sync_export_basic_canvas_theme()
+
+        style_class.assert_called_once_with(app.root)
+        style_class.return_value.lookup.assert_called_once_with(
+            "TFrame", "background"
+        )
+        app.grp_basic_canvas.configure.assert_called_once_with(
+            background="system-background"
+        )
+
+
+class ExportLayoutContractTests(unittest.TestCase):
+    def test_basic_settings_wheel_binding_reaches_nested_controls(self):
+        app = studio.TTSApp.__new__(studio.TTSApp)
+        app._scroll_export_basic_settings = mock.Mock()
+        child = mock.Mock()
+        child.winfo_children.return_value = []
+        parent = mock.Mock()
+        parent.winfo_children.return_value = [child]
+
+        studio.TTSApp._bind_export_basic_scroll_events(app, parent)
+
+        self.assertEqual(parent.bind.call_count, 3)
+        self.assertEqual(child.bind.call_count, 3)
+        parent.bind.assert_any_call(
+            "<MouseWheel>", app._scroll_export_basic_settings, add="+"
+        )
+
+    def test_basic_settings_mouse_wheel_scrolls_in_both_directions(self):
+        app = studio.TTSApp.__new__(studio.TTSApp)
+        app.grp_basic_canvas = mock.Mock()
+        app._grp_basic_scrollbar_visible = True
+        scroll = studio.TTSApp._scroll_export_basic_settings.__get__(
+            app, studio.TTSApp
+        )
+
+        self.assertEqual(scroll(mock.Mock(num=None, delta=120)), "break")
+        app.grp_basic_canvas.yview_scroll.assert_called_once_with(-1, "units")
+
+        app.grp_basic_canvas.yview_scroll.reset_mock()
+        self.assertEqual(scroll(mock.Mock(num=5, delta=0)), "break")
+        app.grp_basic_canvas.yview_scroll.assert_called_once_with(1, "units")
+
+    def test_basic_settings_wheel_is_left_for_parent_without_overflow(self):
+        app = studio.TTSApp.__new__(studio.TTSApp)
+        app.grp_basic_canvas = mock.Mock()
+        app._grp_basic_scrollbar_visible = False
+
+        result = app._scroll_export_basic_settings(
+            mock.Mock(num=None, delta=120)
+        )
+
+        self.assertIsNone(result)
+        app.grp_basic_canvas.yview_scroll.assert_not_called()
+
+    def test_basic_settings_scrollbar_is_visible_only_during_overflow(self):
+        app = studio.TTSApp.__new__(studio.TTSApp)
+        app.grp_basic_canvas = mock.Mock()
+        app.grp_basic_scrollbar = mock.Mock()
+        app._grp_basic_scrollbar_visible = False
+
+        app._set_export_basic_scrollbar("0.0", "0.75")
+
+        app.grp_basic_scrollbar.set.assert_called_with("0.0", "0.75")
+        app.grp_basic_scrollbar.pack.assert_called_once_with(
+            side=studio.tk.RIGHT,
+            fill=studio.tk.Y,
+            before=app.grp_basic_canvas,
+        )
+        self.assertTrue(app._grp_basic_scrollbar_visible)
+
+        app._set_export_basic_scrollbar("0.0", "1.0")
+
+        app.grp_basic_scrollbar.pack_forget.assert_called_once_with()
+        app.grp_basic_canvas.yview_moveto.assert_called_once_with(0)
+        self.assertFalse(app._grp_basic_scrollbar_visible)
+
+    def test_format_stays_compact_and_actions_use_separate_row(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("    def setup_utils_tab(self):")
+        end = source.index("    def _sync_export_mode_controls(self):", start)
+        setup_source = source[start:end]
+
+        format_start = setup_source.index("self.cb_export_fmt = ttk.Combobox(")
+        format_end = setup_source.index(
+            "self.cb_export_fmt.pack(side=tk.LEFT)", format_start
+        )
+        format_block = setup_source[format_start:format_end]
+        self.assertIn('values=["mp3", "wav", "ogg", "opus"]', format_block)
+        self.assertIn("width=5", format_block)
+
+        effects_row = setup_source.index("row3 = ttk.Frame(export_frame)")
+        actions_row = setup_source.index("row4 = ttk.Frame(export_frame)")
+        middle_panel = setup_source.index("self.export_mid_frame = ttk.Frame(frame)")
+        self.assertLess(effects_row, actions_row)
+        self.assertLess(actions_row, middle_panel)
+
+        actions_block = setup_source[actions_row:middle_panel]
+        tags_var = setup_source.index("self.export_tags_only_var = tk.BooleanVar")
+        tags_widget = setup_source.index(
+            "self.chk_export_tags_only = ttk.Checkbutton("
+        )
+        self.assertLess(tags_var, effects_row)
+        self.assertGreater(tags_widget, actions_row)
+        self.assertIn(
+            'text="Только обновить теги в исходных файлах"',
+            actions_block,
+        )
+        self.assertNotIn(
+            "Только обновить теги (в исходных файлах)",
+            setup_source,
+        )
+        self.assertIn(
+            'values=["auto", "32k", "48k", "64k", "96k", "128k", "192k", "256k", "320k"]',
+            setup_source,
+        )
+        self.assertIn("export_actions = ttk.Frame(row4)", actions_block)
+        self.assertIn("export_actions.pack(side=tk.RIGHT)", actions_block)
+        self.assertIn(
+            "self.btn_export_start = ttk.Button(\n            export_actions,",
+            actions_block,
+        )
+        self.assertIn(
+            "self.btn_export_stop = ttk.Button(\n            export_actions,",
+            actions_block,
+        )
+
+    def test_output_settings_offer_32k_bitrate(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("        # 6. Вывод и Теги")
+        end = source.index("    # --- Вкладка \"Глоссарий\" ---", start)
+        output_settings = source[start:end]
+        self.assertIn(
+            '["32k", "48k", "64k", "128k", "192k", "256k", "320k"]',
+            output_settings,
+        )
+
+    def test_basic_group_settings_are_vertically_scrollable(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("    def setup_utils_tab(self):")
+        end = source.index("    def _sync_export_mode_controls(self):", start)
+        setup_source = source[start:end]
+
+        canvas_start = setup_source.index("self.grp_basic_canvas = tk.Canvas(")
+        tags_start = setup_source.index("# -- Вкладка: Теги --")
+        basic_block = setup_source[canvas_start:tags_start]
+        self.assertIn(
+            "self.grp_basic_scrollbar = ttk.Scrollbar(", basic_block
+        )
+        self.assertIn("command=self.grp_basic_canvas.yview", basic_block)
+        self.assertIn("yscrollcommand=self._set_export_basic_scrollbar", basic_block)
+        self.assertNotIn("self.grp_basic_scrollbar.pack(", basic_block)
+        self.assertIn("background=canvas_background", basic_block)
+        self.assertIn("self._update_export_basic_scroll_region", basic_block)
+        self.assertIn("self._bind_export_basic_scroll_events(", basic_block)
+        self.assertIn(
+            "self.btn_mass_apply_basic = ttk.Button(self.grp_basic_content,",
+            basic_block,
+        )
+
+        disable_start = source.index("    def _disable_export_settings(self):")
+        disable_end = source.index("    def on_export_tree_select(self, event):")
+        state_block = source[disable_start:disable_end]
+        self.assertGreaterEqual(
+            state_block.count(
+                "for tab in (self.grp_tab_basic, self.grp_tab_tags):"
+            ),
+            2,
+        )
+
+    def test_stopped_export_resets_status_and_progress_after_worker_finishes(self):
+        app = studio.TTSApp.__new__(studio.TTSApp)
+        app._export_thread = mock.Mock()
+        app._set_export_running_state = mock.Mock()
+        app.export_progress = mock.Mock()
+        app.lbl_export_status = mock.Mock()
+        app._set_status_label = mock.Mock()
+        app.is_export_stopped = True
+
+        app._finish_export_process_ui("stopped")
+
+        self.assertIsNone(app._export_thread)
+        app._set_export_running_state.assert_called_once_with(False)
+        app.export_progress.configure.assert_called_once_with(value=0)
+        app._set_status_label.assert_called_once_with(
+            app.lbl_export_status,
+            "Ожидание...",
+            "info",
+        )
+        self.assertFalse(app.is_export_stopped)
+
+    def test_completed_or_failed_export_keeps_diagnostic_ui(self):
+        for outcome in ("success", "warning", "error"):
+            with self.subTest(outcome=outcome):
+                app = studio.TTSApp.__new__(studio.TTSApp)
+                app._export_thread = mock.Mock()
+                app._set_export_running_state = mock.Mock()
+                app.export_progress = mock.Mock()
+                app.lbl_export_status = mock.Mock()
+                app._set_status_label = mock.Mock()
+                app.is_export_stopped = False
+
+                app._finish_export_process_ui(outcome)
+
+                app.export_progress.configure.assert_not_called()
+                app._set_status_label.assert_not_called()
+                self.assertFalse(app.is_export_stopped)
+
+
 class BuildWorkflowContractTests(unittest.TestCase):
     def test_release_python_and_macos_tk_are_pinned_and_verified(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
@@ -1217,11 +2330,14 @@ class BuildWorkflowContractTests(unittest.TestCase):
         self.assertIn('MACOS_PYTHON_SERIES: "3.13"', workflow)
         self.assertIn('MACOS_TK_SERIES: "9.0"', workflow)
         self.assertIn(
-            'brew install "python@$python_series" "python-tk@$python_series"',
-            workflow,
+            'brew install --skip-link "python@$python_series"', workflow
         )
-        self.assertIn("brew update", workflow)
         self.assertIn(
+            'brew install --skip-link "python-tk@$python_series"', workflow
+        )
+        self.assertIn('HOMEBREW_NO_PATH_SHADOW_CHECK: "1"', workflow)
+        self.assertIn("brew update", workflow)
+        self.assertNotIn(
             'brew upgrade "python@$python_series" "python-tk@$python_series"',
             workflow,
         )
@@ -1280,6 +2396,12 @@ class BuildWorkflowContractTests(unittest.TestCase):
             self.assertIn("FFprobe", document)
 
         self.assertIn("первую страницу контейнера", readme)
+        for document in (readme, help_text):
+            self.assertIn("Ogg/Opus (.opus)", document)
+            self.assertIn("Ogg/Vorbis (.ogg)", document)
+            self.assertIn("128 кбит/с", document)
+            self.assertIn("32 кбит/с", document)
+            self.assertIn("METADATA_BLOCK_PICTURE", document)
         self.assertIn("Промежуточные WAV и Vorbis", help_text)
 
     def test_release_matrix_keeps_required_portable_artifacts(self):
@@ -1494,6 +2616,55 @@ class AudioEffectsTests(unittest.TestCase):
 
 
 class SettingsRecoveryTests(unittest.TestCase):
+    def test_missing_saved_path_recovers_without_discarding_other_settings(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            blocked_parent = root / "not_a_directory"
+            blocked_parent.write_text("file", encoding="utf-8")
+            path = root / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "input_dir": str(blocked_parent / "texts"),
+                        "speaker": "saved_voice",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            app = object.__new__(studio.TTSApp)
+            config = app.load_settings(path)
+
+            self.assertEqual(config["input_dir"], studio.DEFAULT_INPUT_DIR)
+            self.assertEqual(config["speaker"], "saved_voice")
+
+    def test_save_validates_fresh_ui_path_before_writing(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            blocked_parent = root / "not_a_directory"
+            blocked_parent.write_text("file", encoding="utf-8")
+            settings_path = root / "settings.json"
+
+            app = object.__new__(studio.TTSApp)
+            app.config = studio.DEFAULT_CONFIG.copy()
+            app.settings_vars = {
+                "input_dir": mock.Mock(
+                    get=mock.Mock(
+                        return_value=str(blocked_parent / "fresh-ui-value")
+                    ),
+                    set=mock.Mock(),
+                )
+            }
+            app.shared_rate_limiter = mock.Mock()
+
+            self.assertTrue(app.save_settings(settings_path))
+
+            saved = json.loads(settings_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["input_dir"], studio.DEFAULT_INPUT_DIR)
+            app.settings_vars["input_dir"].set.assert_called_with(
+                studio.DEFAULT_INPUT_DIR
+            )
+
     def test_corrupt_settings_fall_back_to_valid_backup(self):
         with tempfile.TemporaryDirectory() as tempdir:
             path = Path(tempdir) / "settings.json"
@@ -1969,6 +3140,205 @@ class _FakeCompletedProcess:
     stderr = b""
 
 
+class InplaceTagCoverTests(unittest.TestCase):
+    @staticmethod
+    def _make_app():
+        app = object.__new__(studio.TTSApp)
+        app.lbl_export_status = object()
+        app._post_status_label = mock.Mock()
+        return app
+
+    def test_mp3_cover_update_uses_jpeg_id3v23_apic(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "chapter.mp3"
+            cover = root / "cover.png"
+            source.write_bytes(b"audio")
+            cover.write_bytes(b"png")
+            captured = []
+
+            def fake_run(command, **_kwargs):
+                captured.append(command)
+                Path(command[-1]).write_bytes(b"tagged")
+                return _FakeCompletedProcess()
+
+            app = self._make_app()
+            with mock.patch.object(
+                studio.subprocess, "run", side_effect=fake_run
+            ):
+                result = app._update_file_tags_inplace(
+                    source, {"title": "Chapter"}, cover, "Chapter"
+                )
+
+            self.assertTrue(result)
+            command = captured[0]
+            self.assertEqual(command[command.index("-c:v") + 1], "mjpeg")
+            self.assertEqual(
+                command[command.index("-id3v2_version") + 1], "3"
+            )
+            self.assertEqual(
+                command[command.index("-disposition:v:0") + 1],
+                "attached_pic",
+            )
+            self.assertEqual(source.read_bytes(), b"tagged")
+
+    def test_opus_update_cover_through_xiph_picture_comment(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "chapter.opus"
+            cover = root / "cover.png"
+            source.write_bytes(b"audio")
+            cover.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+            captured = []
+
+            def fake_run(command, **_kwargs):
+                captured.append(command)
+                Path(command[-1]).write_bytes(b"tagged")
+                return _FakeCompletedProcess()
+
+            app = self._make_app()
+            with mock.patch.object(
+                studio.subprocess, "run", side_effect=fake_run
+            ):
+                result = app._update_file_tags_inplace(
+                    source, {"title": "Chapter"}, cover, "Chapter"
+                )
+
+            self.assertTrue(result)
+            command = captured[0]
+            self.assertEqual(command.count("-i"), 1)
+            self.assertNotIn("-c:v", command)
+            self.assertNotIn("-disposition:v:0", command)
+            self.assertIn("0:a:0", command)
+            metadata = [
+                command[index + 1]
+                for index, option in enumerate(command[:-1])
+                if option == "-metadata"
+            ]
+            self.assertTrue(any(
+                value.startswith("METADATA_BLOCK_PICTURE=")
+                for value in metadata
+            ))
+
+    @unittest.skipUnless(
+        Path(studio.get_ffmpeg_path()).is_file()
+        and Path(studio.get_ffprobe_path()).is_file(),
+        "FFmpeg and FFprobe are required for the integration test",
+    )
+    def test_opus_inplace_cover_and_album_round_trip(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "chapter.opus"
+            cover = root / "cover.png"
+            subprocess.run(
+                [
+                    studio.get_ffmpeg_path(), "-y", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "sine=duration=0.05",
+                    "-c:a", "libopus", str(source),
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    studio.get_ffmpeg_path(), "-y", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=blue:s=16x16",
+                    "-frames:v", "1", str(cover),
+                ],
+                check=True,
+            )
+
+            app = self._make_app()
+            self.assertTrue(app._update_file_tags_inplace(
+                source,
+                {"title": "Part 01", "album": "Test Book"},
+                cover,
+                "Part 01",
+            ))
+
+            probe = subprocess.run(
+                [
+                    studio.get_ffprobe_path(), "-v", "error",
+                    "-show_entries", "stream=codec_name,codec_type:stream_tags",
+                    "-of", "json", str(source),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            streams = json.loads(probe.stdout)["streams"]
+            audio = next(
+                stream for stream in streams
+                if stream.get("codec_type") == "audio"
+            )
+            pictures = [
+                stream for stream in streams
+                if stream.get("codec_type") == "video"
+            ]
+            self.assertEqual(audio["tags"]["title"], "Part 01")
+            self.assertEqual(audio["tags"]["album"], "Test Book")
+            self.assertEqual(len(pictures), 1)
+
+    def test_wav_still_skips_unsupported_cover_stream(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "chapter.wav"
+            cover = root / "cover.png"
+            source.write_bytes(b"audio")
+            cover.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+            captured = []
+
+            def fake_run(command, **_kwargs):
+                captured.append(command)
+                Path(command[-1]).write_bytes(b"tagged")
+                return _FakeCompletedProcess()
+
+            app = self._make_app()
+            with mock.patch.object(
+                studio.subprocess, "run", side_effect=fake_run
+            ), self.assertLogs(level=logging.WARNING):
+                result = app._update_file_tags_inplace(
+                    source, {"title": "Chapter"}, cover, "Chapter"
+                )
+
+            self.assertTrue(result)
+            command = captured[0]
+            self.assertEqual(command.count("-i"), 1)
+            self.assertNotIn("METADATA_BLOCK_PICTURE", " ".join(command))
+
+
+class AudioMetadataImportTests(unittest.TestCase):
+    def test_opus_stream_tags_include_album_when_format_tags_are_empty(self):
+        app = object.__new__(studio.TTSApp)
+        probe_data = {
+            "format": {"duration": "12.5", "tags": {}},
+            "streams": [
+                {
+                    "codec_type": "audio",
+                    "tags": {
+                        "title": "Part 01",
+                        "artist": "Reader",
+                        "album": "Test Book",
+                        "album_artist": "Author",
+                        "date": "2026",
+                    },
+                }
+            ],
+        }
+        with mock.patch.object(
+            studio.subprocess,
+            "check_output",
+            return_value=json.dumps(probe_data).encode("utf-8"),
+        ):
+            metadata = app.get_audio_metadata("part.opus")
+
+        self.assertEqual(metadata["title"], "Part 01")
+        self.assertEqual(metadata["artist"], "Reader")
+        self.assertEqual(metadata["album"], "Test Book")
+        self.assertEqual(metadata["album_artist"], "Author")
+        self.assertEqual(metadata["year"], "2026")
+        self.assertEqual(metadata["duration"], 12.5)
+
+
 class FfmpegSaveCommandTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -2036,12 +3406,16 @@ class FfmpegSaveCommandTests(unittest.TestCase):
     def values_after(command, option):
         return [command[index + 1] for index, value in enumerate(command[:-1]) if value == option]
 
-    def test_mp3_cover_is_stream_copied_with_explicit_maps(self):
+    def test_mp3_cover_is_jpeg_encoded_with_explicit_maps(self):
         processor = self.make_processor()
         _output, command, callbacks = self.run_save(processor, "chapter.mp3")
 
         self.assertEqual(self.values_after(command, "-map"), ["0:a:0", "1:v:0"])
-        self.assertEqual(self.values_after(command, "-c:v"), ["copy"])
+        self.assertEqual(self.values_after(command, "-c:v"), ["mjpeg"])
+        self.assertEqual(
+            self.values_after(command, "-disposition:v:0"),
+            ["attached_pic"],
+        )
         self.assertEqual(self.values_after(command, "-map_metadata"), ["-1"])
         self.assertIn("title=chapter", self.values_after(command, "-metadata"))
         self.assertIn("artist=Writer", self.values_after(command, "-metadata"))
@@ -2058,16 +3432,33 @@ class FfmpegSaveCommandTests(unittest.TestCase):
         self.assertNotIn("-metadata:s:v", command)
         self.assertEqual(self.values_after(command, "-map_metadata"), ["-1"])
 
-    def test_ogg_does_not_map_unsupported_jpeg_or_png_stream(self):
-        processor = self.make_processor(output_format="ogg")
-        with self.assertLogs(level=logging.WARNING) as captured:
-            _output, command, callbacks = self.run_save(processor, "chapter.ogg")
+    def test_opus_embeds_cover_as_xiph_picture_and_preserves_tags(self):
+        self.cover_file.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+        processor = self.make_processor(output_format="opus")
+        _output, command, callbacks = self.run_save(processor, "chapter.opus")
 
         self.assertEqual(command.count("-i"), 1)
         self.assertNotIn("-map", command)
         self.assertNotIn("-c:v", command)
         self.assertNotIn("-disposition:v", command)
-        self.assertIn("пропущена для OGG", "\n".join(captured.output))
+        metadata = self.values_after(command, "-metadata")
+        self.assertIn("album=Book", metadata)
+        self.assertTrue(any(
+            value.startswith("METADATA_BLOCK_PICTURE=")
+            for value in metadata
+        ))
+        self.assertEqual(callbacks[-1][1], "success")
+
+    def test_wav_uses_rf64_auto_for_large_books(self):
+        processor = self.make_processor(
+            output_format="wav",
+            tag_cover="",
+        )
+
+        _output, command, callbacks = self.run_save(processor, "chapter.wav")
+
+        self.assertEqual(self.values_after(command, "-c:a"), ["pcm_s16le"])
+        self.assertEqual(self.values_after(command, "-rf64"), ["auto"])
         self.assertEqual(callbacks[-1][1], "success")
 
 
@@ -2414,6 +3805,69 @@ class CacheOpusMigrationTests(unittest.TestCase):
     "FFmpeg and FFprobe are required for the integration test",
 )
 class FfmpegIntegrationTests(unittest.TestCase):
+    def test_opus_cover_and_album_round_trip_through_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source = root / "source.wav"
+            cover = root / "cover.png"
+            output = root / "book.opus"
+
+            subprocess.run(
+                [
+                    studio.get_ffmpeg_path(), "-y", "-loglevel", "error",
+                    "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=0.05",
+                    "-ar", "48000", "-ac", "1", str(source),
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    studio.get_ffmpeg_path(), "-y", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=blue:s=16x16",
+                    "-frames:v", "1", str(cover),
+                ],
+                check=True,
+            )
+
+            studio._export_single_audio_ffmpeg(
+                source,
+                output,
+                output_format="opus",
+                bitrate_mode="32k",
+                sample_rate="48000",
+                channels="mono",
+                tags={"title": "Part 01", "album": "Test Book"},
+                cover=cover,
+            )
+
+            probe = subprocess.run(
+                [
+                    studio.get_ffprobe_path(), "-v", "error",
+                    "-show_entries",
+                    "stream=codec_name,codec_type:stream_disposition=attached_pic:stream_tags",
+                    "-of", "json", str(output),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            streams = json.loads(probe.stdout)["streams"]
+            audio = next(
+                stream for stream in streams
+                if stream.get("codec_type") == "audio"
+            )
+            pictures = [
+                stream for stream in streams
+                if stream.get("codec_type") == "video"
+            ]
+            self.assertEqual(audio["codec_name"], "opus")
+            self.assertEqual(audio["tags"]["title"], "Part 01")
+            self.assertEqual(audio["tags"]["album"], "Test Book")
+            self.assertEqual(len(pictures), 1)
+            self.assertEqual(pictures[0]["codec_name"], "png")
+            self.assertEqual(pictures[0]["disposition"]["attached_pic"], 1)
+
     def test_existing_vorbis_cache_file_is_canonicalized_to_opus_once(self):
         with tempfile.TemporaryDirectory() as tempdir:
             cache_file = Path(tempdir) / "cached.ogg"
@@ -2647,7 +4101,7 @@ class FfmpegIntegrationTests(unittest.TestCase):
             self.assertGreater(duration, 0.45)
             self.assertGreater(output.stat().st_size, 1000)
 
-    def test_png_cover_remains_png_in_mp3(self):
+    def test_png_cover_is_converted_to_jpeg_for_windows_mp3(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             audio = root / "audio.ogg"
@@ -2719,7 +4173,7 @@ class FfmpegIntegrationTests(unittest.TestCase):
                 if stream.get("codec_type") == "video"
             ]
             self.assertEqual(len(pictures), 1)
-            self.assertEqual(pictures[0]["codec_name"], "png")
+            self.assertEqual(pictures[0]["codec_name"], "mjpeg")
             self.assertEqual(pictures[0]["disposition"]["attached_pic"], 1)
 
 
