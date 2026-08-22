@@ -103,16 +103,25 @@ jobs:
       - name: Set up Homebrew Python and Tk on macOS
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          # Intel runner images keep preinstalled Python links in /usr/local/bin.
+          # They do not affect this build because every Python invocation below
+          # uses the selected formula's absolute opt-prefix path.
+          HOMEBREW_NO_PATH_SHADOW_CHECK: "1"
         run: |
           # setup-python's macOS build currently carries Tk 8.6. Use the
           # Homebrew split tkinter formula so PyInstaller collects Tcl/Tk 9.
           # GitHub runner images can have an older cached tap/bottle. Refresh
           # formula metadata so the matching Python and python-tk patches are
           # installed together, then keep the release contract fail-closed.
+          # Intel images contain /usr/local/bin links owned by the runner image.
+          # Homebrew 4.5+ can install a keg without trying to replace them.
+          # Keep the runner's global Python untouched and use only formula opt
+          # prefixes below; this avoids both the link conflict and PATH shadowing.
           brew update
           python_series="$MACOS_PYTHON_SERIES"
-          brew install "python@$python_series" "python-tk@$python_series"
-          brew upgrade "python@$python_series" "python-tk@$python_series"
+          brew install --skip-link "python@$python_series"
+          brew install --skip-link "python-tk@$python_series"
           python_prefix="$(brew --prefix "python@$python_series")"
           python_bin="$python_prefix/bin/python$python_series"
           test -x "$python_bin"
