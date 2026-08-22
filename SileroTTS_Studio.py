@@ -169,6 +169,65 @@ DEFAULT_OUTPUT_DIR = str(BASE_DIR / "output_audio")
 DEFAULT_DIRECT_OUTPUT_DIR = str(BASE_DIR / "direct_audio")
 DEFAULT_CACHE_DIR = str(BASE_DIR / "cache_audio")
 
+# Пути, которые приложение обязано уметь создать. История диалогов и
+# необязательная папка экспорта сюда намеренно не входят: исчезнувший путь в
+# них не должен переписывать пользовательские настройки.
+REQUIRED_DIRECTORY_DEFAULTS = {
+    "input_dir": DEFAULT_INPUT_DIR,
+    "output_dir": DEFAULT_OUTPUT_DIR,
+    "direct_output_dir": DEFAULT_DIRECT_OUTPUT_DIR,
+    "cache_dir": DEFAULT_CACHE_DIR,
+    "import_outdir": DEFAULT_INPUT_DIR,
+}
+
+
+def ensure_config_directories(config, keys=None):
+    """Создаёт рабочие папки и точечно откатывает недоступные пути.
+
+    Сохранённый каталог может исчезнуть вместе с внешним диском либо содержать
+    синтаксически неверный для текущей ОС путь. В таком случае только этот ключ
+    получает портативное значение по умолчанию. Корректные пользовательские
+    пути, включая ещё не существующие каталоги, создаются и остаются без
+    изменений. Возвращает ``(config, recovered)``; исходный dict меняется на
+    месте, чтобы UI и последующее автосохранение видели восстановленные пути.
+    """
+    if not isinstance(config, dict):
+        config = {}
+
+    selected_keys = tuple(keys) if keys is not None else tuple(
+        REQUIRED_DIRECTORY_DEFAULTS
+    )
+    recovered = {}
+    for key in selected_keys:
+        if key not in REQUIRED_DIRECTORY_DEFAULTS:
+            continue
+        fallback = REQUIRED_DIRECTORY_DEFAULTS[key]
+        raw_value = config.get(key, fallback)
+        value = (
+            str(raw_value).strip()
+            if isinstance(raw_value, (str, os.PathLike))
+            else ""
+        )
+        if not value:
+            value = fallback
+
+        try:
+            Path(value).expanduser().mkdir(parents=True, exist_ok=True)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            recovered[key] = (value, fallback, exc)
+            logging.getLogger(__name__).warning(
+                "Недоступный путь %s=%r заменён на %r: %s",
+                key, value, fallback, exc,
+            )
+            value = fallback
+            # Если даже локальный portable-каталог создать нельзя, исключение
+            # важно не маскировать: продолжение синтеза всё равно невозможно.
+            Path(value).expanduser().mkdir(parents=True, exist_ok=True)
+
+        config[key] = value
+    return config, recovered
+
+
 # Создаем служебную папку и переходим в корень проекта
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 os.chdir(BASE_DIR) # Рабочей директорией делаем BASE_DIR!
@@ -528,7 +587,8 @@ def _config_group_rules_data():
             "fx_echo_decay",
         },
         "tags": {
-            "output_format", "output_bitrate", "synthesis_mode",
+            "output_format", "output_bitrate", "export_bitrate",
+            "export_sample_rate", "export_channels", "synthesis_mode",
             "tag_title", "tag_artist", "tag_album_artist", "tag_album",
             "tag_genre", "tag_composer", "tag_year", "tag_cover",
             "default_group_name",
@@ -605,7 +665,7 @@ def audio_export_kwargs(output_format, bitrate=None, tags=None, cover=None):
     """Формирует безопасные аргументы Pydub для выбранного контейнера."""
     fmt = str(output_format).lower().strip()
     kwargs = {"format": fmt}
-    if fmt == "mp3" and bitrate:
+    if fmt in {"mp3", "ogg", "opus"} and bitrate:
         kwargs["bitrate"] = bitrate
     if tags:
         kwargs["tags"] = tags
@@ -708,7 +768,7 @@ def normalize_output_filename(value, output_format, fallback="direct_output"):
     stem = Path(raw_name).stem if raw_name else fallback
     safe_stem = sanitize_filename_component(stem, fallback=fallback)
     safe_format = str(output_format or "mp3").lower().strip()
-    if safe_format not in {"mp3", "wav", "ogg"}:
+    if safe_format not in {"mp3", "wav", "ogg", "opus"}:
         safe_format = "mp3"
     return f"{safe_stem}.{safe_format}"
 
@@ -1162,6 +1222,538 @@ def _export_audio_atomic(audio_segment, out_path, **export_kwargs):
             except OSError:
                 pass
         temp_path.unlink(missing_ok=True)
+
+
+def _probe_audio_stream_profile(path):
+    """Возвращает кодек, частоту, каналы и битрейт первого аудиопотока.
+
+    Для групповой сборки нельзя безусловно сводить любой материал к профилю
+    внутреннего TTS-кэша (48 кГц mono): пользователь может объединять музыку,
+    stereo MP3 и WAV с более высокой частотой. Короткий ffprobe-проход читает
+    только заголовки и позволяет построить единый, но не заниженный профиль для
+    concat-фильтра. Ошибка пробинга не скрывает последующую диагностику FFmpeg:
+    вызывающий код применит консервативный fallback.
+    """
+    startupinfo = None
+    if platform.system() == "Windows":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+    command = [
+        get_ffprobe_path(),
+        "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_name,sample_rate,channels,bit_rate",
+        "-of", "json",
+        str(Path(path)),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            startupinfo=startupinfo,
+        )
+        streams = json.loads(completed.stdout or "{}").get("streams", ())
+        if not streams:
+            return None
+        sample_rate = int(streams[0].get("sample_rate", 0))
+        channels = int(streams[0].get("channels", 0))
+        if sample_rate <= 0 or channels <= 0:
+            return None
+        raw_bitrate = streams[0].get("bit_rate")
+        try:
+            bitrate = int(raw_bitrate) if raw_bitrate is not None else None
+        except (TypeError, ValueError):
+            bitrate = None
+        # FFmpeg/ffprobe сообщает UINT32_MAX-1 для некоторых VBR Vorbis как
+        # маркер «битрейт неизвестен». Это не реальный 4,29-Гбит/с поток и его
+        # нельзя переносить в ``-b:a`` режима Auto.
+        if bitrate is not None and bitrate >= 0xFFFFFF00:
+            bitrate = None
+        return {
+            "codec": str(streams[0].get("codec_name", "")).strip().lower(),
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "bitrate": bitrate if bitrate and bitrate > 0 else None,
+        }
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        return None
+
+
+def _mp3_compatible_sample_rate(sample_rate):
+    """Выбирает поддерживаемую libmp3lame частоту без лишнего downsample."""
+    supported = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
+    sample_rate = max(1, int(sample_rate))
+    for candidate in supported:
+        if candidate >= sample_rate:
+            return candidate
+    return supported[-1]
+
+
+def _opus_compatible_sample_rate(sample_rate):
+    """Выбирает ближайшую частоту, поддерживаемую libopus."""
+    supported = (8000, 12000, 16000, 24000, 48000)
+    sample_rate = max(1, int(sample_rate))
+    for candidate in supported:
+        if candidate >= sample_rate:
+            return candidate
+    return supported[-1]
+
+
+def _audio_profile_compatibility_error(
+    output_format,
+    sample_rate,
+    channels,
+    bitrate,
+):
+    """Объясняет несовместимый профиль до запуска FFmpeg.
+
+    Поля экспорта общие для всех контейнеров, но кодеки принимают разные
+    сочетания. Не оставляем эту проверку поздней ошибке ``Error while opening
+    encoder`` и не подменяем явно выбранный пользователем битрейт молча.
+    """
+    fmt = str(output_format).strip().lower()
+    sample_rate = int(sample_rate)
+    channels = int(channels)
+    bitrate_text = str(bitrate or "").strip().lower()
+    if fmt == "wav" or not bitrate_text:
+        return None
+    match = re.fullmatch(r"([1-9]\d*)k", bitrate_text)
+    if not match:
+        return "Некорректный битрейт аудиопрофиля."
+    bitrate_kbps = int(match.group(1))
+
+    if fmt == "mp3" and sample_rate <= 12000 and bitrate_kbps > 64:
+        return (
+            "MP3 с частотой 8–12 кГц поддерживает битрейт не выше "
+            "64 кбит/с. Увеличьте частоту либо используйте режим «Авто»."
+        )
+    if fmt == "mp3" and sample_rate <= 24000 and bitrate_kbps > 160:
+        return (
+            "MP3 с частотой 16–24 кГц поддерживает битрейт не выше "
+            "160 кбит/с. Выберите 128 кбит/с, увеличьте частоту до 32 кГц "
+            "или используйте режим «Авто»."
+        )
+
+    if fmt == "opus" and not 6 <= bitrate_kbps <= 510:
+        return (
+            "Opus поддерживает битрейт от 6 до 510 кбит/с. Выберите "
+            "совместимое значение либо используйте режим «Авто»."
+        )
+
+    if fmt == "ogg":
+        if sample_rate > 48000:
+            return (
+                "OGG/Vorbis 88,2/96 кГц доступен только с битрейтом "
+                "«Авто» (quality-режим кодировщика). Выберите «Авто» либо "
+                "частоту не выше 48 кГц."
+            )
+        maximums = {
+            (22050, 1): 64,
+            (22050, 2): 128,
+            (24000, 1): 64,
+            (24000, 2): 128,
+            (32000, 1): 128,
+            (44100, 1): 192,
+            (48000, 1): 192,
+        }
+        maximum = maximums.get((sample_rate, channels))
+        if maximum is not None and bitrate_kbps > maximum:
+            channel_text = "mono" if channels == 1 else "stereo"
+            return (
+                f"OGG/Vorbis {sample_rate / 1000:g} кГц {channel_text} "
+                f"поддерживает выбранный режим битрейта не выше "
+                f"{maximum} кбит/с. Уменьшите битрейт, увеличьте частоту "
+                "или используйте режим «Авто»."
+            )
+    return None
+
+
+def _select_merge_audio_profile(
+    sources,
+    output_format,
+    *,
+    sample_rate="auto",
+    channels="auto",
+    bitrate="auto",
+    cancelled=None,
+):
+    """Выбирает общий профиль для безопасного concat разнородных потоков.
+
+    Максимальная входная частота не занижается, если это допускает выбранный
+    контейнер/кодек. Полностью mono-набор остаётся mono; наличие stereo или
+    многоканального входа сохраняет stereo-результат. Если хотя бы один файл не
+    удалось исследовать, неизвестный поток консервативно считается 48 кГц
+    stereo, а сам FFmpeg всё равно выполнит окончательную проверку/декодирование.
+    """
+    profiles = []
+    unknown = []
+    for source in sources:
+        if cancelled and cancelled():
+            raise InterruptedError("Сборка остановлена пользователем")
+        profile = _probe_audio_stream_profile(source)
+        if profile is None:
+            unknown.append(Path(source).name)
+        else:
+            profiles.append(profile)
+
+    if cancelled and cancelled():
+        raise InterruptedError("Сборка остановлена пользователем")
+
+    sample_rates = [profile["sample_rate"] for profile in profiles]
+    if unknown or not sample_rates:
+        sample_rates.append(CACHE_AUDIO_SAMPLE_RATE)
+    requested_sample_rate = str(sample_rate).strip().lower()
+    if requested_sample_rate != "auto":
+        sample_rate = int(sample_rate)
+    else:
+        sample_rate = max(sample_rates)
+    output_format = str(output_format).strip().lower()
+    if output_format == "mp3":
+        compatible_sample_rate = _mp3_compatible_sample_rate(sample_rate)
+        if requested_sample_rate != "auto" and compatible_sample_rate != sample_rate:
+            raise ValueError(
+                "MP3/libmp3lame не поддерживает выбранную частоту "
+                f"{sample_rate} Гц. Выберите частоту не выше 48 кГц либо "
+                "режим «Авто»."
+            )
+        sample_rate = compatible_sample_rate
+    elif output_format == "opus":
+        compatible_sample_rate = _opus_compatible_sample_rate(sample_rate)
+        if requested_sample_rate != "auto" and compatible_sample_rate != sample_rate:
+            raise ValueError(
+                "Opus/libopus поддерживает только 8, 12, 16, 24 и 48 кГц. "
+                "Выберите поддерживаемую частоту либо режим «Авто»."
+            )
+        sample_rate = compatible_sample_rate
+
+    requested_channels = str(channels).strip().lower()
+    if requested_channels == "mono":
+        channels = 1
+    elif requested_channels == "stereo":
+        channels = 2
+    else:
+        channels = 2 if unknown or any(
+            profile["channels"] > 1 for profile in profiles
+        ) else 1
+    channel_layout = "stereo" if channels == 2 else "mono"
+
+    requested_bitrate = str(bitrate).strip().lower()
+    if output_format == "wav":
+        selected_bitrate = None
+    elif requested_bitrate != "auto":
+        selected_bitrate = requested_bitrate
+    else:
+        # Битрейт имеет одинаковый смысл лишь у сжатых входов. Например,
+        # ``bit_rate`` PCM/WAV описывает поток несжатых отсчётов и не должен
+        # внезапно становиться целевым битрейтом MP3/OGG в режиме ``auto``.
+        bitrates = [
+            profile.get("bitrate")
+            for profile in profiles
+            if profile.get("codec") not in {
+                "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_f64le"
+            }
+        ]
+        selected_bitrate = (
+            f"{round(bitrates[0] / 1000)}k"
+            if (
+                not unknown
+                and bitrates
+                and len(bitrates) == len(profiles)
+                and all(value for value in bitrates)
+                and len(set(bitrates)) == 1
+            )
+            else None
+        )
+
+    compatibility_error = _audio_profile_compatibility_error(
+        output_format,
+        sample_rate,
+        channels,
+        selected_bitrate,
+    )
+    if compatibility_error:
+        if requested_bitrate == "auto":
+            # В auto параметры потока являются подсказкой, а не приказом.
+            # Сохраняем частоту и каналы, но даём кодировщику выбрать
+            # совместимый битрейт вместо заведомого падения.
+            selected_bitrate = None
+        else:
+            raise ValueError(compatibility_error)
+
+    if unknown:
+        preview = ", ".join(unknown[:3])
+        suffix = "…" if len(unknown) > 3 else ""
+        logging.warning(
+            "Не удалось определить аудиопрофиль %d входных файлов (%s%s); "
+            "для них используется безопасный fallback 48 кГц stereo.",
+            len(unknown),
+            preview,
+            suffix,
+        )
+    return {
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "channel_layout": channel_layout,
+        "bitrate": selected_bitrate,
+    }
+
+
+def _ffmpeg_audio_effect_filters(
+    *,
+    speed=1.0,
+    pitch=1.0,
+    echo=False,
+    echo_delay=300,
+    echo_decay=0.3,
+    sample_rate=CACHE_AUDIO_SAMPLE_RATE,
+):
+    """Возвращает общий FFmpeg-граф эффектов без промежуточного WAV."""
+    filters = []
+    pitch = float(pitch)
+    speed = float(speed)
+    sample_rate = max(1, int(sample_rate))
+    if pitch != 1.0:
+        filters.append(f"asetrate={int(sample_rate * pitch)}")
+        filters.extend(AudioEffects._atempo_filters(1 / pitch))
+        # asetrate меняет заявленную частоту потока; перед кодированием снова
+        # приводим её к общему профилю текущей группы.
+        filters.append(f"aresample={sample_rate}")
+    if speed != 1.0:
+        filters.extend(AudioEffects._atempo_filters(speed))
+    if echo:
+        filters.append(
+            f"aecho=0.8:0.8:{int(echo_delay)}:{float(echo_decay)}"
+        )
+    return filters
+
+
+def _export_merged_audio_ffmpeg(
+    audio_files,
+    out_path,
+    *,
+    output_format,
+    bitrate=None,
+    pause_ms=0,
+    speed=1.0,
+    pitch=1.0,
+    echo=False,
+    echo_delay=300,
+    echo_decay=0.3,
+    tags=None,
+    cover=None,
+    sample_rate="auto",
+    channels="auto",
+    bitrate_mode=None,
+    cancelled=None,
+):
+    """Потоково объединяет разнородные файлы через ``-filter_complex``.
+
+    Каждый вход сначала декодируется и приводится к одинаковым sample rate,
+    channel layout и sample format. Поэтому concat-фильтр безопасен для смеси
+    MP3/WAV/OGG/Opus и не создаёт единый PCM ``AudioSegment``/временный RIFF. Это
+    снимает как расход RAM на всю книгу, так и 4-ГиБ лимит WAV-заголовка.
+    """
+    sources = tuple(Path(path).expanduser().resolve() for path in audio_files)
+    if not sources:
+        raise ValueError("Нет аудиофайлов для объединения")
+    missing = [str(path) for path in sources if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(missing[0])
+
+    fmt = str(output_format).strip().lower()
+    if fmt not in {"mp3", "ogg", "opus", "wav"}:
+        raise ValueError(f"Неподдерживаемый формат экспорта: {fmt}")
+
+    requested_bitrate = (
+        str(bitrate_mode).strip().lower()
+        if bitrate_mode is not None
+        else str(bitrate or "auto").strip().lower()
+    )
+    merge_profile = _select_merge_audio_profile(
+        sources,
+        fmt,
+        sample_rate=sample_rate,
+        channels=channels,
+        bitrate=requested_bitrate,
+        cancelled=cancelled,
+    )
+    sample_rate = merge_profile["sample_rate"]
+    channels = merge_profile["channels"]
+    channel_layout = merge_profile["channel_layout"]
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = out_path.with_name(
+        f".{out_path.stem}.{uuid.uuid4().hex}.tmp{out_path.suffix}"
+    )
+    command = [get_ffmpeg_path(), "-y", "-hide_banner", "-loglevel", "error"]
+    for source in sources:
+        command.extend(["-i", str(source)])
+
+    has_cover = bool(fmt == "mp3" and cover and Path(cover).is_file())
+    if has_cover:
+        command.extend(["-i", str(Path(cover).resolve())])
+    elif cover and Path(cover).is_file() and fmt != "mp3":
+        logging.warning(
+            "Обложка пропущена для %s: формат %s не поддерживает JPEG/PNG "
+            "attached_pic этим способом.",
+            out_path.name,
+            fmt,
+        )
+
+    # concat требует одинаковых параметров. apad здесь не используется:
+    # он сделал бы каждый вход бесконечным. Сбрасываем PTS и нормализуем все
+    # потоки отдельно, а паузы создаём конечным anullsrc+atrim внутри графа.
+    filters = []
+    concat_labels = []
+    for index in range(len(sources)):
+        label = f"a{index}"
+        filters.append(
+            f"[{index}:a:0]aresample={sample_rate},"
+            "aformat=sample_fmts=fltp:"
+            f"sample_rates={sample_rate}:channel_layouts={channel_layout},"
+            f"asetpts=PTS-STARTPTS[{label}]"
+        )
+        concat_labels.append(f"[{label}]")
+        if index < len(sources) - 1 and int(pause_ms) > 0:
+            pause_label = f"p{index}"
+            pause_seconds = int(pause_ms) / 1000.0
+            filters.append(
+                "anullsrc="
+                f"r={sample_rate}:cl={channel_layout},"
+                f"atrim=duration={pause_seconds:.6f},"
+                f"asetpts=PTS-STARTPTS[{pause_label}]"
+            )
+            concat_labels.append(f"[{pause_label}]")
+
+    filters.append(
+        "".join(concat_labels)
+        + f"concat=n={len(concat_labels)}:v=0:a=1[merged]"
+    )
+    effect_filters = _ffmpeg_audio_effect_filters(
+        speed=speed,
+        pitch=pitch,
+        echo=echo,
+        echo_delay=echo_delay,
+        echo_decay=echo_decay,
+        sample_rate=sample_rate,
+    )
+    output_label = "merged"
+    if effect_filters:
+        filters.append(f"[merged]{','.join(effect_filters)}[processed]")
+        output_label = "processed"
+
+    command.extend(
+        [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            f"[{output_label}]",
+        ]
+    )
+    if has_cover:
+        command.extend(
+            [
+                "-map",
+                f"{len(sources)}:v:0",
+                # JPEG внутри ID3v2.3/APIC даёт наиболее предсказуемое
+                # отображение в Проводнике и Media Player Windows. FFmpeg
+                # примет и JPEG, и PNG на входе, но всегда запишет APIC как
+                # image/jpeg вместо менее совместимого image/png.
+                "-c:v",
+                "mjpeg",
+                "-id3v2_version",
+                "3",
+                "-disposition:v:0",
+                "attached_pic",
+                "-metadata:s:v",
+                "title=Album cover",
+                "-metadata:s:v",
+                "comment=Cover (front)",
+            ]
+        )
+    else:
+        command.extend(["-vn"])
+    command.extend(["-sn", "-dn", "-map_metadata", "-1"])
+
+    if fmt == "mp3":
+        command.extend([
+            "-c:a", "libmp3lame", "-b:a",
+            str(merge_profile["bitrate"] or "128k"),
+        ])
+    elif fmt == "ogg":
+        command.extend(["-c:a", "libvorbis"])
+        if merge_profile["bitrate"]:
+            command.extend(["-b:a", str(merge_profile["bitrate"])])
+        else:
+            # libvorbis поддерживает 88,2/96 кГц в quality/VBR-режиме, но
+            # не принимает для них явный номинальный bitrate. Для Auto
+            # quality=4 даёт предсказуемый профиль без скрытого downsample.
+            command.extend(["-q:a", "4"])
+    elif fmt == "opus":
+        command.extend(["-c:a", "libopus"])
+        if merge_profile["bitrate"]:
+            command.extend(["-b:a", str(merge_profile["bitrate"])])
+    else:
+        # Обычный RIFF хранит размеры в 32 битах и перестаёт быть валидным
+        # после ~4 ГиБ PCM. FFmpeg сам выберет классический RIFF для короткого
+        # результата и RF64 для длинного, поэтому единая потоковая склейка
+        # работает и для многотомных книг без прежней ошибки struct '<L'.
+        command.extend(["-c:a", "pcm_s16le", "-rf64", "auto"])
+    command.extend(["-ar", str(sample_rate), "-ac", str(channels)])
+    for key, value in (tags or {}).items():
+        if value:
+            command.extend(["-metadata", f"{key}={value}"])
+    command.append(str(temp_path))
+
+    startupinfo = None
+    if platform.system() == "Windows":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            startupinfo=startupinfo,
+        )
+        while process.poll() is None:
+            if cancelled and cancelled():
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise InterruptedError("Сборка остановлена пользователем")
+            time.sleep(0.05)
+        stderr = process.stderr.read() if process.stderr else b""
+        if process.returncode != 0 or not temp_path.is_file():
+            detail = stderr.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(
+                "FFmpeg не смог объединить аудиофайлы"
+                + (f": {detail}" if detail else "")
+            )
+        os.replace(temp_path, out_path)
+        return out_path
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _export_single_audio_ffmpeg(source, out_path, **kwargs):
+    """Экспортирует один файл с тем же профилем, что и групповая сборка.
+
+    Отдельный файл не должен обходить выбранные в UI частоту, каналы и режим
+    битрейта. Один вход поэтому проходит через тот же ``filter_complex`` и
+    потоковый FFmpeg-путь, но без паузы и без промежуточного PCM/WAV.
+    """
+    return _export_merged_audio_ffmpeg([source], out_path, **kwargs)
 
 
 def _prepare_api_audio_file(
@@ -1763,6 +2355,12 @@ DEFAULT_CONFIG = {
     
     "output_format": "mp3",
     "output_bitrate": "128k",
+    # Параметры универсальной вкладки экспорта. ``auto`` сохраняет общий
+    # профиль исходников, когда он однороден, и выбирает совместимый профиль
+    # для смешанного набора. Это не связано с каноническим 48 kHz mono-кэшем.
+    "export_bitrate": "auto",
+    "export_sample_rate": "auto",
+    "export_channels": "auto",
     "synthesis_mode": "sentence",
     
     "tag_title": "{filename}",
@@ -1891,7 +2489,7 @@ def normalize_config(config):
         normalized["silence_threshold"] = DEFAULT_CONFIG["silence_threshold"]
 
     for key, allowed in (
-        ("output_format", {"mp3", "wav", "ogg"}),
+        ("output_format", {"mp3", "wav", "ogg", "opus"}),
         ("synthesis_mode", {"sentence", "paragraph", "full"}),
     ):
         value = str(normalized.get(key, DEFAULT_CONFIG[key])).lower().strip()
@@ -1902,14 +2500,31 @@ def normalize_config(config):
         bitrate if re.fullmatch(r"[1-9]\d*k", bitrate) else DEFAULT_CONFIG["output_bitrate"]
     )
 
-    required_paths = {
-        "input_dir": DEFAULT_INPUT_DIR,
-        "output_dir": DEFAULT_OUTPUT_DIR,
-        "direct_output_dir": DEFAULT_DIRECT_OUTPUT_DIR,
-        "cache_dir": DEFAULT_CACHE_DIR,
-        "import_outdir": DEFAULT_INPUT_DIR,
-    }
-    for key, fallback in required_paths.items():
+    export_bitrate = str(normalized.get("export_bitrate", "auto")).strip().lower()
+    normalized["export_bitrate"] = (
+        export_bitrate
+        if export_bitrate == "auto" or re.fullmatch(r"[1-9]\d*k", export_bitrate)
+        else DEFAULT_CONFIG["export_bitrate"]
+    )
+    export_sample_rate = str(
+        normalized.get("export_sample_rate", "auto")
+    ).strip().lower()
+    normalized["export_sample_rate"] = (
+        export_sample_rate
+        if export_sample_rate == "auto" or export_sample_rate in {
+            "8000", "12000", "16000", "22050", "24000", "32000",
+            "44100", "48000", "88200", "96000"
+        }
+        else DEFAULT_CONFIG["export_sample_rate"]
+    )
+    export_channels = str(normalized.get("export_channels", "auto")).strip().lower()
+    normalized["export_channels"] = (
+        export_channels
+        if export_channels in {"auto", "mono", "stereo"}
+        else DEFAULT_CONFIG["export_channels"]
+    )
+
+    for key, fallback in REQUIRED_DIRECTORY_DEFAULTS.items():
         value = normalized.get(key)
         normalized[key] = str(value).strip() if isinstance(value, (str, Path)) else ""
         if not normalized[key]:
@@ -2084,15 +2699,22 @@ class TTSProcessor:
         # от GUI. Локальная нормализация гарантирует, что JSON-строки вроде
         # "false" не превратятся в True при обычном bool("false").
         self.cfg = normalize_config(config)
+        _, recovered_paths = ensure_config_directories(
+            self.cfg, keys=("input_dir", "output_dir", "cache_dir")
+        )
+        # GUI должен сохранить те же восстановленные значения, иначе следующий
+        # запуск снова попробует путь с отключённого диска. Прямые пользователи
+        # TTSProcessor получают только локальную нормализованную копию.
+        if isinstance(config, dict):
+            for key in recovered_paths:
+                config[key] = self.cfg[key]
         config = self.cfg
         self.error_callback = error_callback
         
         # Используем общий лимитер, если передан
         self.rate_limiter = shared_rate_limiter or RateLimiter(int(config["api_max_requests"]), float(config["api_time_window"]))
         
-        Path(self.cfg["input_dir"]).mkdir(parents=True, exist_ok=True)
-        Path(self.cfg["output_dir"]).mkdir(parents=True, exist_ok=True)
-        self.cache_dir = Path(self.cfg["cache_dir"])
+        self.cache_dir = Path(self.cfg["cache_dir"]).expanduser()
         self.cache_audio_dir = self.cache_dir / "audio"
         self.cache_audio_dir.mkdir(parents=True, exist_ok=True)
         self.cache_index_path = self.cache_dir / "sentence_cache.json"
@@ -2719,7 +3341,7 @@ class TTSProcessor:
                 prepared_ogg = self.cache_audio_dir / f"prepared_{uuid.uuid4().hex}.ogg"
                 with open(temp_ogg, "wb") as file:
                     file.write(audio_data)
-                    
+
                 _prepare_api_audio_file(
                     temp_ogg,
                     prepared_ogg,
@@ -3130,9 +3752,10 @@ class TTSProcessor:
                     if fmt == "mp3":
                         cmd.extend(["-i", cover_path])
                         has_cover = True
-                    elif fmt == "ogg":
+                    elif fmt in {"ogg", "opus"}:
                         # Ogg/Vorbis stores artwork in a base64 Vorbis-comment
-                        # block, not as a JPEG/PNG video stream. FFmpeg's Ogg
+                        # block, while Ogg/Opus does not accept it as a normal
+                        # JPEG/PNG video stream either. FFmpeg's Ogg
                         # muxer rejects the latter, so do not even add the image
                         # input (automatic stream selection could pick it).
                         logging.warning(
@@ -3167,19 +3790,29 @@ class TTSProcessor:
                 if fmt == "mp3":
                     cmd.extend(["-c:a", "libmp3lame", "-b:a", self.cfg["output_bitrate"]])
                     if has_cover:
-                        # Копирование сохраняет JPEG как MJPEG и PNG как PNG,
-                        # не пережимая картинку. MP3/ID3 автоматически помечает
-                        # такой видеопоток как attached_pic.
+                        # Для Windows пишем обложку как JPEG в ID3v2.3/APIC:
+                        # PNG формально допустим, но Проводник/Media Player
+                        # отображают его непоследовательно.
                         cmd.extend([
-                            "-map", "0:a:0", "-map", "1:v:0", "-c:v", "copy",
+                            "-map", "0:a:0", "-map", "1:v:0",
+                            "-c:v", "mjpeg",
                             "-id3v2_version", "3",
+                            "-disposition:v:0", "attached_pic",
                             "-metadata:s:v", "title=Album cover",
                             "-metadata:s:v", "comment=Cover (front)",
                         ])
                 elif fmt == "ogg":
                     cmd.extend(["-c:a", "libvorbis"])
+                elif fmt == "opus":
+                    cmd.extend([
+                        "-c:a", "libopus", "-b:a", self.cfg["output_bitrate"]
+                    ])
                 elif fmt == "wav":
-                    cmd.extend(["-c:a", "pcm_s16le"])
+                    # RIFF хранит размер чанков в 32 битах. Для длинных книг
+                    # FFmpeg должен сам переключиться на RF64, иначе запись
+                    # финального заголовка заканчивается ошибкой упаковки
+                    # ``'L' format requires 0 <= number <= 4294967295``.
+                    cmd.extend(["-c:a", "pcm_s16le", "-rf64", "auto"])
     
                 if apply_tags:
                     base_name = out_filepath.stem
@@ -3748,6 +4381,13 @@ class TTSApp:
         self.setup_help_tab()
         
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
+        # Мягкая страховка после закрытия native messagebox: если Aqua не
+        # вернул локальный Tk-фокус, первый обычный клик назначает его именно
+        # на нажатый виджет. focus_force не используется и потому приложение
+        # не отбирает фокус у другого окна без действия пользователя.
+        self.root.bind_all(
+            "<ButtonPress-1>", self._restore_focus_on_app_click, add="+"
+        )
         self.load_files()
         self.update_fonts()
 
@@ -3769,13 +4409,86 @@ class TTSApp:
             self._fix_cyrillic_clipboard()
 
         self.root.after(300, self._silent_pre_warm_tabs)
-        
+
 
     def _post_to_ui(self, callback, *args, **kwargs):
         """Потокобезопасно ставит вызов Tkinter в очередь главного потока."""
         if getattr(self, "_is_closing", False):
             return
         self._ui_queue.put((callback, args, kwargs))
+
+    def _restore_focus_on_app_click(self, event):
+        """Возвращает локальный Tk-фокус на виджет, по которому уже кликнули."""
+        widget = getattr(event, "widget", None)
+        if widget is None or getattr(self, "_is_closing", False):
+            return
+        try:
+            if widget.winfo_toplevel() is not self.root:
+                return
+            current_focus = self.root.focus_get()
+            if current_focus is None:
+                widget.focus_set()
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _run_messagebox(self, dialog_function, title, message, **options):
+        """Показывает системный диалог с владельцем и возвращает Tk-фокус.
+
+        На macOS ``messagebox`` без ``parent`` создаёт нативный alert, который
+        не всегда возвращает keyboard focus главному NSWindow после закрытия.
+        Явный владелец делает alert оконно-модальным, а отложенный ``focus_set``
+        восстанавливает именно тот Tk-виджет, в котором пользователь работал.
+        ``focus_force`` намеренно не используется: он мог бы перехватить фокус,
+        если пользователь переключился в другое приложение.
+        """
+        try:
+            previous_focus = self.root.focus_get()
+        except tk.TclError:
+            previous_focus = None
+
+        options.setdefault("parent", self.root)
+        try:
+            return dialog_function(title, message, **options)
+        finally:
+            self._schedule_focus_after_messagebox(previous_focus)
+
+    def _schedule_focus_after_messagebox(self, previous_focus=None):
+        """Возвращает локальный фокус после полного закрытия native dialog."""
+        if getattr(self, "_is_closing", False):
+            return
+
+        def restore_focus():
+            if getattr(self, "_is_closing", False):
+                return
+            try:
+                if not self.root.winfo_exists():
+                    return
+                target = previous_focus
+                if target is None or not target.winfo_exists():
+                    target = self.root
+                target.focus_set()
+            except (AttributeError, tk.TclError):
+                try:
+                    self.root.focus_set()
+                except tk.TclError:
+                    pass
+
+        try:
+            self.root.after_idle(restore_focus)
+        except tk.TclError:
+            pass
+
+    def _show_info(self, title, message, **options):
+        return self._run_messagebox(messagebox.showinfo, title, message, **options)
+
+    def _show_warning(self, title, message, **options):
+        return self._run_messagebox(messagebox.showwarning, title, message, **options)
+
+    def _show_error(self, title, message, **options):
+        return self._run_messagebox(messagebox.showerror, title, message, **options)
+
+    def _ask_yes_no(self, title, message, **options):
+        return self._run_messagebox(messagebox.askyesno, title, message, **options)
 
     def _create_synthesis_processor(self, config):
         """Создаёт процессор и делит RAM-кэш между одновременно активными вкладками."""
@@ -4281,7 +4994,7 @@ class TTSApp:
         if hasattr(self, 'lbl_decay_val'): self.lbl_decay_val.config(text="0.3")
         
         self.save_settings()
-        messagebox.showinfo("Успех", "Глобальные эффекты сброшены по умолчанию!")
+        self._show_info("Успех", "Глобальные эффекты сброшены по умолчанию!")
 
     def _natural_sort_key(self, text):
         """Ключ для сортировки файлов человеком, а не машиной (Глава 2 будет перед Глава 10)"""
@@ -4315,7 +5028,7 @@ class TTSApp:
         groups = [i for i in selected if i in self.export_groups]
         
         if not groups:
-            messagebox.showinfo("Внимание", "Выделите группу(ы) для разгруппировки.")
+            self._show_info("Внимание", "Выделите группу(ы) для разгруппировки.")
             return
             
         for g_id in groups:
@@ -4654,7 +5367,7 @@ class TTSApp:
         # нет безопасной команды Stop, поэтому сначала просим дождаться конца.
         if self.is_cache_operation_running():
             operation = getattr(self, "_cache_operation", None)
-            messagebox.showwarning(
+            self._show_warning(
                 "Операция с кэшем выполняется",
                 "Дождитесь завершения операции «"
                 f"{CACHE_OPERATION_LABELS.get(operation, operation)}» перед "
@@ -4663,21 +5376,21 @@ class TTSApp:
             )
             return
         if getattr(self, "_import_running", False):
-            messagebox.showwarning(
+            self._show_warning(
                 "Импорт выполняется",
                 "Дождитесь завершения импорта книги перед закрытием приложения, "
                 "чтобы не получить неполный набор глав.",
             )
             return
         if getattr(self, "_export_lock", False):
-            messagebox.showwarning(
+            self._show_warning(
                 "Чтение аудиофайлов выполняется",
                 "Дождитесь завершения добавления аудиофайлов в проект перед "
                 "закрытием приложения.",
             )
             return
         if getattr(self, "_export_running", False):
-            messagebox.showwarning(
+            self._show_warning(
                 "Экспорт выполняется",
                 "Сначала нажмите «Стоп» и дождитесь завершения текущего файла, "
                 "затем закройте приложение.",
@@ -4830,18 +5543,40 @@ class TTSApp:
         finally:
             self._is_updating_ui = False
 
-    def ensure_dirs(self):
-        """Гарантирует существование всех системных и рабочих папок на лету (даже если их удалили во время работы)"""
+    def ensure_dirs(self, keys=None):
+        """Создаёт рабочие папки, восстанавливая недоступные значения."""
         try:
             APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-            if hasattr(self, 'config'):
-                for dir_key in ("input_dir", "output_dir", "direct_output_dir", "cache_dir"):
-                    path_str = self.config.get(dir_key)
-                    if path_str:
-                        Path(path_str).mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            logging.error(f"Ошибка авто-создания директорий: {e}")
-            
+            if not hasattr(self, "config"):
+                return {}
+            _, recovered = ensure_config_directories(self.config, keys=keys)
+        except Exception as exc:
+            logging.error("Ошибка авто-создания директорий: %s", exc)
+            return {}
+
+        for key in recovered:
+            variable = (
+                self.settings_vars.get(key)
+                if hasattr(self, "settings_vars")
+                else None
+            )
+            if variable is not None:
+                try:
+                    variable.set(self.config[key])
+                except (AttributeError, tk.TclError):
+                    pass
+        if (
+            "direct_output_dir" in recovered
+            and hasattr(self, "direct_output_dir_var")
+        ):
+            try:
+                self.direct_output_dir_var.set(
+                    self.config["direct_output_dir"]
+                )
+            except tk.TclError:
+                pass
+        return recovered
+
     def load_settings(self, path=SETTINGS_FILE):
         """Безопасная загрузка настроек с авто-созданием папки"""
         path = Path(path)
@@ -4866,6 +5601,12 @@ class TTSApp:
                 logging.error(f"Ошибка загрузки конфига {candidate}: {e}")
                 loaded_config = {}
         cfg = normalize_config(loaded_config)
+        try:
+            ensure_config_directories(cfg)
+        except Exception as exc:
+            # Если недоступен даже portable-дефолт, не рушим построение GUI:
+            # конкретная операция с диском позднее покажет штатную ошибку.
+            logging.error("Не удалось по��готовить рабочие папки: %s", exc)
         # Флажок direct-тегов является подтверждением только для текущего
         # сеанса. Удаляем также значение, случайно сохранённое prerelease-
         # версиями, чтобы приложение всегда стартовало в безопасном режиме.
@@ -4891,6 +5632,22 @@ class TTSApp:
             direct_dir = str(self.direct_output_dir_var.get()).strip()
             if direct_dir:
                 self.config["direct_output_dir"] = direct_dir
+
+        # Параметры универсального сборщика не дублируют настройки финального
+        # TTS-вывода: у внешних файлов есть собственные частота и каналы, а
+        # режим ``auto`` должен сохраняться между запусками.
+        for key, attr_name in (
+            ("output_format", "export_fmt_var"),
+            ("export_bitrate", "export_bitrate_var"),
+            ("export_sample_rate", "export_sample_rate_var"),
+            ("export_channels", "export_channels_var"),
+        ):
+            variable = getattr(self, attr_name, None)
+            if variable is not None:
+                try:
+                    self.config[key] = str(variable.get()).strip().lower()
+                except tk.TclError:
+                    pass
 
         self.config.pop("direct_apply_tags", None)
 
@@ -4924,7 +5681,7 @@ class TTSApp:
         except ValueError as exc:
             logging.error(f"Некорректная настройка API steps: {exc}")
             if show_popup:
-                messagebox.showerror("Некорректный Steps", str(exc))
+                self._show_error("Некорректный Steps", str(exc))
             return False
         if steps is not None:
             self.config["api_steps"] = steps
@@ -4934,7 +5691,7 @@ class TTSApp:
         if warning and warning_key not in self._confirmed_steps_warnings:
             if not show_popup:
                 return False
-            if not messagebox.askyesno(
+            if not self._ask_yes_no(
                 "Экспериментальное значение Steps",
                 f"{warning}\n\nПродолжить с этим значением?",
                 icon="warning",
@@ -4945,8 +5702,11 @@ class TTSApp:
             
     def save_settings(self, path=SETTINGS_FILE, show_popup=False):
         """Безопасное сохранение настроек с авто-созданием папки и уведомлением"""
-        self.ensure_dirs()
+        # Сначала забираем свежий текст из Entry, затем валидируем именно его.
+        # Обратный порядок снова сохранял введённый недоступный Windows-путь
+        # после того, как ensure_dirs уже проверил старое значение config.
         self.update_config_from_ui()
+        self.ensure_dirs()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -4963,12 +5723,12 @@ class TTSApp:
         try:
             self._write_json_atomic(path, self.config, backup=True)
             if show_popup:
-                messagebox.showinfo("Успех", "Настройки успешно сохранены!")
+                self._show_info("Успех", "Настройки успешно сохранены!")
             return True
         except Exception as e:
             logging.error(f"Ошибка сохранения конфига {path}: {e}")
             if show_popup:
-                messagebox.showerror("Ошибка", f"Не удалось сохранить настройки:\n{e}")
+                self._show_error("Ошибка", f"Не удалось сохранить настройки:\n{e}")
             return False
 
     def _schedule_settings_save(self, *_args, delay_ms=350):
@@ -5121,7 +5881,15 @@ class TTSApp:
             if hasattr(self, 'export_fmt_var'):
                 self.export_fmt_var.set(str(self.config.get("output_format", "mp3")))
             if hasattr(self, 'export_bitrate_var'):
-                self.export_bitrate_var.set(str(self.config.get("output_bitrate", "128k")))
+                self.export_bitrate_var.set(str(self.config.get("export_bitrate", "auto")))
+            if hasattr(self, "export_sample_rate_var"):
+                self.export_sample_rate_var.set(
+                    str(self.config.get("export_sample_rate", "auto"))
+                )
+            if hasattr(self, "export_channels_var"):
+                self.export_channels_var.set(
+                    str(self.config.get("export_channels", "auto"))
+                )
             if hasattr(self, 'direct_output_dir_var'):
                 try:
                     self.direct_output_dir_var.set(
@@ -5190,7 +5958,7 @@ class TTSApp:
                 imported_data = json.load(f)
             if not isinstance(imported_data, dict): raise ValueError()
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+            self._show_error("Ошибка", f"Не удалось прочитать файл:\n{e}")
             return
             
         dialog = tk.Toplevel(self.root)
@@ -5250,14 +6018,14 @@ class TTSApp:
             self.save_settings(SETTINGS_FILE)
             self.full_ui_refresh()
             self.load_files()
-            messagebox.showinfo("Успех", "Выбранные настройки успешно применены!")
+            self._show_info("Успех", "Выбранные настройки успешно применены!")
             
         ttk.Button(dialog, text="Импортировать", command=do_import).pack(pady=15)
         self._center_popup(dialog, 430, 315, fit_screen=True)
 
     def reset_config(self):
         """Сброс рабочих настроек с сохранением темы оформления и размера шрифта"""
-        if messagebox.askyesno("Сбросить настройки", "Сбросить рабочие настройки (паузы, лимиты, пути) к значениям по умолчанию?"):
+        if self._ask_yes_no("Сбросить настройки", "Сбросить рабочие настройки (паузы, лимиты, пути) к значениям по умолчанию?"):
             try:
                 self.ensure_dirs()
                 
@@ -5276,10 +6044,10 @@ class TTSApp:
                 self.full_ui_refresh()
                 self.load_files()
 
-                messagebox.showinfo("Успех", "Все рабочие настройки сброшены!\n(Тема и размер шрифта сохранены).")
+                self._show_info("Успех", "Все рабочие настройки сброшены!\n(Тема и размер шрифта сохранены).")
             except Exception as e:
                 logging.error(f"Ошибка сброса настроек: {e}")
-                messagebox.showerror("Ошибка", f"Не удалось сбросить настройки:\n{e}")
+                self._show_error("Ошибка", f"Не удалось сбросить настройки:\n{e}")
 
     # --- Вкладка "Синтез из папки" ---
     def setup_main_tab(self):
@@ -5506,7 +6274,7 @@ class TTSApp:
             self.settings_vars["fx_echo_delay"].set(self.dir_echo_delay_var.get())
             self.settings_vars["fx_echo_decay"].set(self.dir_echo_decay_var.get())
             self.save_settings()
-            messagebox.showinfo("Успех", "Эффекты сохранены в глобальные настройки!")
+            self._show_info("Успех", "Эффекты сохранены в глобальные настройки!")
             
         ttk.Button(bot_fx, text="💾 Сделать глобальными", command=apply_to_global).pack(side=tk.RIGHT, padx=5)
         ttk.Button(bot_fx, text="🔄 Сбросить эффекты", command=self.reset_direct_fx).pack(side=tk.RIGHT, padx=5)
@@ -5705,21 +6473,24 @@ class TTSApp:
         filepath = self.import_filepath_var.get().strip()
         source_path = Path(filepath).expanduser() if filepath else None
         if source_path is None or not source_path.is_file():
-            messagebox.showerror("Ошибка", "Выберите существующий файл!")
+            self._show_error("Ошибка", "Выберите существующий файл!")
             return
             
-        out_dir = self.settings_vars["import_outdir"].get().strip()
+        # save_settings() уже проверил свежий Entry и при необходимости
+        # заменил недоступный каталог на portable-дефолт. Берём итог из config,
+        # а не прежнее значение Tk-переменной.
+        out_dir = str(self.config.get("import_outdir", "")).strip()
         template = self.settings_vars["import_template"].get().strip()
         regex_pattern = self.settings_vars["import_regex"].get()
         single_file = self.settings_vars["import_single_file"].get()
         if not out_dir:
-            messagebox.showerror("Ошибка", "Укажите папку для сохранения глав.")
+            self._show_error("Ошибка", "Укажите папку для сохранения глав.")
             return
         if not template:
-            messagebox.showerror("Ошибка", "Шаблон имени файла не может быть пустым.")
+            self._show_error("Ошибка", "Шаблон имени файла не может быть пустым.")
             return
         if source_path.suffix.lower() not in {".epub", ".fb2", ".docx", ".txt"}:
-            messagebox.showerror(
+            self._show_error(
                 "Ошибка", "Поддерживаются только EPUB, FB2, DOCX и TXT."
             )
             return
@@ -5766,14 +6537,14 @@ class TTSApp:
                 
                 msg = f"Успешно извлечено и сохранено файлов: {len(saved_files)}\nПапка: {out_dir}"
                 self._post_status_label(self.lbl_import_status, "Готово!", "success")
-                self._post_to_ui(messagebox.showinfo, "Успех", msg)
+                self._post_to_ui(self._show_info, "Успех", msg)
                 self._post_to_ui(self.load_files)
                 
             except Exception as e:
                 logging.error(f"Ошибка импорта: {e}")
                 error_message = f"Не удалось обработать файл:\n{e}"
                 self._post_status_label(self.lbl_import_status, "Ошибка!", "error")
-                self._post_to_ui(messagebox.showerror, "Ошибка", error_message)
+                self._post_to_ui(self._show_error, "Ошибка", error_message)
             finally:
                 def finish_import_ui():
                     self._import_running = False
@@ -5790,7 +6561,7 @@ class TTSApp:
             self.btn_import_start.config(state=tk.NORMAL)
             self._set_status_label(self.lbl_import_status, "Ошибка запуска.", "error")
             logging.exception("Не удалось запустить поток импорта книги")
-            messagebox.showerror(
+            self._show_error(
                 "Ошибка", f"Не удалось запустить импорт:\n{exc}"
             )
 
@@ -5839,38 +6610,69 @@ class TTSApp:
         row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="Формат:").pack(side=tk.LEFT, padx=(5, 2))
         self.export_fmt_var = tk.StringVar(value=self.config.get("output_format", "mp3"))
-        self.cb_export_fmt = ttk.Combobox(row2, textvariable=self.export_fmt_var, values=["mp3", "wav", "ogg"], width=5, state="readonly")
+        self.cb_export_fmt = ttk.Combobox(
+            row2,
+            textvariable=self.export_fmt_var,
+            values=["mp3", "wav", "ogg", "opus"],
+            width=5,
+            state="readonly",
+        )
         self.cb_export_fmt.pack(side=tk.LEFT)
         
         ttk.Label(row2, text="Битрейт:").pack(side=tk.LEFT, padx=(10, 2))
-        self.export_bitrate_var = tk.StringVar(value=self.config.get("output_bitrate", "128k"))
-        self.cb_export_bitrate = ttk.Combobox(row2, textvariable=self.export_bitrate_var, values=["64k", "128k", "192k", "256k", "320k"], width=5, state="readonly")
+        self.export_bitrate_var = tk.StringVar(
+            value=self.config.get("export_bitrate", "auto")
+        )
+        self.cb_export_bitrate = ttk.Combobox(
+            row2,
+            textvariable=self.export_bitrate_var,
+            values=["auto", "48k", "64k", "96k", "128k", "192k", "256k", "320k"],
+            width=6,
+            state="readonly",
+        )
         self.cb_export_bitrate.pack(side=tk.LEFT)
+
+        ttk.Label(row2, text="Частота:").pack(side=tk.LEFT, padx=(10, 2))
+        self.export_sample_rate_var = tk.StringVar(
+            value=self.config.get("export_sample_rate", "auto")
+        )
+        self.cb_export_sample_rate = ttk.Combobox(
+            row2,
+            textvariable=self.export_sample_rate_var,
+            values=[
+                "auto", "8000", "12000", "16000", "22050", "24000",
+                "32000", "44100", "48000", "88200", "96000",
+            ],
+            width=7,
+            state="readonly",
+        )
+        self.cb_export_sample_rate.pack(side=tk.LEFT)
+
+        ttk.Label(row2, text="Каналы:").pack(side=tk.LEFT, padx=(10, 2))
+        self.export_channels_var = tk.StringVar(
+            value=self.config.get("export_channels", "auto")
+        )
+        self.cb_export_channels = ttk.Combobox(
+            row2,
+            textvariable=self.export_channels_var,
+            values=["auto", "mono", "stereo"],
+            width=7,
+            state="readonly",
+        )
+        self.cb_export_channels.pack(side=tk.LEFT)
+
+        self.export_fmt_var.trace_add(
+            "write", lambda *_args: self._sync_export_mode_controls()
+        )
         
         self.export_apply_fx_var = tk.BooleanVar(value=False)
         self.chk_export_fx = ttk.Checkbutton(row2, text="Наложить эффекты", variable=self.export_apply_fx_var)
         self.chk_export_fx.pack(side=tk.LEFT, padx=10)
 
-        # НОВАЯ ГАЛОЧКА: Только теги
+        # Режим обновления тегов отключает параметры сборки, поэтому
+        # сам флаг размещается ниже этих параметров, в строке действий.
         self.export_tags_only_var = tk.BooleanVar(value=False)
-        self.chk_export_tags_only = ttk.Checkbutton(
-            row2,
-            text="Только обновить теги (в исходных файлах)",
-            variable=self.export_tags_only_var,
-        )
-        self.chk_export_tags_only.pack(side=tk.LEFT, padx=10)
-        
-        # ИСПРАВЛЕНИЕ: Блокировка UI при включении галочки "Только обновить теги"
-        def toggle_export_mode(*args):
-            self._sync_export_mode_controls()
-            
-        self.export_tags_only_var.trace_add("write", toggle_export_mode)
-        
-        self.btn_export_start = ttk.Button(row2, text="🚀 Начать Сборку", command=self.start_export_process)
-        self.btn_export_start.pack(side=tk.RIGHT, padx=5)
-        self.btn_export_stop = ttk.Button(row2, text="⏹ Стоп", command=self.stop_export_process, state=tk.DISABLED)
-        self.btn_export_stop.pack(side=tk.RIGHT, padx=5)
-        
+
         row3 = ttk.Frame(export_frame)
         row3.pack(fill=tk.X, pady=2)
         
@@ -5901,6 +6703,38 @@ class TTSApp:
         self.lbl_exp_decay.pack(side=tk.LEFT)
         ttk.Scale(row3, from_=0.1, to_=0.8, variable=self.exp_decay_var, command=lambda v: self.lbl_exp_decay.config(text=f"{float(v):.1f}")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
         ttk.Button(row3, text="🔄 Сброс", command=self.reset_export_fx).pack(side=tk.RIGHT, padx=2)
+
+        # Команды сборки вынесены в отдельную строку: параметры профиля и
+        # эффекты остаются доступными даже при небольшой ширине окна.
+        row4 = ttk.Frame(export_frame)
+        row4.pack(fill=tk.X, pady=(2, 0))
+        self.chk_export_tags_only = ttk.Checkbutton(
+            row4,
+            text="Только обновить теги в исходных файлах",
+            variable=self.export_tags_only_var,
+        )
+        self.chk_export_tags_only.pack(side=tk.LEFT, padx=5)
+
+        # Блокировка UI при включении режима "только теги".
+        self.export_tags_only_var.trace_add(
+            "write", lambda *_args: self._sync_export_mode_controls()
+        )
+
+        export_actions = ttk.Frame(row4)
+        export_actions.pack(side=tk.RIGHT)
+        self.btn_export_start = ttk.Button(
+            export_actions,
+            text="🚀 Начать Сборку",
+            command=self.start_export_process,
+        )
+        self.btn_export_start.pack(side=tk.LEFT, padx=(0, 5))
+        self.btn_export_stop = ttk.Button(
+            export_actions,
+            text="⏹ Стоп",
+            command=self.stop_export_process,
+            state=tk.DISABLED,
+        )
+        self.btn_export_stop.pack(side=tk.LEFT)
 
         # === 3. ПАНЕЛЬ КНОПОК (В ДВА РЯДА) ===
         self.export_mid_frame = ttk.Frame(frame)
@@ -5978,32 +6812,71 @@ class TTSApp:
         self.grp_notebook = ttk.Notebook(self.group_settings_frame)
         self.grp_notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         
-        self.grp_tab_basic = ttk.Frame(self.grp_notebook, padding=5)
+        self.grp_tab_basic = ttk.Frame(self.grp_notebook)
         self.grp_tab_tags = ttk.Frame(self.grp_notebook, padding=5)
         self.grp_notebook.add(self.grp_tab_basic, text="Основные")
         self.grp_notebook.add(self.grp_tab_tags, text="Теги")
 
-        self.lbl_grp_name = ttk.Label(self.grp_tab_basic, text="Имя группы / Название трека:")
+        # На невысоких экранах нижняя кнопка массового применения
+        # раньше обрезалась ноутбуком. Прокручиваем только эту компактную
+        # вкладку, не меняя геометрию дерева и всей панели сборки.
+        self.grp_basic_canvas = tk.Canvas(
+            self.grp_tab_basic,
+            width=270,
+            height=1,
+            highlightthickness=0,
+            borderwidth=0,
+            takefocus=False,
+        )
+        self.grp_basic_scrollbar = ttk.Scrollbar(
+            self.grp_tab_basic,
+            orient=tk.VERTICAL,
+            command=self.grp_basic_canvas.yview,
+        )
+        self.grp_basic_canvas.configure(
+            yscrollcommand=self.grp_basic_scrollbar.set
+        )
+        self.grp_basic_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.grp_basic_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.grp_basic_content = ttk.Frame(self.grp_basic_canvas, padding=5)
+        grp_basic_window = self.grp_basic_canvas.create_window(
+            (0, 0), window=self.grp_basic_content, anchor="nw"
+        )
+        self.grp_basic_content.bind(
+            "<Configure>",
+            lambda _event: self.grp_basic_canvas.configure(
+                scrollregion=self.grp_basic_canvas.bbox("all")
+            ),
+        )
+        self.grp_basic_canvas.bind(
+            "<Configure>",
+            lambda event: self.grp_basic_canvas.itemconfigure(
+                grp_basic_window, width=event.width
+            ),
+        )
+
+        self.lbl_grp_name = ttk.Label(self.grp_basic_content, text="Имя группы / Название трека:")
         self.lbl_grp_name.pack(anchor=tk.W, pady=(0, 2))
         self.grp_name_var = tk.StringVar()
         self.grp_name_var.trace_add("write", self.save_export_item_settings)
-        ttk.Entry(self.grp_tab_basic, textvariable=self.grp_name_var).pack(fill=tk.X, pady=(0, 10))
+        ttk.Entry(self.grp_basic_content, textvariable=self.grp_name_var).pack(fill=tk.X, pady=(0, 10))
         
         self.grp_merge_var = tk.BooleanVar()
         self.grp_merge_var.trace_add("write", self.save_export_item_settings)
         self.grp_merge_var.trace_add(
             "write", lambda *_args: self._sync_group_subfolder_state()
         )
-        self.chk_merge = ttk.Checkbutton(self.grp_tab_basic, text="Склеить файлы в один трек", variable=self.grp_merge_var)
+        self.chk_merge = ttk.Checkbutton(self.grp_basic_content, text="Склеить файлы в один трек", variable=self.grp_merge_var)
         self.chk_merge.pack(anchor=tk.W, pady=2)
         
         self.grp_subfolder_var = tk.BooleanVar(value=True)
         self.grp_subfolder_var.trace_add("write", self.save_export_item_settings)
-        self.chk_subfolder = ttk.Checkbutton(self.grp_tab_basic, text="Сохранять в подпапку", variable=self.grp_subfolder_var)
+        self.chk_subfolder = ttk.Checkbutton(self.grp_basic_content, text="Сохранять в подпапку", variable=self.grp_subfolder_var)
         self.chk_subfolder.pack(anchor=tk.W, pady=(0, 5))
         self.lbl_subfolder_hint = self._register_palette_widget(
             ttk.Label(
-                self.grp_tab_basic,
+                self.grp_basic_content,
                 text="Доступно только когда файлы группы не склеиваются.",
                 foreground=self.get_status_color("muted"),
                 font=("", 8, "italic"),
@@ -6012,15 +6885,16 @@ class TTSApp:
         )
         self.lbl_subfolder_hint.pack(anchor=tk.W, pady=(0, 5))
         
-        ttk.Label(self.grp_tab_basic, text="Пауза между файлами (мс):").pack(anchor=tk.W, pady=(5, 2))
+        ttk.Label(self.grp_basic_content, text="Пауза между файлами (мс):").pack(anchor=tk.W, pady=(5, 2))
         self.grp_pause_var = tk.IntVar()
         self.grp_pause_var.trace_add("write", self.save_export_item_settings)
-        self.ent_pause = ttk.Entry(self.grp_tab_basic, textvariable=self.grp_pause_var, width=10)
+        self.ent_pause = ttk.Entry(self.grp_basic_content, textvariable=self.grp_pause_var, width=10)
         self.ent_pause.pack(anchor=tk.W, pady=(0, 10))
         
         # ЭЛЕГАНТНАЯ КНОПКА МАССОВОГО ПРИМЕНЕНИЯ
-        self.btn_mass_apply_basic = ttk.Button(self.grp_tab_basic, text="⚙️ Применить ко всем группам...", command=self.open_mass_apply_dialog)
+        self.btn_mass_apply_basic = ttk.Button(self.grp_basic_content, text="⚙️ Применить ко всем группам...", command=self.open_mass_apply_dialog)
         self.btn_mass_apply_basic.pack(anchor=tk.W, pady=5)
+        self._bind_export_basic_scroll_events(self.grp_tab_basic)
         
         # -- Вкладка: Теги --
         tag_grid = ttk.Frame(self.grp_tab_tags)
@@ -6079,6 +6953,36 @@ class TTSApp:
         self._disable_export_settings()
         
     # --- Логика интерфейса Сборщика ---
+    def _bind_export_basic_scroll_events(self, widget):
+        """Делает колесо доступным над всеми дочерними полями."""
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(
+                sequence,
+                self._scroll_export_basic_settings,
+                add="+",
+            )
+        for child in widget.winfo_children():
+            self._bind_export_basic_scroll_events(child)
+
+    def _scroll_export_basic_settings(self, event):
+        """Прокручивает компактную вкладку основных настроек группы."""
+        event_num = getattr(event, "num", None)
+        event_delta = getattr(event, "delta", 0)
+        if event_num == 4:
+            units = -1
+        elif event_num == 5:
+            units = 1
+        elif event_delta:
+            # Windows посылает кратные 120, macOS может передавать
+            # меньшие значения трекпада.
+            units = -max(1, abs(int(event_delta)) // 120)
+            if event_delta < 0:
+                units = -units
+        else:
+            return None
+        self.grp_basic_canvas.yview_scroll(units, "units")
+        return "break"
+
     def _sync_export_mode_controls(self):
         """Восстанавливает специальные состояния полей режима экспорта."""
         if getattr(self, "_export_running", False):
@@ -6089,7 +6993,13 @@ class TTSApp:
         self.btn_export_dir.configure(state=normal_state)
         self.ent_export_dir.configure(state=normal_state)
         self.cb_export_fmt.configure(state=combo_state)
-        self.cb_export_bitrate.configure(state=combo_state)
+        fmt = str(self.export_fmt_var.get()).strip().lower()
+        bitrate_state = (
+            tk.DISABLED if tags_only or fmt == "wav" else "readonly"
+        )
+        self.cb_export_bitrate.configure(state=bitrate_state)
+        self.cb_export_sample_rate.configure(state=combo_state)
+        self.cb_export_channels.configure(state=combo_state)
         self.chk_export_fx.configure(state=normal_state)
         self.btn_export_start.configure(state=tk.NORMAL)
         self.btn_export_stop.configure(state=tk.DISABLED)
@@ -6260,7 +7170,7 @@ class TTSApp:
         for g_id in self.export_groups:
             self.export_groups[g_id]["pause"] = val
             
-        messagebox.showinfo("Успех", f"Пауза {val} мс применена ко всем группам и сохранена как значение по умолчанию!")
+        self._show_info("Успех", f"Пауза {val} мс применена ко всем группам и сохранена как значение по умолчанию!")
 
     def update_total_export_duration(self):
         """Пересчитывает и отображает общее время всех файлов в дереве экспорта"""
@@ -6280,7 +7190,7 @@ class TTSApp:
         if getattr(self, "_export_running", False) or getattr(self, "_export_lock", False):
             return
         if not self.current_selected_export_item or self.current_selected_export_item not in self.export_groups:
-            messagebox.showwarning("Внимание", "Выберите группу-эталон, настройки которой вы хотите применить к остальным.")
+            self._show_warning("Внимание", "Выберите группу-эталон, настройки которой вы хотите применить к остальным.")
             return
 
         dialog = tk.Toplevel(self.root)
@@ -6322,7 +7232,7 @@ class TTSApp:
                 self.save_settings()
                 
             dialog.destroy()
-            messagebox.showinfo("Успех", "Настройки успешно применены ко всем группам!")
+            self._show_info("Успех", "Настройки успешно применены ко всем группам!")
             
         ttk.Button(dialog, text="Применить", command=apply_changes).pack(pady=15)
         
@@ -6360,18 +7270,18 @@ class TTSApp:
             selected = self.export_tree.selection()
             for sel_id in selected:
                 apply_to_item(sel_id)
-            messagebox.showinfo("Успех", "Теги применены ко всем выделенным элементам!")
+            self._show_info("Успех", "Теги применены ко всем выделенным элементам!")
             
         elif scope == "parent_group" and not is_group:
             if parent_g_id in self.export_groups:
                 apply_to_item(parent_g_id)
-            messagebox.showinfo("Успех", "Теги скопированы в родительскую группу!")
+            self._show_info("Успех", "Теги скопированы в родительскую группу!")
             
         elif scope == "group_files":
             if parent_g_id:
                 for f_id in self.export_tree.get_children(parent_g_id):
                     apply_to_item(f_id)
-            messagebox.showinfo("Успех", "Теги применены ко всем файлам в группе!")
+            self._show_info("Успех", "Теги применены ко всем файлам в группе!")
             
         elif scope == "all":
             # 1. Применяем к группам и их файлам
@@ -6383,7 +7293,7 @@ class TTSApp:
             for f_id in self.export_tree.get_children(""):
                 if f_id in self.export_files:
                     apply_to_item(f_id)
-            messagebox.showinfo("Успех", "Теги применены абсолютно ко всем группам и файлам!")
+            self._show_info("Успех", "Теги применены абсолютно ко всем группам и файлам!")
 
     def move_export_item(self, direction):
         if getattr(self, "_export_running", False) or getattr(self, "_export_lock", False):
@@ -6413,7 +7323,7 @@ class TTSApp:
         files_to_move = [item for item in selected_items if item in self.export_files]
         
         if not files_to_move:
-            messagebox.showwarning("Внимание", "Выделите аудиофайлы в списке для объединения в группу.")
+            self._show_warning("Внимание", "Выделите аудиофайлы в списке для объединения в группу.")
             return
 
         new_g_id = self.add_export_group()
@@ -6520,7 +7430,7 @@ class TTSApp:
             
             files = filedialog.askopenfilenames(
                 initialdir=init_dir,
-                filetypes=[("Audio Files", "*.mp3 *.wav *.ogg")]
+                filetypes=[("Audio Files", "*.mp3 *.wav *.ogg *.opus")]
             )
         if not files: return
 
@@ -6633,7 +7543,7 @@ class TTSApp:
 
     def add_export_folder(self):
         if getattr(self, '_export_lock', False) or getattr(self, '_export_running', False):
-             messagebox.showwarning("Занято", "Дождитесь окончания предыдущего импорта файлов.")
+             self._show_warning("Занято", "Дождитесь окончания предыдущего импорта файлов.")
              return
              
         # Берём последний зафиксированный путь
@@ -6647,11 +7557,18 @@ class TTSApp:
         self.config["last_browse_dir"] = str(Path(folder).parent)
         self.save_settings()
         
-        create_group = messagebox.askyesno("Добавление папки", f"Создать отдельную группу для папки '{Path(folder).name}'?\n\nДа - создать группу\nНет - добавить файлы в корень (или текущую группу)")
+        create_group = self._ask_yes_no("Добавление папки", f"Создать отдельную группу для папки '{Path(folder).name}'?\n\nДа - создать группу\nНет - добавить файлы в корень (или текущую группу)")
         
-        files = sorted([str(p) for p in Path(folder).glob("*.*") if p.suffix.lower() in ['.mp3', '.wav', '.ogg']], key=self._natural_sort_key)
+        files = sorted(
+            [
+                str(path)
+                for path in Path(folder).glob("*.*")
+                if path.suffix.lower() in {".mp3", ".wav", ".ogg", ".opus"}
+            ],
+            key=self._natural_sort_key,
+        )
         if not files:
-            messagebox.showinfo("Пусто", "В папке нет аудиофайлов.")
+            self._show_info("Пусто", "В папке нет аудиофайлов.")
             return
             
         target_group = self.add_export_group(name=Path(folder).name) if create_group else None
@@ -6788,7 +7705,7 @@ class TTSApp:
         )
                 
         if not all_files:
-            messagebox.showinfo("Пусто", "Сначала добавьте аудиофайлы.")
+            self._show_info("Пусто", "Сначала добавьте аудиофайлы.")
             return
 
         dialog = tk.Toplevel(self.root)
@@ -6812,12 +7729,12 @@ class TTSApp:
                     raise ValueError
                 limit_sec = limit_minutes * 60
             except (tk.TclError, TypeError, ValueError):
-                messagebox.showerror("Ошибка", "Введите положительное число минут!")
+                self._show_error("Ошибка", "Введите положительное число минут!")
                 return
             
             template = template_var.get().strip()
             if not template:
-                messagebox.showerror("Ошибка", "Шаблон имени группы не может быть пустым.")
+                self._show_error("Ошибка", "Шаблон имени группы не может быть пустым.")
                 return
             self.settings_vars["default_group_name"].set(template)
             self.save_settings()
@@ -6901,7 +7818,8 @@ class TTSApp:
             # Явные map исключают перенос старой обложки вместе с новой.
             cmd.extend([
                 "-i", str(cov), "-map", "0:a:0", "-map", "1:v:0",
-                "-c:a", "copy", "-c:v", "copy", "-id3v2_version", "3",
+                "-c:a", "copy", "-c:v", "mjpeg", "-id3v2_version", "3",
+                "-disposition:v:0", "attached_pic",
                 "-metadata:s:v", "title=Album cover",
                 "-metadata:s:v", "comment=Cover (front)",
             ])
@@ -6958,7 +7876,7 @@ class TTSApp:
             return
         items = self.export_tree.get_children()
         if not items:
-            messagebox.showwarning("Пусто", "Список пуст. Добавьте аудиофайлы или группы.")
+            self._show_warning("Пусто", "Список пуст. Добавьте аудиофайлы или группы.")
             return
             
         # Проверяем, есть ли вообще файлы (в корне или в группах)
@@ -6972,7 +7890,7 @@ class TTSApp:
                 break
 
         if not has_any_files:
-            messagebox.showwarning("Нет файлов", "Добавьте аудиофайлы перед началом сборки.")
+            self._show_warning("Нет файлов", "Добавьте аудиофайлы перед началом сборки.")
             return
         
         # ИСПРАВЛЕНИЕ: Если включено "Только теги", игнорируем пустую папку!
@@ -6980,7 +7898,7 @@ class TTSApp:
         out_dir_str = self.export_outdir_var.get().strip()
         
         if not tags_only and not out_dir_str:
-            messagebox.showwarning("Папка не выбрана", "Пожалуйста, укажите папку для сохранения результатов экспорта.")
+            self._show_warning("Папка не выбрана", "Пожалуйста, укажите папку для сохранения результатов экспорта.")
             chosen = filedialog.askdirectory(
                 initialdir=resolve_dialog_initial_dir(
                     self.config.get("export_dir", ""),
@@ -7002,7 +7920,7 @@ class TTSApp:
                 out_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 logging.error("Не удалось создать папку экспорта %s: %s", out_dir, exc)
-                messagebox.showerror(
+                self._show_error(
                     "Ошибка папки",
                     f"Не удалось создать папку экспорта:\n{out_dir}\n\n{exc}",
                 )
@@ -7019,7 +7937,7 @@ class TTSApp:
         if missing_sources:
             preview = "\n".join(str(path) for path in missing_sources[:5])
             suffix = "\n…" if len(missing_sources) > 5 else ""
-            messagebox.showerror(
+            self._show_error(
                 "Нет исходных файлов",
                 f"Не найдено файлов: {len(missing_sources)}\n\n{preview}{suffix}",
             )
@@ -7039,11 +7957,22 @@ class TTSApp:
 
         fmt = self.export_fmt_var.get().strip().lower()
         bitrate = self.export_bitrate_var.get().strip().lower()
-        if fmt not in {"mp3", "wav", "ogg"}:
-            messagebox.showerror("Ошибка", "Выбран неподдерживаемый формат экспорта.")
+        sample_rate = self.export_sample_rate_var.get().strip().lower()
+        channels = self.export_channels_var.get().strip().lower()
+        if fmt not in {"mp3", "wav", "ogg", "opus"}:
+            self._show_error("Ошибка", "Выбран неподдерживаемый формат экспорта.")
             return
-        if not re.fullmatch(r"[1-9]\d*k", bitrate):
-            messagebox.showerror("Ошибка", "Некорректный битрейт экспорта.")
+        if bitrate != "auto" and not re.fullmatch(r"[1-9]\d*k", bitrate):
+            self._show_error("Ошибка", "Некорректный битрейт экспорта.")
+            return
+        if sample_rate != "auto" and sample_rate not in {
+            "8000", "12000", "16000", "22050", "24000", "32000",
+            "44100", "48000", "88200", "96000"
+        }:
+            self._show_error("Ошибка", "Некорректная частота экспорта.")
+            return
+        if channels not in {"auto", "mono", "stereo"}:
+            self._show_error("Ошибка", "Некорректный режим каналов экспорта.")
             return
         group_children = {
             group_id: tuple(self.export_tree.get_children(group_id))
@@ -7094,7 +8023,7 @@ class TTSApp:
             duplicates = duplicate_paths(planned_outputs)
             if duplicates:
                 preview = "\n".join(duplicates[:5])
-                messagebox.showerror(
+                self._show_error(
                     "Совпадающие имена",
                     "Несколько элементов будут записаны в один файл. "
                     "Измените названия:\n\n" + preview,
@@ -7193,54 +8122,53 @@ class TTSApp:
                             self._post_status_label(self.lbl_export_status, f"Обработка: {g_name}...", "text")
 
                             if g_set["merge"]:
-                                final_audio = AudioSegment.empty()
                                 pause_ms = g_set["pause"]
-                                if apply_fx and sp != 1.0: pause_ms = int(pause_ms / sp)
-                                pause_seg = AudioSegment.silent(duration=pause_ms)
 
                                 first_f_set = export_files.get(files[0], {})
                                 for key in ["artist", "album", "album_artist", "genre", "composer", "year", "cover"]:
                                     if not g_set.get(key) and first_f_set.get(key):
                                         g_set[key] = first_f_set[key]
-                                
-                                for i, f_id in enumerate(files):
-                                    if self.is_export_stopped: break
-                                    fp = export_files[f_id]["path"]
-                                    final_audio += _load_audio_segment(fp)
-                                    if i < len(files) - 1 and pause_ms > 0: final_audio += pause_seg
-                                    
+
+                                merge_sources = []
+                                for f_id in files:
+                                    if self.is_export_stopped:
+                                        break
+                                    merge_sources.append(export_files[f_id]["path"])
                                     processed_files += 1
                                     pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
                                     self._post_to_ui(self.export_progress.config, value=pct)
-                                
-                                if self.is_export_stopped: break
-                                    
-                                if apply_fx:
-                                    self._post_status_label(self.lbl_export_status, f"Применение эффектов и сохранение {g_name}...", "warning")
-                                    final_audio = AudioEffects.apply_effects(
-                                        final_audio,
-                                        speed=sp,
-                                        pitch=pt,
-                                        echo=ec,
-                                        echo_delay=ed,
-                                        echo_decay=ey,
-                                        strict=True,
-                                    )
-                                else:
-                                    self._post_status_label(self.lbl_export_status, f"Сохранение {g_name}...", "warning")
-                                
+
+                                if self.is_export_stopped:
+                                    break
+                                self._post_status_label(
+                                    self.lbl_export_status,
+                                    (
+                                        f"Потоковая склейка, эффекты и сохранение {g_name}..."
+                                        if apply_fx
+                                        else f"Потоковая склейка и сохранение {g_name}..."
+                                    ),
+                                    "warning",
+                                )
                                 g_set["title"] = g_name
                                 tags = build_tags(g_set)
-                                export_kwargs = audio_export_kwargs(
-                                    fmt,
-                                    bitrate=bitrate,
+                                out_file = out_dir / f"{safe_group_name}.{fmt}"
+                                _export_merged_audio_ffmpeg(
+                                    merge_sources,
+                                    out_file,
+                                    output_format=fmt,
+                                    bitrate=None if bitrate == "auto" else bitrate,
+                                    bitrate_mode=bitrate,
+                                    sample_rate=sample_rate,
+                                    channels=channels,
+                                    pause_ms=pause_ms,
+                                    speed=sp if apply_fx else 1.0,
+                                    pitch=pt if apply_fx else 1.0,
+                                    echo=ec if apply_fx else False,
+                                    echo_delay=ed,
+                                    echo_decay=ey,
                                     tags=tags,
                                     cover=g_set.get("cover"),
-                                )
-                                    
-                                out_file = out_dir / f"{safe_group_name}.{fmt}"
-                                _export_audio_atomic(
-                                    final_audio, out_file, **export_kwargs
+                                    cancelled=lambda: self.is_export_stopped,
                                 )
                                 
                             else:
@@ -7268,32 +8196,31 @@ class TTSApp:
                                     cov = f_set.get("cover") or g_set.get("cover")
                                     
                                     self._post_status_label(self.lbl_export_status, f"Конвертация: {f_set['title']}...", "warning")
-                                    audio = _load_audio_segment(fp)
-                                    
-                                    if apply_fx:
-                                        audio = AudioEffects.apply_effects(
-                                            audio,
-                                            speed=sp,
-                                            pitch=pt,
-                                            echo=ec,
-                                            echo_delay=ed,
-                                            echo_decay=ey,
-                                            strict=True,
-                                        )
-                                    
-                                    export_kwargs = audio_export_kwargs(
-                                        fmt,
-                                        bitrate=bitrate,
-                                        tags=f_tags,
-                                        cover=cov,
-                                    )
-                                    
                                     safe_name = sanitize_filename_component(
                                         f_set["title"], fallback=Path(fp).stem
                                     )
                                     out_file = target_dir / f"{safe_name}.{fmt}"
-                                    _export_audio_atomic(
-                                        audio, out_file, **export_kwargs
+                                    # Один вход всё равно проходит через общий
+                                    # FFmpeg-граф: так выбранные частота,
+                                    # каналы, битрейт и эффекты одинаково
+                                    # применяются и к склейке, и к отдельным
+                                    # файлам без промежуточного PCM/WAV.
+                                    _export_single_audio_ffmpeg(
+                                        fp,
+                                        out_file,
+                                        output_format=fmt,
+                                        bitrate=None if bitrate == "auto" else bitrate,
+                                        bitrate_mode=bitrate,
+                                        sample_rate=sample_rate,
+                                        channels=channels,
+                                        speed=sp if apply_fx else 1.0,
+                                        pitch=pt if apply_fx else 1.0,
+                                        echo=ec if apply_fx else False,
+                                        echo_delay=ed,
+                                        echo_decay=ey,
+                                        tags=f_tags,
+                                        cover=cov,
+                                        cancelled=lambda: self.is_export_stopped,
                                     )
 
                                     processed_files += 1
@@ -7309,31 +8236,27 @@ class TTSApp:
                             cov = f_set.get("cover")
                             
                             self._post_status_label(self.lbl_export_status, f"Конвертация: {f_set['title']}...", "text")
-                            audio = _load_audio_segment(fp)
-                            
-                            if apply_fx:
-                                audio = AudioEffects.apply_effects(
-                                    audio,
-                                    speed=sp,
-                                    pitch=pt,
-                                    echo=ec,
-                                    echo_delay=ed,
-                                    echo_decay=ey,
-                                    strict=True,
-                                )
-                            
-                            export_kwargs = audio_export_kwargs(
-                                fmt,
-                                bitrate=bitrate,
-                                tags=f_tags,
-                                cover=cov,
-                            )
-                            
                             safe_name = sanitize_filename_component(
                                 f_set["title"], fallback=Path(fp).stem
                             )
                             out_file = out_dir / f"{safe_name}.{fmt}"
-                            _export_audio_atomic(audio, out_file, **export_kwargs)
+                            _export_single_audio_ffmpeg(
+                                fp,
+                                out_file,
+                                output_format=fmt,
+                                bitrate=None if bitrate == "auto" else bitrate,
+                                bitrate_mode=bitrate,
+                                sample_rate=sample_rate,
+                                channels=channels,
+                                speed=sp if apply_fx else 1.0,
+                                pitch=pt if apply_fx else 1.0,
+                                echo=ec if apply_fx else False,
+                                echo_delay=ed,
+                                echo_decay=ey,
+                                tags=f_tags,
+                                cover=cov,
+                                cancelled=lambda: self.is_export_stopped,
+                            )
                             
                             processed_files += 1
                             pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
@@ -7341,7 +8264,7 @@ class TTSApp:
 
                 if self.is_export_stopped:
                     self._post_status_label(self.lbl_export_status, "Сборка прервана!", "error")
-                    self._post_to_ui(messagebox.showwarning, "Остановлено", "Процесс сборки был прерван пользователем.")
+                    self._post_to_ui(self._show_warning, "Остановлено", "Процесс сборки был прерван пользователем.")
                 else:
                     if failed_files:
                         msg = (
@@ -7351,17 +8274,29 @@ class TTSApp:
                         self._post_status_label(
                             self.lbl_export_status, "Готово с ошибками.", "warning"
                         )
-                        self._post_to_ui(messagebox.showwarning, "Готово", msg)
+                        self._post_to_ui(self._show_warning, "Готово", msg)
                     else:
                         msg = "Теги успешно обновлены в исходных файлах!" if tags_only else f"Сборка успешно завершена!\nСохранено в: {out_dir}"
                         self._post_status_label(self.lbl_export_status, "Готово!", "success")
-                        self._post_to_ui(messagebox.showinfo, "Успех", msg)
+                        self._post_to_ui(self._show_info, "Успех", msg)
                 
+            except InterruptedError:
+                # Отмена потоковой FFmpeg-склейки является штатным исходом:
+                # helper уже завершил дочерний процесс и удалил временный файл.
+                self.is_export_stopped = True
+                self._post_status_label(
+                    self.lbl_export_status, "Сборка прервана!", "warning"
+                )
+                self._post_to_ui(
+                    self._show_warning,
+                    "Остановлено",
+                    "Процесс сборки был прерван пользователем.",
+                )
             except Exception as e:
                 logging.exception("Ошибка сборки")
                 error_message = f"Произошла ошибка при сборке:\n{e}"
                 self._post_status_label(self.lbl_export_status, "Ошибка!", "error")
-                self._post_to_ui(messagebox.showerror, "Ошибка", error_message)
+                self._post_to_ui(self._show_error, "Ошибка", error_message)
             finally:
                 def finish_export_ui():
                     self._export_thread = None
@@ -7378,7 +8313,7 @@ class TTSApp:
                 self.lbl_export_status, "Ошибка запуска сборки.", "error"
             )
             logging.exception("Не удалось запустить поток экспорта")
-            messagebox.showerror(
+            self._show_error(
                 "Ошибка", f"Не удалось запустить сборку:\n{exc}"
             )
 
@@ -7559,7 +8494,7 @@ class TTSApp:
                 _config_bool(self.settings_vars["api_steps_enabled"].get())
                 and not _config_bool(self.settings_vars["cache_include_steps"].get())
             ):
-                if not messagebox.askyesno(
+                if not self._ask_yes_no(
                     "Общий кэш Steps",
                     "Без учёта Steps разные значения качества используют один "
                     "и тот же ключ и могут заменять друг друга. Оставить общий "
@@ -7702,10 +8637,22 @@ class TTSApp:
 
         # 6. Вывод и Теги
         add_combobox(tab_output, "Режим синтеза:", "synthesis_mode", 0, ["sentence", "paragraph", "full"])
-        add_combobox(tab_output, "Формат аудио:", "output_format", 1, ["mp3", "wav", "ogg"])
-        add_combobox(tab_output, "Битрейт (для mp3):", "output_bitrate", 2, ["64k", "128k", "192k", "256k", "320k"])
+        add_combobox(
+            tab_output,
+            "Формат аудио:",
+            "output_format",
+            1,
+            ["mp3", "wav", "ogg", "opus"],
+        )
+        add_combobox(
+            tab_output,
+            "Битрейт (для mp3/opus):",
+            "output_bitrate",
+            2,
+            ["64k", "128k", "192k", "256k", "320k"],
+        )
         ttk.Separator(tab_output, orient=tk.HORIZONTAL).grid(row=3, column=0, columnspan=2, sticky="ew", pady=10)
-        ttk.Label(tab_output, text="Теги ID3 (для mp3/ogg):").grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=5)
+        ttk.Label(tab_output, text="Теги (для mp3/ogg/opus):").grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=5)
         
         tags_frame = ttk.Frame(tab_output)
         tags_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5)
@@ -7838,7 +8785,7 @@ class TTSApp:
             self.glos_word1.set("")
             self.glos_word2.set("")
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось обновить JSON: {e}")
+            self._show_error("Ошибка", f"Не удалось обновить JSON: {e}")
 
     def load_glossary_ui(self):
         cache_dir = Path(self.config.get("cache_dir", "cache_audio"))
@@ -7879,9 +8826,9 @@ class TTSApp:
         try:
             parsed = json.loads(content)
             self._write_json_atomic(path, parsed, backup=True)
-            messagebox.showinfo("Успех", "Глоссарий сохранен!")
+            self._show_info("Успех", "Глоссарий сохранен!")
         except Exception as e:
-            messagebox.showerror("Ошибка JSON", f"Неверный формат JSON:\n{e}")
+            self._show_error("Ошибка JSON", f"Неверный формат JSON:\n{e}")
 
 # --- Вкладка "Кэш" ---
     def setup_cache_tab(self):
@@ -8156,7 +9103,7 @@ class TTSApp:
             self.settings_vars["fx_echo_delay"].set(cache_echo_delay_var.get())
             self.settings_vars["fx_echo_decay"].set(cache_echo_decay_var.get())
             self.save_settings()
-            messagebox.showinfo("Успех", "Эффекты сохранены в глобальные настройки!")
+            self._show_info("Успех", "Эффекты сохранены в глобальные настройки!")
 
         filepath = resolve_cache_audio_path(
             self.config.get("cache_dir", "cache_audio"),
@@ -8165,7 +9112,7 @@ class TTSApp:
 
         def play_cache_audio():
             if filepath is None or not filepath.is_file():
-                messagebox.showwarning(
+                self._show_warning(
                     "Файл не найден",
                     "Аудиофайл этой записи отсутствует или имеет небезопасный путь.",
                 )
@@ -8253,7 +9200,7 @@ class TTSApp:
         """Атомарно резервирует операцию; при конфликте показывает причину."""
         current = getattr(self, "_cache_operation", None)
         if current is not None:
-            messagebox.showinfo(
+            self._show_info(
                 "Кэш занят",
                 "Дождитесь завершения операции: "
                 f"{CACHE_OPERATION_LABELS.get(current, current)}.",
@@ -8277,7 +9224,7 @@ class TTSApp:
         operation = getattr(self, "_cache_operation", None)
         if operation is None:
             return False
-        messagebox.showwarning(
+        self._show_warning(
             "Кэш занят",
             "Дождитесь завершения операции: "
             f"{CACHE_OPERATION_LABELS.get(operation, operation)}.",
@@ -8364,9 +9311,9 @@ class TTSApp:
         self.lbl_cache_count.config(text=f"Всего записей: {len(self.cache_data)}")
         self.filter_cache()
         if error:
-            messagebox.showerror("Ошибка кэша", error)
+            self._show_error("Ошибка кэша", error)
         elif warning:
-            messagebox.showwarning("Восстановление кэша", warning)
+            self._show_warning("Восстановление кэша", warning)
 
     def _schedule_cache_filter(self, *_args):
         """Объединяет быстрый набор в поиске в одну перерисовку Treeview."""
@@ -8412,12 +9359,12 @@ class TTSApp:
 
     def delete_selected_cache(self):
         if self.is_synthesis_running():
-            messagebox.showwarning("Занято", "Нельзя удалять записи из кэша во время активного синтеза!")
+            self._show_warning("Занято", "Нельзя удалять записи из кэша во время активного синтеза!")
             return
         selected = self.cache_tree.selection()
         if not selected:
             return
-        if not messagebox.askyesno(
+        if not self._ask_yes_no(
             "Удаление",
             f"Удалить выбранные записи ({len(selected)} шт.) из кэша?",
         ):
@@ -8503,7 +9450,7 @@ class TTSApp:
         self._end_cache_operation("delete")
         self._close_popup_safely(popup)
         if error:
-            messagebox.showerror("Ошибка", error)
+            self._show_error("Ошибка", error)
             return
         if updated_cache is None:
             self._cache_ui_loaded = False
@@ -8519,7 +9466,7 @@ class TTSApp:
             if self.cache_tree.exists(hash_key):
                 self.cache_tree.delete(hash_key)
         self.lbl_cache_count.config(text=f"Всего записей: {len(self.cache_data)}")
-        messagebox.showinfo("Успех", "Записи удалены.")
+        self._show_info("Успех", "Записи удалены.")
 
     def is_synthesis_running(self):
         """Проверяет, запущен ли основной или прямой синтез в данный момент"""
@@ -8558,7 +9505,7 @@ class TTSApp:
             )
             self.filter_cache()
         if error:
-            messagebox.showerror("Ошибка", error)
+            self._show_error("Ошибка", error)
 
     @staticmethod
     def _format_byte_count(value):
@@ -8583,7 +9530,7 @@ class TTSApp:
         self._end_cache_operation("transcode")
         self._close_popup_safely(popup)
         if error:
-            messagebox.showerror("Ошибка", error)
+            self._show_error("Ошибка", error)
             return
 
         converted = int(stats.get("converted", 0))
@@ -8610,17 +9557,17 @@ class TTSApp:
             lines.append(
                 "Операцию можно запустить снова: уже готовые Opus-файлы будут пропущены."
             )
-        messagebox.showinfo(title, "\n".join(lines))
+        self._show_info(title, "\n".join(lines))
 
     def transcode_cache_to_opus(self):
         """Явно и возобновляемо мигрирует старый Vorbis-кэш в Ogg/Opus."""
         if self.is_cache_operation_running():
-            messagebox.showwarning(
+            self._show_warning(
                 "Кэш занят", "Дождитесь завершения текущей операции с кэшем."
             )
             return
         if self.is_synthesis_running():
-            messagebox.showwarning(
+            self._show_warning(
                 "Занято",
                 "Нельзя перекодировать кэш во время активного синтеза.",
             )
@@ -8631,10 +9578,10 @@ class TTSApp:
         if not cache_path.exists() and not cache_path.with_suffix(
             cache_path.suffix + ".bak"
         ).exists():
-            messagebox.showinfo("Пусто", "Индекс кэша не найден.")
+            self._show_info("Пусто", "Индекс кэша не найден.")
             return
 
-        if not messagebox.askyesno(
+        if not self._ask_yes_no(
             "Перекодирование кэша в Opus",
             "Старые фрагменты Ogg/Vorbis будут по одному перекодированы в "
             f"Ogg/Opus {CACHE_AUDIO_BITRATE}, 48 кГц mono.\n\n"
@@ -8978,7 +9925,7 @@ class TTSApp:
         poll_reader()
         self.root.wait_window(popup)
         if "error" in outcome:
-            messagebox.showerror("Ошибка кэша", outcome["error"])
+            self._show_error("Ошибка кэша", outcome["error"])
             return None
 
         stats = outcome.get("stats", analyze_cache_step_variants({}))
@@ -8993,13 +9940,13 @@ class TTSApp:
 
     def optimize_cache(self):
         if self.is_cache_operation_running():
-            messagebox.showinfo(
+            self._show_info(
                 "Кэш занят",
                 "Дождитесь завершения текущей операции с кэшем.",
             )
             return
         if self.is_synthesis_running():
-            messagebox.showwarning("Занято", "Нельзя оптимизировать кэш во время активного синтеза!")
+            self._show_warning("Занято", "Нельзя оптимизировать кэш во время активного синтеза!")
             return
             
         # Оптимизация не делает API-запросов, поэтому большое steps здесь не
@@ -9018,7 +9965,7 @@ class TTSApp:
         if variant_policy is None:
             return
 
-        if not messagebox.askyesno(
+        if not self._ask_yes_no(
             "Оптимизация",
             "Скрипт просканирует папку с текстами и удалит из кэша "
             "аудиофрагменты, которых нет в текущих текстах.\n\n"
@@ -9064,7 +10011,7 @@ class TTSApp:
                 
                 if not txt_files:
                     self._post_to_ui(
-                        messagebox.showwarning,
+                        self._show_warning,
                         "Отмена",
                         f"В папке '{input_dir}' не найдено текстовых файлов (.txt).\n"
                         "Оптимизация отменена, чтобы защитить кэш.",
@@ -9072,7 +10019,7 @@ class TTSApp:
                     return
 
                 if not processor.cache:
-                    self._post_to_ui(messagebox.showinfo, "Информация", "Кэш пуст.")
+                    self._post_to_ui(self._show_info, "Информация", "Кэш пуст.")
                     return
 
                 # Текст проверяется по единому хэшу normalized_text + speaker.
@@ -9158,9 +10105,9 @@ class TTSApp:
                         f"Удалено по выбранной политике Steps: {deleted_variant_count}\n"
                         f"Всего удалено: {len(keys_to_delete)}"
                     )
-                    self._post_to_ui(messagebox.showinfo, "Успех", msg)
+                    self._post_to_ui(self._show_info, "Успех", msg)
                 else:
-                    self._post_to_ui(messagebox.showinfo, "Готово", "Оптимизация завершена. Лишних записей не найдено.")
+                    self._post_to_ui(self._show_info, "Готово", "Оптимизация завершена. Лишних записей не найдено.")
                 cache_snapshot = dict(processor.cache)
             except Exception as exc:
                 logging.exception("Ошибка оптимизации кэша")
@@ -9188,12 +10135,12 @@ class TTSApp:
     def clear_entire_cache(self):
         """Полная очистка кэша"""
         if self.is_cache_operation_running():
-            messagebox.showwarning("Кэш занят", "Дождитесь завершения текущей операции с кэшем.")
+            self._show_warning("Кэш занят", "Дождитесь завершения текущей операции с кэшем.")
             return
         if self.is_synthesis_running():
-            messagebox.showwarning("Занято", "Нельзя полностью очищать кэш во время активного синтеза!")
+            self._show_warning("Занято", "Нельзя полностью очищать кэш во время активного синтеза!")
             return
-        if not messagebox.askyesno(
+        if not self._ask_yes_no(
             "🔥 КРИТИЧЕСКОЕ ДЕЙСТВИЕ",
             "Вы уверены, что хотите полностью очистить синтезированный кэш?\n"
             "Аудиофрагменты, паузы и индекс будут удалены безвозвратно.\n"
@@ -9231,20 +10178,20 @@ class TTSApp:
         self._end_cache_operation("clear")
         self._close_popup_safely(popup)
         if error:
-            messagebox.showerror("Ошибка", error)
+            self._show_error("Ошибка", error)
             return
         self._cache_generation_changed()
         self._clear_cache_view()
-        messagebox.showinfo(
+        self._show_info(
             "Готово", "Синтезированный кэш очищен. Глоссарий сохранён."
         )
 
     def archive_cache(self):
         if self.is_cache_operation_running():
-            messagebox.showwarning("Кэш занят", "Дождитесь завершения текущей операции с кэшем.")
+            self._show_warning("Кэш занят", "Дождитесь завершения текущей операции с кэшем.")
             return
         if self.is_synthesis_running():
-            messagebox.showwarning(
+            self._show_warning(
                 "Занято",
                 "Нельзя архивировать кэш во время активного синтеза: индекс "
                 "и аудиофайлы могут измениться в процессе копирования.",
@@ -9252,7 +10199,7 @@ class TTSApp:
             return
         cache_dir = Path(self.config.get("cache_dir", "cache_audio")).resolve()
         if not cache_dir.is_dir():
-            messagebox.showinfo("Пусто", "Папка кэша не существует.")
+            self._show_info("Пусто", "Папка кэша не существует.")
             return
             
         out_zip = filedialog.asksaveasfilename(
@@ -9269,7 +10216,7 @@ class TTSApp:
         except ValueError:
             pass
         else:
-            messagebox.showerror(
+            self._show_error(
                 "Некорректный путь",
                 "ZIP-архив нельзя сохранять внутрь самой папки кэша.",
             )
@@ -9327,9 +10274,9 @@ class TTSApp:
             self._cache_generation_changed()
             self._clear_cache_view()
         if error:
-            messagebox.showerror("Ошибка", error)
+            self._show_error("Ошибка", error)
         else:
-            messagebox.showinfo("Успех", f"Архив создан:\n{archive_path}")
+            self._show_info("Успех", f"Архив создан:\n{archive_path}")
 
     def _clear_cache_view(self):
         """Очищает только RAM/Treeview, не перечитывая индекс кэша с диска."""
@@ -9511,6 +10458,8 @@ class TTSApp:
 • Перепаковка и Разгруппировка: Выделите файлы и используйте кнопки "📦 В новую группу" или "📤 Разгруппировать" (кнопка перенесена на верхнюю панель для удобства).
 • Массовое применение настроек: Кнопка "⚙️ Применить ко всем группам..." открывает диалог, позволяющий в 1 клик применить параметры склейки, подпапок, пауз ко всем томам и сохранить их по умолчанию.
 • Склеивание в один трек: Склеивает все файлы группы в один большой аудиофайл с настройкой паузы между ними (в мс).
+• Потоковая склейка длинных групп: MP3/WAV/OGG декодируются и объединяются самим FFmpeg без общего PCM-буфера Pydub и промежуточного RIFF. Поэтому книга не упирается в 4-ГиБ заголовок WAV; для очень большого результата WAV FFmpeg автоматически использует RF64.
+• Профиль результата: Поля «Битрейт», «Частота» и «Каналы» относятся только к этой вкладке, сохраняются в настройках и одинаково применяются к одиночному файлу, несклеенной группе и общей дорожке. Режим «Авто» (в настройках — auto) сохраняет исходные параметры одиночного файла или однородной группы; для смешанной группы выбирает максимальную частоту и stereo при наличии многоканального входа, а при неизвестном профиле использует безопасные 48 кГц stereo. Явные частота и каналы поддерживаются MP3, OGG, Opus и WAV в пределах возможностей кодека. Битрейт применяется только к MP3/OGG/Opus; для WAV PCM он отключён и не применяется. OGG остаётся совместимым Ogg/Vorbis (.ogg), а отдельный Ogg/Opus (.opus) создаёт тот же Ogg-контейнер с рекомендованным для Opus расширением. При необходимости файл .opus можно вручную переименовать в .ogg без перекодирования, но приложение не предлагает этот менее совместимый вариант. В «Авто» MP3 получает ближайшую поддерживаемую libmp3lame частоту (не выше 48 кГц); явная неподдерживаемая частота не подменяется. OGG/Vorbis сохраняет 88,2/96 кГц только при битрейте «Авто» в quality/VBR-режиме; Opus поддерживает 8/12/16/24/48 кГц. Несовместимые явные сочетания низкой частоты, mono и высокого битрейта блокируются с объяснением; в «Авто» сохраняются частота и каналы, но несовместимый битрейт не наследуется. Пауза вставляется до общего эффекта скорости и изменяется вместе со всей дорожкой только один раз.
 • Наследование тегов при склейке: Если поля ID3 группы не заполнены, исполнитель, альбом, исполнитель альбома, жанр, композитор, год и обложка берутся из первого файла группы. Явно заданные значения группы имеют приоритет, а имя итогового файла и тег Title формируются из имени группы.
 • Авто-разбивка по времени: Работает как с уже созданными группами, так и только с файлами в корне. Нумерация адаптируется к последнему отображаемому номеру.
 • Безопасность сборки: Пока экспорт активен, дерево, перегруппировка и настройки блокируются. Перед стартом проверяются исчезнувшие исходники и совпадающие выходные имена.
@@ -9583,6 +10532,7 @@ class TTSApp:
   Проверенная и рекомендуемая связка для исходника — Python 3.13.x + Tcl/Tk 9.0.x (локально проверены Python 3.13.15 и Tk 9.0.4). Это не жёсткое требование для синтеза: Python 3.12/Tk 8.6 поддерживается, но после смены системной светлой/тёмной темы может потребоваться перезапуск. Официальная macOS `.app` собирается на актуальном Homebrew Python 3.13.x и проверяется с Tk 9; Windows/Linux поддерживают штатный Tk 8.6.
   Дочерние FFmpeg/FFprobe и системные утилиты запускаются через безопасный для Tk/CoreFoundation механизм `posix_spawn`, без предупреждений `The process has forked ... You MUST exec()`.
   После восстановления свёрнутого окна события Map/Activate повторно применяют системное оформление, переустанавливают текущую ttk-тему и инвалидируют системные виджеты; прогрессбары и ползунки не должны оставаться серыми до переключения на другое приложение.
+  Системные сообщения привязаны к главному окну и после закрытия возвращают локальный фокус прежнему полю через idle, не перехватывая фокус у другого приложения.
 • Умный буфер обмена (Кроссплатформенный):
   - На macOS обрабатывает ⌘C, ⌘V, ⌘X, ⌘A, ⌘Z при русской и английской раскладках и декодирует явные пути Finder (`file://`, `%20`, NFC), не изменяя обычный текст.
   - На Windows и Linux обрабатывает Ctrl+C/V/X/A/Z при русской и английской раскладках, снимает внешние кавычки у явных путей Windows 11 и декодирует `file://`-пути.
@@ -9603,12 +10553,20 @@ class TTSApp:
         pass
 
     def load_files(self):
+        self.ensure_dirs(keys=("input_dir",))
         self.save_settings()
         old_items = self.tree.get_children()
         if old_items:
             self.tree.delete(*old_items)
-        Path(self.config["input_dir"]).mkdir(parents=True, exist_ok=True)
-        self.txt_files = sorted(list(Path(self.config["input_dir"]).glob("*.txt")), key=lambda x: x.name)
+        input_dir = Path(self.config["input_dir"]).expanduser()
+        try:
+            self.txt_files = sorted(input_dir.glob("*.txt"), key=lambda x: x.name)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logging.error("Не удалось прочитать папку с текстами %s: %s", input_dir, exc)
+            self.config["input_dir"] = DEFAULT_INPUT_DIR
+            self.ensure_dirs(keys=("input_dir",))
+            input_dir = Path(self.config["input_dir"])
+            self.txt_files = sorted(input_dir.glob("*.txt"), key=lambda x: x.name)
         for f in self.txt_files:
             self.tree.insert("", tk.END, iid=f.name, values=("⏳ В очереди", f.name), tags=('queued',))
         
@@ -9686,14 +10644,14 @@ class TTSApp:
             return
         self.save_settings()
         if not self.config.get("api_token"):
-            messagebox.showerror("Ошибка", "Введите API Token во вкладке Настройки!")
+            self._show_error("Ошибка", "Введите API Token во вкладке Настройки!")
             return
             
         # Определяем, какие файлы отправлять на синтез
         items_to_process = self.tree.selection() if only_selected else self.tree.get_children()
         
         if not items_to_process:
-            messagebox.showinfo("Пусто", "Нет файлов для обработки. Выделите файлы или обновите список.")
+            self._show_info("Пусто", "Нет файлов для обработки. Выделите файлы или обновите список.")
             return
 
         # Блокируем/разблокируем кнопки
@@ -9725,7 +10683,7 @@ class TTSApp:
             self.btn_stop.config(state=tk.DISABLED)
             self.btn_hard_stop.config(state=tk.DISABLED)
             self._set_status_label(self.lbl_current_text, "Ошибка подготовки.", "error")
-            messagebox.showerror("Ошибка", f"Не удалось подготовить синтез:\n{exc}")
+            self._show_error("Ошибка", f"Не удалось подготовить синтез:\n{exc}")
             return
         self.batch_processor = processor
         self.processor = processor
@@ -9750,7 +10708,7 @@ class TTSApp:
             self.btn_hard_stop.config(state=tk.DISABLED)
             self._set_status_label(self.lbl_current_text, "Ошибка запуска.", "error")
             logging.exception("Не удалось запустить поток пакетного синтеза")
-            messagebox.showerror(
+            self._show_error(
                 "Ошибка", f"Не удалось запустить синтез:\n{exc}"
             )
 
@@ -9786,7 +10744,7 @@ class TTSApp:
             "Принудительно остановлено. Кэш сохраняется...",
             "error",
         )
-        messagebox.showwarning(
+        self._show_warning(
             "Принудительная остановка",
             "Процесс прерван. Текущее предложение не завершено; "
             "накопленный кэш сохраняется в фоне.",
@@ -9805,7 +10763,7 @@ class TTSApp:
         
         if queue_failed:
             self._set_status_label(self.lbl_current_text, "Обработка завершилась с ошибкой.", "error")
-            messagebox.showerror("Ошибка", "Очередь синтеза завершилась с ошибкой. Подробности записаны в лог.")
+            self._show_error("Ошибка", "Очередь синтеза завершилась с ошибкой. Подробности записаны в лог.")
         elif processor.is_stopped:
             if getattr(self, "_batch_hard_stop_requested", False):
                 self._set_status_label(
@@ -9815,10 +10773,10 @@ class TTSApp:
                 )
             else:
                 self._set_status_label(self.lbl_current_text, "Остановлено.", "warning")
-                messagebox.showwarning("Остановлено", "Обработка была прервана.")
+                self._show_warning("Остановлено", "Обработка была прервана.")
         else:
             self._set_status_label(self.lbl_current_text, "Ожидание...", "info")
-            messagebox.showinfo("Готово", "Все выбранные файлы обработаны!")
+            self._show_info("Готово", "Все выбранные файлы обработаны!")
 
         self._batch_hard_stop_requested = False
         self.batch_processor = None
@@ -9934,7 +10892,7 @@ class TTSApp:
             return
         self.save_settings()
         if not self.config.get("api_token"):
-            messagebox.showerror("Ошибка", "Введите API Token во вкладке Настройки!")
+            self._show_error("Ошибка", "Введите API Token во вкладке Настройки!")
             return
 
         text = self.direct_text.get(1.0, tk.END).strip()
@@ -9962,7 +10920,7 @@ class TTSApp:
                 Path(direct_output_dir).expanduser().mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 logging.error(f"Некорректная папка прямого синтеза: {exc}")
-                messagebox.showerror(
+                self._show_error(
                     "Ошибка папки",
                     f"Не удалось создать папку прямого синтеза:\n{direct_output_dir}\n\n{exc}",
                 )
@@ -10004,7 +10962,7 @@ class TTSApp:
             self.btn_direct_stop.config(state=tk.DISABLED)
             self.btn_direct_hard_stop.config(state=tk.DISABLED)
             self._set_status_label(self.lbl_direct_status, "Ошибка подготовки.", "error")
-            messagebox.showerror("Ошибка", f"Не удалось подготовить прямой синтез:\n{exc}")
+            self._show_error("Ошибка", f"Не удалось подготовить прямой синтез:\n{exc}")
             return
         self.direct_processor = processor
         self.processor = processor
@@ -10073,7 +11031,7 @@ class TTSApp:
             self.btn_direct_hard_stop.config(state=tk.DISABLED)
             self._set_status_label(self.lbl_direct_status, "Ошибка запуска.", "error")
             logging.exception("Не удалось запустить поток прямого синтеза")
-            messagebox.showerror(
+            self._show_error(
                 "Ошибка", f"Не удалось запустить прямой синтез:\n{exc}"
             )
 
@@ -10187,7 +11145,7 @@ class TTSApp:
 
     def show_critical_error(self, message):
         """Показывает всплывающее окно с ошибкой, пришедшей из фонового потока"""
-        self._post_to_ui(messagebox.showerror, "Критическая ошибка API", message)
+        self._post_to_ui(self._show_error, "Критическая ошибка API", message)
 
     def export_config(self):
         self.update_config_from_ui()
@@ -10237,7 +11195,7 @@ class TTSApp:
                             
             dialog.destroy()
             if not export_data:
-                messagebox.showwarning("Пусто", "Ничего не выбрано для экспорта.")
+                self._show_warning("Пусто", "Ничего не выбрано для экспорта.")
                 return
                 
             filepath = filedialog.asksaveasfilename(
@@ -10250,9 +11208,9 @@ class TTSApp:
                 try:
                     self._write_json_atomic(filepath, export_data)
                     self._remember_dialog_directory("last_config_dir", filepath)
-                    messagebox.showinfo("Успех", f"Настройки экспортированы в:\n{filepath}")
+                    self._show_info("Успех", f"Настройки экспортированы в:\n{filepath}")
                 except Exception as e:
-                    messagebox.showerror("Ошибка", f"Не удалось экспортировать конфиг:\n{e}")
+                    self._show_error("Ошибка", f"Не удалось экспортировать конфиг:\n{e}")
                     
         ttk.Button(dialog, text="Экспортировать", command=do_export).pack(pady=15)
         self._center_popup(dialog, 460, 315, fit_screen=True)
@@ -10262,7 +11220,7 @@ class TTSApp:
         try:
             parsed = json.loads(content)
         except Exception as e:
-            messagebox.showerror("Ошибка JSON", f"Исправьте ошибки в редакторе перед экспортом:\n{e}")
+            self._show_error("Ошибка JSON", f"Исправьте ошибки в редакторе перед экспортом:\n{e}")
             return
             
         dialog = tk.Toplevel(self.root)
@@ -10305,10 +11263,10 @@ class TTSApp:
                 try:
                     self._write_json_atomic(filepath, export_data)
                     self._remember_dialog_directory("last_glossary_dir", filepath)
-                    messagebox.showinfo("Успех", f"Глоссарий экспортирован в:\n{filepath}")
+                    self._show_info("Успех", f"Глоссарий экспортирован в:\n{filepath}")
                 except Exception as exc:
                     logging.error("Не удалось экспортировать глоссарий: %s", exc)
-                    messagebox.showerror(
+                    self._show_error(
                         "Ошибка", f"Не удалось экспортировать глоссарий:\n{exc}"
                     )
                 
@@ -10328,7 +11286,7 @@ class TTSApp:
                 imported_data = json.load(f)
             if not isinstance(imported_data, dict): raise ValueError()
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+            self._show_error("Ошибка", f"Не удалось прочитать файл:\n{e}")
             return
             
         dialog = tk.Toplevel(self.root)
@@ -10373,7 +11331,7 @@ class TTSApp:
             self.txt_glossary.delete(1.0, tk.END)
             self.txt_glossary.insert(tk.END, json.dumps(current, indent=4, ensure_ascii=False))
             self.save_glossary_ui()
-            messagebox.showinfo("Успех", "Правила успешно добавлены в глоссарий!")
+            self._show_info("Успех", "Правила успешно добавлены в глоссарий!")
             
         ttk.Button(dialog, text="Импортировать (Добавить)", command=do_import).pack(pady=15)
         self._center_popup(dialog, 320, 220)
