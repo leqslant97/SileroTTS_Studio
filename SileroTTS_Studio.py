@@ -11,6 +11,7 @@ import time
 import uuid
 import base64
 import hashlib
+import struct
 import threading
 import logging
 import requests
@@ -674,6 +675,106 @@ def audio_export_kwargs(output_format, bitrate=None, tags=None, cover=None):
     if fmt == "mp3" and cover and Path(cover).is_file():
         kwargs["cover"] = str(cover)
     return kwargs
+
+
+def _cover_mime_type(path):
+    """Определяет MIME JPEG/PNG по сигнатуре, а не по расширению файла."""
+    path = Path(path)
+    try:
+        with path.open("rb") as cover_file:
+            signature = cover_file.read(16)
+    except OSError:
+        return None
+    if signature.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if signature.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    return None
+
+
+def _xiph_metadata_block_picture(cover):
+    """Возвращает base64 FLAC-picture block для VorbisComment/OpusTags.
+
+    Ogg Opus и Ogg Vorbis не хранят обложку как обычный видеопоток в файле.
+    Стандартный способ Xiph — бинарная структура FLAC PICTURE, закодированная
+    base64 в комментарии ``METADATA_BLOCK_PICTURE``. FFmpeg при чтении
+    представляет такой комментарий как виртуальный ``attached_pic``-поток,
+    поэтому существующее извлечение обложек продолжает работать.
+
+    В 1.4.1 helper применяется к Opus. Ogg/Vorbis пока сохраняет прежнюю
+    политику безопасного пропуска обложки, чтобы не менять его release-поведение.
+    """
+    path = Path(cover)
+    mime_type = _cover_mime_type(path)
+    if mime_type is None:
+        raise ValueError("Обложка должна быть файлом JPEG или PNG")
+    image_data = path.read_bytes()
+    mime_bytes = mime_type.encode("ascii")
+    description = b""
+    picture = b"".join(
+        (
+            struct.pack(">I", 3),  # front cover
+            struct.pack(">I", len(mime_bytes)),
+            mime_bytes,
+            struct.pack(">I", len(description)),
+            description,
+            # Размеры/глубина необязательны в Xiph picture block. Нули не
+            # требуют декодировать изображение в Python и валидны для JPEG/PNG.
+            struct.pack(">IIIII", 0, 0, 0, 0, len(image_data)),
+            image_data,
+        )
+    )
+    return base64.b64encode(picture).decode("ascii")
+
+
+def _xiph_cover_metadata(cover, output_name=None):
+    """Безопасно готовит обложку Xiph; ошибочная картинка не срывает звук."""
+    if not cover or not Path(cover).is_file():
+        return None
+    try:
+        return _xiph_metadata_block_picture(cover)
+    except (OSError, ValueError) as exc:
+        logging.warning(
+            "Обложка пропущена%s: %s",
+            f" для {output_name}" if output_name else "",
+            exc,
+        )
+        return None
+
+
+def _create_xiph_cover_metadata_file(cover, output_name=None):
+    """Создаёт короткоживущий FFmetadata input без лимита командной строки.
+
+    Base64 обычной книжной обложки легко превышает предел аргументов Windows
+    или macOS. Поэтому передаём ``METADATA_BLOCK_PICTURE`` FFmpeg через файл,
+    закрытый до запуска дочернего процесса, а вызывающий код удаляет его после
+    завершения операции.
+    """
+    encoded_picture = _xiph_cover_metadata(cover, output_name)
+    if not encoded_picture:
+        return None
+    SESSION_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    metadata_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="ascii",
+            newline="\n",
+            prefix="opus_cover_",
+            suffix=".ffmeta",
+            dir=SESSION_TEMP_DIR,
+            delete=False,
+        ) as metadata_file:
+            metadata_path = Path(metadata_file.name)
+            metadata_file.write(";FFMETADATA1\n")
+            metadata_file.write(
+                f"METADATA_BLOCK_PICTURE={encoded_picture}\n"
+            )
+        return metadata_path
+    except Exception:
+        if metadata_path is not None:
+            metadata_path.unlink(missing_ok=True)
+        raise
 
 
 def normalize_clipboard_text(value):
@@ -1596,9 +1697,16 @@ def _export_merged_audio_ffmpeg(
         command.extend(["-i", str(source)])
 
     has_cover = bool(fmt == "mp3" and cover and Path(cover).is_file())
+    xiph_metadata_path = (
+        _create_xiph_cover_metadata_file(cover, out_path.name)
+        if fmt == "opus"
+        else None
+    )
+    if xiph_metadata_path:
+        command.extend(["-f", "ffmetadata", "-i", str(xiph_metadata_path)])
     if has_cover:
         command.extend(["-i", str(Path(cover).resolve())])
-    elif cover and Path(cover).is_file() and fmt != "mp3":
+    elif cover and Path(cover).is_file() and fmt in {"ogg", "wav"}:
         logging.warning(
             "Обложка пропущена для %s: формат %s не поддерживает JPEG/PNG "
             "attached_pic этим способом.",
@@ -1709,6 +1817,8 @@ def _export_merged_audio_ffmpeg(
     for key, value in (tags or {}).items():
         if value:
             command.extend(["-metadata", f"{key}={value}"])
+    if xiph_metadata_path:
+        command.extend(["-map_metadata", str(len(sources))])
     command.append(str(temp_path))
 
     startupinfo = None
@@ -1734,6 +1844,8 @@ def _export_merged_audio_ffmpeg(
                 raise InterruptedError("Сборка остановлена пользователем")
             time.sleep(0.05)
         stderr = process.stderr.read() if process.stderr else b""
+        if process.stderr:
+            process.stderr.close()
         if process.returncode != 0 or not temp_path.is_file():
             detail = stderr.decode("utf-8", errors="ignore").strip()
             raise RuntimeError(
@@ -1744,6 +1856,8 @@ def _export_merged_audio_ffmpeg(
         return out_path
     finally:
         temp_path.unlink(missing_ok=True)
+        if xiph_metadata_path is not None:
+            xiph_metadata_path.unlink(missing_ok=True)
 
 
 def _export_single_audio_ffmpeg(source, out_path, **kwargs):
@@ -3744,6 +3858,7 @@ class TTSProcessor:
 
                 fmt = self.cfg["output_format"].lower()
                 has_cover = False
+                xiph_cover = None
                 apply_tags = _config_bool(
                     self.cfg.get("apply_output_tags", True), default=True
                 )
@@ -3752,15 +3867,14 @@ class TTSProcessor:
                     if fmt == "mp3":
                         cmd.extend(["-i", cover_path])
                         has_cover = True
-                    elif fmt in {"ogg", "opus"}:
-                        # Ogg/Vorbis stores artwork in a base64 Vorbis-comment
-                        # block, while Ogg/Opus does not accept it as a normal
-                        # JPEG/PNG video stream either. FFmpeg's Ogg
-                        # muxer rejects the latter, so do not even add the image
-                        # input (automatic stream selection could pick it).
+                    elif fmt == "opus":
+                        xiph_cover = _xiph_cover_metadata(
+                            cover_path, out_filepath.name
+                        )
+                    elif fmt == "ogg":
                         logging.warning(
-                            "Обложка пропущена для OGG %s: контейнер не "
-                            "поддерживает JPEG/PNG attached_pic.",
+                            "Обложка пропущена для OGG %s: Ogg/Vorbis не "
+                            "поддерживает JPEG/PNG attached_pic этим способом.",
                             out_filepath.name,
                         )
 
@@ -3853,6 +3967,12 @@ class TTSProcessor:
                     year = _apply_tag_template("tag_year")
                     if year:
                         cmd.extend(["-metadata", f"date={year}"])
+
+                    if xiph_cover:
+                        cmd.extend([
+                            "-metadata",
+                            f"METADATA_BLOCK_PICTURE={xiph_cover}",
+                        ])
     
                 cmd.append(str(temp_out))
 
@@ -5484,6 +5604,9 @@ class TTSApp:
 
     def _refresh_status_colors(self):
         """Перекрашивает постоянные статусы, не меняя их текущий смысл."""
+        # Canvas не относится к ttk и сам не перечитывает фон после выбора
+        # нативной темы/смены системного appearance.
+        self._sync_export_basic_canvas_theme()
         if hasattr(self, "tree"):
             self.tree.tag_configure("queued", foreground=self.get_status_color("muted"))
             self.tree.tag_configure("success", foreground=self.get_status_color("success"))
@@ -5606,7 +5729,7 @@ class TTSApp:
         except Exception as exc:
             # Если недоступен даже portable-дефолт, не рушим построение GUI:
             # конкретная операция с диском позднее покажет штатную ошибку.
-            logging.error("Не удалось по��готовить рабочие папки: %s", exc)
+            logging.error("Не удалось подготовить рабочие папки: %s", exc)
         # Флажок direct-тегов является подтверждением только для текущего
         # сеанса. Удаляем также значение, случайно сохранённое prerelease-
         # версиями, чтобы приложение всегда стартовало в безопасном режиме.
@@ -6626,7 +6749,7 @@ class TTSApp:
         self.cb_export_bitrate = ttk.Combobox(
             row2,
             textvariable=self.export_bitrate_var,
-            values=["auto", "48k", "64k", "96k", "128k", "192k", "256k", "320k"],
+            values=["auto", "32k", "48k", "64k", "96k", "128k", "192k", "256k", "320k"],
             width=6,
             state="readonly",
         )
@@ -6817,13 +6940,19 @@ class TTSApp:
         self.grp_notebook.add(self.grp_tab_basic, text="Основные")
         self.grp_notebook.add(self.grp_tab_tags, text="Теги")
 
-        # На невысоких экранах нижняя кнопка массового применения
-        # раньше обрезалась ноутбуком. Прокручиваем только эту компактную
-        # вкладку, не меняя геометрию дерева и всей панели сборки.
+        # На невысоких экранах нижняя кнопка массового применения раньше
+        # обрезалась ноутбуком. Прокручиваем только эту компактную вкладку,
+        # причём полосу показываем лишь при фактическом переполнении. Фон
+        # обычного Canvas явно синхронизируется с ttk, иначе на Aqua/в тёмной
+        # теме он выглядит как белое поле внутри системной панели.
+        canvas_background = ttk.Style(self.root).lookup("TFrame", "background")
+        if not canvas_background:
+            canvas_background = self.root.cget("background")
         self.grp_basic_canvas = tk.Canvas(
             self.grp_tab_basic,
             width=270,
             height=1,
+            background=canvas_background,
             highlightthickness=0,
             borderwidth=0,
             takefocus=False,
@@ -6833,27 +6962,23 @@ class TTSApp:
             orient=tk.VERTICAL,
             command=self.grp_basic_canvas.yview,
         )
+        self._grp_basic_scrollbar_visible = False
         self.grp_basic_canvas.configure(
-            yscrollcommand=self.grp_basic_scrollbar.set
+            yscrollcommand=self._set_export_basic_scrollbar
         )
-        self.grp_basic_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.grp_basic_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.grp_basic_content = ttk.Frame(self.grp_basic_canvas, padding=5)
-        grp_basic_window = self.grp_basic_canvas.create_window(
+        self._grp_basic_window = self.grp_basic_canvas.create_window(
             (0, 0), window=self.grp_basic_content, anchor="nw"
         )
         self.grp_basic_content.bind(
             "<Configure>",
-            lambda _event: self.grp_basic_canvas.configure(
-                scrollregion=self.grp_basic_canvas.bbox("all")
-            ),
+            self._update_export_basic_scroll_region,
         )
         self.grp_basic_canvas.bind(
             "<Configure>",
-            lambda event: self.grp_basic_canvas.itemconfigure(
-                grp_basic_window, width=event.width
-            ),
+            self._resize_export_basic_content,
         )
 
         self.lbl_grp_name = ttk.Label(self.grp_basic_content, text="Имя группы / Название трека:")
@@ -6953,6 +7078,59 @@ class TTSApp:
         self._disable_export_settings()
         
     # --- Логика интерфейса Сборщика ---
+    def _sync_export_basic_canvas_theme(self):
+        """Убирает нетематический фон Canvas внутри ttk-вкладки."""
+        canvas = getattr(self, "grp_basic_canvas", None)
+        if canvas is None:
+            return
+        try:
+            background = ttk.Style(self.root).lookup("TFrame", "background")
+            if not background:
+                background = self.root.cget("background")
+            canvas.configure(background=background)
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _set_export_basic_scrollbar(self, first, last):
+        """Автоматически показывает полосу только для прокручиваемого вида."""
+        try:
+            first_value = float(first)
+            last_value = float(last)
+        except (TypeError, ValueError):
+            first_value, last_value = 0.0, 1.0
+
+        self.grp_basic_scrollbar.set(first, last)
+        overflow = first_value > 0.0 or last_value < 1.0
+        visible = bool(
+            getattr(self, "_grp_basic_scrollbar_visible", False)
+        )
+        if overflow and not visible:
+            # ``before`` сохраняет правильный порядок pack: полоса получает
+            # свою узкую полосу справа, а Canvas занимает остаток.
+            self.grp_basic_scrollbar.pack(
+                side=tk.RIGHT,
+                fill=tk.Y,
+                before=self.grp_basic_canvas,
+            )
+            self._grp_basic_scrollbar_visible = True
+        elif not overflow and visible:
+            self.grp_basic_scrollbar.pack_forget()
+            self._grp_basic_scrollbar_visible = False
+            self.grp_basic_canvas.yview_moveto(0)
+
+    def _update_export_basic_scroll_region(self, _event=None):
+        """Пересчитывает реальную область после изменения размеров полей."""
+        bbox = self.grp_basic_canvas.bbox("all")
+        self.grp_basic_canvas.configure(scrollregion=bbox or (0, 0, 0, 0))
+
+    def _resize_export_basic_content(self, event):
+        """Растягивает ttk-содержимое по ширине видимой части Canvas."""
+        self.grp_basic_canvas.itemconfigure(
+            self._grp_basic_window,
+            width=max(1, event.width),
+        )
+        self._update_export_basic_scroll_region()
+
     def _bind_export_basic_scroll_events(self, widget):
         """Делает колесо доступным над всеми дочерними полями."""
         for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
@@ -6966,6 +7144,8 @@ class TTSApp:
 
     def _scroll_export_basic_settings(self, event):
         """Прокручивает компактную вкладку основных настроек группы."""
+        if not getattr(self, "_grp_basic_scrollbar_visible", False):
+            return None
         event_num = getattr(event, "num", None)
         event_delta = getattr(event, "delta", 0)
         if event_num == 4:
@@ -7587,7 +7767,19 @@ class TTSApp:
             out = subprocess.check_output(cmd, startupinfo=startupinfo).decode('utf-8', errors='ignore')
             data = json.loads(out)
             
-            tags = {k.lower(): v for k, v in data.get("format", {}).get("tags", {}).items()}
+            # MP3 обычно показывает теги на уровне контейнера, тогда как Ogg
+            # Vorbis/Opus FFmpeg возвращает VorbisComment/OpusTags у аудио-
+            # потока. Читаем оба места, иначе при повторном импорте Opus в UI
+            # визуально пропадали Album и другие уже записанные поля.
+            tags = {
+                k.lower(): v
+                for k, v in data.get("format", {}).get("tags", {}).items()
+            }
+            for stream in data.get("streams", []):
+                if stream.get("codec_type") != "audio":
+                    continue
+                for key, value in stream.get("tags", {}).items():
+                    tags.setdefault(key.lower(), value)
             duration = float(data.get("format", {}).get("duration", 0.0))
             
             cover_path = ""
@@ -7795,6 +7987,25 @@ class TTSApp:
         self.btn_export_stop.config(state=tk.DISABLED)
         self._set_status_label(self.lbl_export_status, "Остановка сборки (ожидание завершения текущего файла)...", "warning")
 
+    def _finish_export_process_ui(self, outcome):
+        """Возвращает UI сборщика в устойчивое состояние после worker-потока.
+
+        При штатной пользовательской остановке worker сперва ставит в UI-очередь
+        модальное сообщение и лишь затем этот callback, поэтому сброс виден
+        после закрытия сообщения. Успех, частичный успех и реальная ошибка
+        сохраняют свои финальные статус и прогресс для диагностики.
+        """
+        self._export_thread = None
+        self._set_export_running_state(False)
+        if outcome == "stopped":
+            self.export_progress.configure(value=0)
+            self._set_status_label(
+                self.lbl_export_status,
+                "Ожидание...",
+                "info",
+            )
+        self.is_export_stopped = False
+
     def _update_file_tags_inplace(self, fp, f_tags, cov, title_for_status):
         """Обновляет теги файла прямо в его исходной папке на диске без конвертации"""
         self._post_status_label(
@@ -7814,6 +8025,11 @@ class TTSApp:
 
         ext = source_path.suffix.lower()
         cover_supported = ext == ".mp3"
+        xiph_cover = (
+            _xiph_cover_metadata(cov, source_path.name)
+            if ext == ".opus"
+            else None
+        )
         if cov and os.path.isfile(cov) and cover_supported:
             # Явные map исключают перенос старой обложки вместе с новой.
             cmd.extend([
@@ -7824,11 +8040,22 @@ class TTSApp:
                 "-metadata:s:v", "comment=Cover (front)",
             ])
         else:
-            # Не копируем attached_pic автоматически: OGG/WAV не принимают
-            # JPEG/PNG как видеопоток, а старую MP3-обложку при изменении тегов
-            # безопаснее сохранить только когда новая не запрошена.
-            cmd.extend(["-map", "0", "-c", "copy"])
-            if cov and os.path.isfile(cov) and not cover_supported:
+            # Входной виртуальный attached_pic у Xiph-файла является
+            # представлением METADATA_BLOCK_PICTURE. При новой обложке явно
+            # копируем лишь аудио, чтобы старый picture block не задублировался.
+            if ext == ".opus":
+                # FFmpeg exposes METADATA_BLOCK_PICTURE as a virtual video
+                # stream which the Opus muxer cannot copy back. Always select
+                # only the real audio stream, then write the new comment below.
+                cmd.extend(["-map", "0:a:0", "-c:a", "copy"])
+            else:
+                cmd.extend(["-map", "0", "-c", "copy"])
+            if (
+                cov
+                and os.path.isfile(cov)
+                and not cover_supported
+                and ext != ".opus"
+            ):
                 logging.warning(
                     "Обложка пропущена при обновлении тегов %s: формат %s "
                     "не поддерживает attached picture этим способом.",
@@ -7842,6 +8069,10 @@ class TTSApp:
         if f_tags:
             for k, v in f_tags.items():
                 if v: cmd.extend(["-metadata", f"{k}={v}"])
+        if xiph_cover:
+            cmd.extend([
+                "-metadata", f"METADATA_BLOCK_PICTURE={xiph_cover}"
+            ])
 
         cmd.append(str(temp_file))
 
@@ -8036,6 +8267,7 @@ class TTSApp:
         self.is_export_stopped = False
         
         def run_export():
+            outcome = "running"
             try:
                 total_files = len(export_files)
                 processed_files = 0
@@ -8263,10 +8495,12 @@ class TTSApp:
                             self._post_to_ui(self.export_progress.config, value=pct)
 
                 if self.is_export_stopped:
+                    outcome = "stopped"
                     self._post_status_label(self.lbl_export_status, "Сборка прервана!", "error")
                     self._post_to_ui(self._show_warning, "Остановлено", "Процесс сборки был прерван пользователем.")
                 else:
                     if failed_files:
+                        outcome = "warning"
                         msg = (
                             f"Обработка завершена с ошибками: {failed_files}.\n"
                             "Подробности записаны в журнал."
@@ -8276,6 +8510,7 @@ class TTSApp:
                         )
                         self._post_to_ui(self._show_warning, "Готово", msg)
                     else:
+                        outcome = "success"
                         msg = "Теги успешно обновлены в исходных файлах!" if tags_only else f"Сборка успешно завершена!\nСохранено в: {out_dir}"
                         self._post_status_label(self.lbl_export_status, "Готово!", "success")
                         self._post_to_ui(self._show_info, "Успех", msg)
@@ -8283,6 +8518,7 @@ class TTSApp:
             except InterruptedError:
                 # Отмена потоковой FFmpeg-склейки является штатным исходом:
                 # helper уже завершил дочерний процесс и удалил временный файл.
+                outcome = "stopped"
                 self.is_export_stopped = True
                 self._post_status_label(
                     self.lbl_export_status, "Сборка прервана!", "warning"
@@ -8293,15 +8529,13 @@ class TTSApp:
                     "Процесс сборки был прерван пользователем.",
                 )
             except Exception as e:
+                outcome = "error"
                 logging.exception("Ошибка сборки")
                 error_message = f"Произошла ошибка при сборке:\n{e}"
                 self._post_status_label(self.lbl_export_status, "Ошибка!", "error")
                 self._post_to_ui(self._show_error, "Ошибка", error_message)
             finally:
-                def finish_export_ui():
-                    self._export_thread = None
-                    self._set_export_running_state(False)
-                self._post_to_ui(finish_export_ui)
+                self._post_to_ui(self._finish_export_process_ui, outcome)
 
         self._export_thread = threading.Thread(target=run_export, daemon=True)
         try:
@@ -8649,7 +8883,7 @@ class TTSApp:
             "Битрейт (для mp3/opus):",
             "output_bitrate",
             2,
-            ["64k", "128k", "192k", "256k", "320k"],
+            ["32k", "48k", "64k", "128k", "192k", "256k", "320k"],
         )
         ttk.Separator(tab_output, orient=tk.HORIZONTAL).grid(row=3, column=0, columnspan=2, sticky="ew", pady=10)
         ttk.Label(tab_output, text="Теги (для mp3/ogg/opus):").grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=5)
@@ -10458,13 +10692,13 @@ class TTSApp:
 • Перепаковка и Разгруппировка: Выделите файлы и используйте кнопки "📦 В новую группу" или "📤 Разгруппировать" (кнопка перенесена на верхнюю панель для удобства).
 • Массовое применение настроек: Кнопка "⚙️ Применить ко всем группам..." открывает диалог, позволяющий в 1 клик применить параметры склейки, подпапок, пауз ко всем томам и сохранить их по умолчанию.
 • Склеивание в один трек: Склеивает все файлы группы в один большой аудиофайл с настройкой паузы между ними (в мс).
-• Потоковая склейка длинных групп: MP3/WAV/OGG декодируются и объединяются самим FFmpeg без общего PCM-буфера Pydub и промежуточного RIFF. Поэтому книга не упирается в 4-ГиБ заголовок WAV; для очень большого результата WAV FFmpeg автоматически использует RF64.
-• Профиль результата: Поля «Битрейт», «Частота» и «Каналы» относятся только к этой вкладке, сохраняются в настройках и одинаково применяются к одиночному файлу, несклеенной группе и общей дорожке. Режим «Авто» (в настройках — auto) сохраняет исходные параметры одиночного файла или однородной группы; для смешанной группы выбирает максимальную частоту и stereo при наличии многоканального входа, а при неизвестном профиле использует безопасные 48 кГц stereo. Явные частота и каналы поддерживаются MP3, OGG, Opus и WAV в пределах возможностей кодека. Битрейт применяется только к MP3/OGG/Opus; для WAV PCM он отключён и не применяется. OGG остаётся совместимым Ogg/Vorbis (.ogg), а отдельный Ogg/Opus (.opus) создаёт тот же Ogg-контейнер с рекомендованным для Opus расширением. При необходимости файл .opus можно вручную переименовать в .ogg без перекодирования, но приложение не предлагает этот менее совместимый вариант. В «Авто» MP3 получает ближайшую поддерживаемую libmp3lame частоту (не выше 48 кГц); явная неподдерживаемая частота не подменяется. OGG/Vorbis сохраняет 88,2/96 кГц только при битрейте «Авто» в quality/VBR-режиме; Opus поддерживает 8/12/16/24/48 кГц. Несовместимые явные сочетания низкой частоты, mono и высокого битрейта блокируются с объяснением; в «Авто» сохраняются частота и каналы, но несовместимый битрейт не наследуется. Пауза вставляется до общего эффекта скорости и изменяется вместе со всей дорожкой только один раз.
+• Потоковая склейка длинных групп: MP3/WAV/OGG/Opus декодируются и объединяются самим FFmpeg без общего PCM-буфера Pydub и промежуточного RIFF. Поэтому книга не упирается в 4-ГиБ заголовок WAV; для очень большого результата WAV FFmpeg автоматически использует RF64.
+• Профиль результата: Поля «Битрейт», «Частота» и «Каналы» относятся только к этой вкладке, сохраняются в настройках и одинаково применяются к одиночному файлу, несклеенной группе и общей дорожке. Режим «Авто» (в настройках — auto) предсказуемо сохраняет исходные параметры одиночного файла или однородной группы, включая известный общий битрейт: MP3 128 кбит/с при выводе в Opus останется 128 кбит/с, поэтому результат не обязан быть меньше простой MP3-склейки. Для сжатия речевой книги явно выберите Opus 48 кбит/с или 32 кбит/с (меньше размер, но выше потеря качества). Для смешанной группы «Авто» выбирает максимальную частоту и stereo при наличии многоканального входа, а при неизвестном профиле использует безопасные 48 кГц stereo. Явные частота и каналы поддерживаются MP3, OGG, Opus и WAV в пределах возможностей кодека. Битрейт применяется только к MP3/OGG/Opus; для WAV PCM он отключён и не применяется. OGG остаётся совместимым Ogg/Vorbis (.ogg), а отдельный Ogg/Opus (.opus) создаёт тот же Ogg-контейнер с рекомендованным для Opus расширением. При необходимости файл .opus можно вручную переименовать в .ogg без перекодирования, но приложение не предлагает этот менее совместимый вариант. В «Авто» MP3 получает ближайшую поддерживаемую libmp3lame частоту (не выше 48 кГц); явная неподдерживаемая частота не подменяется. OGG/Vorbis сохраняет 88,2/96 кГц только при битрейте «Авто» в quality/VBR-режиме; Opus поддерживает 8/12/16/24/48 кГц. Несовместимые явные сочетания низкой частоты, mono и высокого битрейта блокируются с объяснением; в «Авто» сохраняются частота и каналы, но несовместимый битрейт не наследуется. Пауза вставляется до общего эффекта скорости и изменяется вместе со всей дорожкой только один раз.
 • Наследование тегов при склейке: Если поля ID3 группы не заполнены, исполнитель, альбом, исполнитель альбома, жанр, композитор, год и обложка берутся из первого файла группы. Явно заданные значения группы имеют приоритет, а имя итогового файла и тег Title формируются из имени группы.
 • Авто-разбивка по времени: Работает как с уже созданными группами, так и только с файлами в корне. Нумерация адаптируется к последнему отображаемому номеру.
 • Безопасность сборки: Пока экспорт активен, дерево, перегруппировка и настройки блокируются. Перед стартом проверяются исчезнувшие исходники и совпадающие выходные имена.
-• [x] Только обновить теги (In-place tagging): Метаданные меняются без перекодирования аудио. Новая JPEG/PNG-обложка встраивается для MP3; для WAV/OGG она пропускается с записью в журнал вместо ошибки FFmpeg.
-• Редактор ID3-тегов и Обложек: Установка метаданных и автоматическое извлечение обложек из файлов через ffprobe. «Сохранять в подпапку» доступно только если группа не склеивается.
+• [x] Только обновить теги (In-place tagging): Метаданные меняются без перекодирования аудио. Новая JPEG/PNG-обложка встраивается для MP3 как ID3v2.3/APIC, для Opus — как METADATA_BLOCK_PICTURE; для OGG-Vorbis и WAV она пропускается с записью в журнал вместо ошибки FFmpeg.
+• Редактор тегов и Обложек: Название, исполнитель, альбом, исполнитель альбома, жанр, композитор и год сохраняются в MP3, OGG и Opus. Обложка Opus записывается штатным комментарием без отдельного opusenc. «Сохранять в подпапку» доступно только если группа не склеивается.
 • Умная сетка применения тегов (2х2):
   - [⬇ К файлам группы]: Копирует теги текущей группы на все входящие в нее файлы.
   - [⬆ В род. группу]: Копирует теги с выделенного файла на его родительскую группу.
