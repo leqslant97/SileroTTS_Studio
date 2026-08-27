@@ -7,11 +7,13 @@ Silero TTS Studio - Профессиональная среда для гене�
 import os
 import re
 import json
+import copy
 import time
 import uuid
 import base64
 import hashlib
 import struct
+import math
 import threading
 import logging
 import requests
@@ -25,7 +27,7 @@ import unicodedata
 import queue
 import concurrent.futures
 import warnings
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # === КРОССПЛАТФОРМЕННЫЙ ЗАПУСК ДОЧЕРНИХ ПРОЦЕССОВ ===
 # Pydub импортирует Popen двумя способами: через модуль subprocess и напрямую
@@ -141,9 +143,14 @@ except Exception as exc:
     IMPORT_LIBS_ERROR = exc
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, font as tkfont
 from collections import deque
 from razdel import sentenize
+
+APP_VERSION = "1.5.0"
+# Публичный релиз ветки с нулевым patch называется короче: v1.5. Внутренняя
+# трёхкомпонентная версия остаётся нужна метаданным Windows/macOS.
+APP_PUBLIC_VERSION = APP_VERSION.removesuffix(".0")
 
 # Для воспроизведения аудио на Windows
 if platform.system() == "Windows":
@@ -355,6 +362,477 @@ def _config_bool(value, default=False):
     return bool(value)
 
 
+GLOSSARY_SECTION_DEFAULTS = {
+    "accents_ignore_case": [],
+    "accents_strict_case": [],
+    "terms_ignore_case": {},
+    "terms_strict_case": {},
+    "regex_rules": [],
+}
+
+
+def empty_glossary_data():
+    """Возвращает новый пустой глоссарий без общих изменяемых значений."""
+    return copy.deepcopy(GLOSSARY_SECTION_DEFAULTS)
+
+
+def canonicalize_glossary_data(data, *, strict=True):
+    """Проверяет переносимый JSON глоссария и дополняет пустые секции.
+
+    Неизвестные корневые поля сохраняются для прямой совместимости с будущими
+    версиями. В пользовательских операциях используется строгий режим с
+    понятной ошибкой; мягкий режим пригоден только для восстановления данных.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("корень глоссария должен быть JSON-объектом")
+
+    result = copy.deepcopy(data)
+
+    def invalid(message, fallback):
+        if strict:
+            raise ValueError(message)
+        return copy.deepcopy(fallback)
+
+    for key in ("accents_ignore_case", "accents_strict_case"):
+        values = result.get(key, [])
+        if not isinstance(values, list):
+            values = invalid(f"секция {key} должна быть JSON-массивом", [])
+        cleaned = []
+        for index, value in enumerate(values):
+            if not isinstance(value, str) or not value.strip():
+                if strict:
+                    raise ValueError(
+                        f"{key}[{index}] должен быть непустой строкой"
+                    )
+                continue
+            cleaned.append(value)
+        result[key] = cleaned
+
+    for key in ("terms_ignore_case", "terms_strict_case"):
+        values = result.get(key, {})
+        if not isinstance(values, dict):
+            values = invalid(f"секция {key} должна быть JSON-объектом", {})
+        cleaned = {}
+        for source, value in values.items():
+            if not isinstance(source, str) or not source.strip():
+                if strict:
+                    raise ValueError(
+                        f"ключи секции {key} должны быть непустыми строками"
+                    )
+                continue
+            if isinstance(value, dict):
+                for flag in ("verbatim", "whole_word"):
+                    if flag in value and not isinstance(value[flag], (bool, str, int)):
+                        if strict:
+                            raise ValueError(
+                                f"{key}.{source}.{flag} должен быть логическим значением"
+                            )
+                replacement = value.get(
+                    "replacement", value.get("repl", value.get("value", ""))
+                )
+                if isinstance(replacement, (dict, list)):
+                    if strict:
+                        raise ValueError(
+                            f"замена для {key}.{source} должна быть строкой"
+                        )
+                    continue
+            elif isinstance(value, (list, tuple)):
+                if strict:
+                    raise ValueError(
+                        f"замена для {key}.{source} должна быть строкой или объектом"
+                    )
+                continue
+            cleaned[source] = copy.deepcopy(value)
+        result[key] = cleaned
+
+    rules = result.get("regex_rules", [])
+    if not isinstance(rules, list):
+        rules = invalid("секция regex_rules должна быть JSON-массивом", [])
+    cleaned_rules = []
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            if strict:
+                raise ValueError(f"regex_rules[{index}] должен быть JSON-объектом")
+            continue
+        pattern = rule.get("pattern") or rule.get("regex")
+        if not isinstance(pattern, str) or not pattern:
+            if strict:
+                raise ValueError(
+                    f"regex_rules[{index}] должен содержать непустой pattern"
+                )
+            continue
+        replacement = rule.get("repl", "")
+        if isinstance(replacement, (dict, list)):
+            if strict:
+                raise ValueError(f"regex_rules[{index}].repl должен быть строкой")
+            continue
+        try:
+            re.compile(pattern, re.MULTILINE)
+        except re.error as exc:
+            if strict:
+                raise ValueError(
+                    f"ошибка в regex_rules[{index}] ({pattern}): {exc}"
+                ) from exc
+            continue
+        cleaned_rules.append(copy.deepcopy(rule))
+    result["regex_rules"] = cleaned_rules
+
+    for key, default in GLOSSARY_SECTION_DEFAULTS.items():
+        result.setdefault(key, copy.deepcopy(default))
+    return result
+
+
+def glossary_term_spec(value):
+    """Читает legacy-строку либо расширенное правило термина v1.5.
+
+    Старые ``"исходное": "замена"`` продолжают работать байт-в-байт.
+    Объект добавляет два необязательных свойства: ``verbatim`` защищает
+    замену от нормализатора и финальной очистки, а ``whole_word=false``
+    разрешает совпадение внутри слова. По умолчанию границы слова сохраняются.
+    """
+    if not isinstance(value, dict):
+        return {
+            "replacement": str(value if value is not None else ""),
+            "verbatim": False,
+            "whole_word": True,
+        }
+
+    replacement = value.get("replacement")
+    if replacement is None:
+        replacement = value.get("repl")
+    if replacement is None:
+        replacement = value.get("value", "")
+
+    match_mode = str(value.get("match", "")).strip().lower()
+    if match_mode in {"substring", "part", "inside"}:
+        whole_word = False
+    elif match_mode in {"word", "whole", "whole_word"}:
+        whole_word = True
+    else:
+        whole_word = _config_bool(value.get("whole_word"), default=True)
+
+    return {
+        "replacement": str(replacement if replacement is not None else ""),
+        "verbatim": _config_bool(value.get("verbatim"), default=False),
+        "whole_word": whole_word,
+    }
+
+
+def make_glossary_term_value(replacement, *, verbatim=False, whole_word=True):
+    """Сохраняет простой legacy-вид, пока расширенные флаги не нужны."""
+    replacement = str(replacement if replacement is not None else "")
+    if not verbatim and whole_word:
+        return replacement
+    return {
+        "replacement": replacement,
+        "verbatim": bool(verbatim),
+        "whole_word": bool(whole_word),
+    }
+
+
+class _VerbatimText(str):
+    """Точная замена вместе с исходным фрагментом для контекстного прохода.
+
+    Строковый подкласс оставляет прежний внутренний контракт сегментов:
+    существующий код может объединять и показывать значение как обычный
+    ``str``. Дополнительное поле нужно только нормализатору — сначала он видит
+    исходный термин и сохраняет грамматический контекст, а точная замена
+    возвращается уже после его обработки.
+    """
+
+    def __new__(cls, replacement, source):
+        value = super().__new__(cls, str(replacement))
+        value.source = str(source)
+        return value
+
+
+def _stable_unique(values, *, ignore_case=False):
+    if not isinstance(values, (list, tuple)):
+        return []
+    result = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        key = value.casefold() if ignore_case else value
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+def merge_glossary_data(
+    current,
+    imported,
+    selected_sections=("accents", "terms", "regex"),
+    *,
+    replace_existing=False,
+):
+    """Объединяет переносимый глоссарий, не затирая правила по умолчанию.
+
+    Централизованный набор исправлений можно импортировать поверх личного
+    файла: при конфликте сохраняется уже существующее правило. Явный режим
+    ``replace_existing`` оставляет прежнюю возможность заменить его импортом.
+    Возвращаемая статистика используется диалогом и тестами.
+    """
+    if not isinstance(current, dict) or not isinstance(imported, dict):
+        raise ValueError("корень глоссария должен быть JSON-объектом")
+
+    merged = copy.deepcopy(current)
+    selected = set(selected_sections)
+    stats = {"added": 0, "replaced": 0, "kept": 0, "duplicates": 0}
+
+    if "accents" in selected:
+        for key, ignore_case in (
+            ("accents_ignore_case", True),
+            ("accents_strict_case", False),
+        ):
+            existing = _stable_unique(merged.get(key, []), ignore_case=ignore_case)
+            seen = {
+                value.casefold() if ignore_case else value for value in existing
+            }
+            imported_values = imported.get(key, [])
+            if not isinstance(imported_values, (list, tuple)):
+                imported_values = []
+            for value in imported_values:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                identity = value.casefold() if ignore_case else value
+                if identity in seen:
+                    stats["duplicates"] += 1
+                    continue
+                existing.append(value)
+                seen.add(identity)
+                stats["added"] += 1
+            merged[key] = existing
+
+    if "terms" in selected:
+        for key, ignore_case in (
+            ("terms_ignore_case", True),
+            ("terms_strict_case", False),
+        ):
+            existing = merged.get(key, {})
+            if not isinstance(existing, dict):
+                existing = {}
+            else:
+                existing = copy.deepcopy(existing)
+            identities = {
+                (term.casefold() if ignore_case else term): term
+                for term in existing
+                if isinstance(term, str)
+            }
+            incoming = imported.get(key, {})
+            if not isinstance(incoming, dict):
+                incoming = {}
+            for term, value in incoming.items():
+                if not isinstance(term, str) or not term.strip():
+                    continue
+                identity = term.casefold() if ignore_case else term
+                previous_key = identities.get(identity)
+                if previous_key is None:
+                    existing[term] = copy.deepcopy(value)
+                    identities[identity] = term
+                    stats["added"] += 1
+                elif replace_existing:
+                    existing[previous_key] = copy.deepcopy(value)
+                    stats["replaced"] += 1
+                else:
+                    stats["kept"] += 1
+            merged[key] = existing
+
+    if "regex" in selected:
+        existing = merged.get("regex_rules", [])
+        existing = copy.deepcopy(existing) if isinstance(existing, list) else []
+        pattern_positions = {}
+        for index, rule in enumerate(existing):
+            if not isinstance(rule, dict):
+                continue
+            pattern = rule.get("pattern") or rule.get("regex")
+            if isinstance(pattern, str) and pattern not in pattern_positions:
+                pattern_positions[pattern] = index
+        incoming = imported.get("regex_rules", [])
+        if not isinstance(incoming, list):
+            incoming = []
+        for rule in incoming:
+            if not isinstance(rule, dict):
+                continue
+            pattern = rule.get("pattern") or rule.get("regex")
+            if not isinstance(pattern, str) or not pattern:
+                continue
+            previous_index = pattern_positions.get(pattern)
+            if previous_index is None:
+                pattern_positions[pattern] = len(existing)
+                existing.append(copy.deepcopy(rule))
+                stats["added"] += 1
+            elif replace_existing:
+                existing[previous_index] = copy.deepcopy(rule)
+                stats["replaced"] += 1
+            else:
+                stats["kept"] += 1
+        merged["regex_rules"] = existing
+
+    for key, default in GLOSSARY_SECTION_DEFAULTS.items():
+        merged.setdefault(key, copy.deepcopy(default))
+    return merged, stats
+
+
+def glossary_shadowed_accent_rules(data):
+    """Находит ударения, которые перекрываются термином того же регистра.
+
+    Исторически правило термина имеет приоритет над ударением с тем же
+    исходным словом. Сохраняем это совместимое поведение, но возвращаем
+    точные ключи для предупреждений и менеджера правил вместо молчаливого
+    исчезновения ударения во время компиляции.
+    """
+    normalized = canonicalize_glossary_data(data)
+    conflicts = []
+    for accent_section, term_section, ignore_case in (
+        ("accents_ignore_case", "terms_ignore_case", True),
+        ("accents_strict_case", "terms_strict_case", False),
+    ):
+        terms = {}
+        for term in normalized[term_section]:
+            identity = term.lower() if ignore_case else term
+            terms.setdefault(identity, term)
+        for index, accent in enumerate(normalized[accent_section]):
+            source = accent.replace("+", "")
+            identity = source.lower() if ignore_case else source
+            term = terms.get(identity)
+            if term is not None:
+                conflicts.append(
+                    {
+                        "key": (accent_section, index),
+                        "accent": accent,
+                        "term": term,
+                        "ignore_case": ignore_case,
+                    }
+                )
+    return tuple(conflicts)
+
+
+def glossary_rule_records(data):
+    """Возвращает стабильные записи для менеджера глоссария.
+
+    ``key`` указывает на точное место правила в JSON. Индексы
+    нужны для списков: одинаковые RegEx или ударения всё ещё
+    можно удалить по одному, не затрагивая соседние дубли.
+    """
+    normalized = canonicalize_glossary_data(data)
+    records = []
+    shadowed_accents = {
+        conflict["key"] for conflict in glossary_shadowed_accent_rules(normalized)
+    }
+
+    for section, strict_case in (
+        ("accents_ignore_case", False),
+        ("accents_strict_case", True),
+    ):
+        for index, source in enumerate(normalized[section]):
+            flags = "регистр: строгий" if strict_case else "регистр: любой"
+            if (section, index) in shadowed_accents:
+                flags += ", не применяется: приоритет термина"
+            records.append(
+                {
+                    "key": (section, index),
+                    "group": "accents",
+                    "kind": "Ударение",
+                    "source": source,
+                    "replacement": "",
+                    "flags": flags,
+                }
+            )
+
+    for section, strict_case in (
+        ("terms_ignore_case", False),
+        ("terms_strict_case", True),
+    ):
+        for source, value in normalized[section].items():
+            spec = glossary_term_spec(value)
+            flags = [
+                "регистр: строгий" if strict_case else "регистр: любой",
+                "слово целиком" if spec["whole_word"] else "часть слова",
+            ]
+            if spec["verbatim"]:
+                flags.append("verbatim")
+            records.append(
+                {
+                    "key": (section, source),
+                    "group": "terms",
+                    "kind": "Термин",
+                    "source": source,
+                    "replacement": spec["replacement"],
+                    "flags": ", ".join(flags),
+                }
+            )
+
+    for index, rule in enumerate(normalized["regex_rules"]):
+        records.append(
+            {
+                "key": ("regex_rules", index),
+                "group": "regex",
+                "kind": "RegEx",
+                "source": str(rule.get("pattern") or rule.get("regex") or ""),
+                "replacement": str(rule.get("repl", "")),
+                "flags": "verbatim" if _config_bool(rule.get("verbatim")) else "обычное",
+            }
+        )
+
+    for record in records:
+        record["search_text"] = " ".join(
+            str(record[field])
+            for field in ("kind", "source", "replacement", "flags")
+        ).casefold()
+    return tuple(records)
+
+
+def remove_glossary_rules(data, rule_keys):
+    """Удаляет точно выбранные правила и сохраняет будущие поля JSON."""
+    result = canonicalize_glossary_data(data)
+    selected = {
+        tuple(key)
+        for key in rule_keys
+        if isinstance(key, (list, tuple)) and len(key) == 2
+    }
+    removed = 0
+
+    for section in ("accents_ignore_case", "accents_strict_case"):
+        previous = result[section]
+        result[section] = [
+            value
+            for index, value in enumerate(previous)
+            if (section, index) not in selected
+        ]
+        removed += len(previous) - len(result[section])
+
+    for section in ("terms_ignore_case", "terms_strict_case"):
+        previous = result[section]
+        result[section] = {
+            source: value
+            for source, value in previous.items()
+            if (section, source) not in selected
+        }
+        removed += len(previous) - len(result[section])
+
+    previous_regex = result["regex_rules"]
+    result["regex_rules"] = [
+        rule
+        for index, rule in enumerate(previous_regex)
+        if ("regex_rules", index) not in selected
+    ]
+    removed += len(previous_regex) - len(result["regex_rules"])
+    return result, removed
+
+
+def clear_glossary_rules(data):
+    """Очищает все известные секции, но не стирает будущие корневые поля."""
+    result = canonicalize_glossary_data(data)
+    removed = len(glossary_rule_records(result))
+    for section, default in GLOSSARY_SECTION_DEFAULTS.items():
+        result[section] = copy.deepcopy(default)
+    return result, removed
+
+
 def paragraph_starts_with_speech(text):
     """Распознаёт абзац-реплику по тире либо открывающей кавычке."""
     value = str(text or "").lstrip()
@@ -436,6 +914,57 @@ def format_sequence_number(number, total_count, start_index=1):
     return str(number).zfill(width)
 
 
+def next_sequence_name(template, existing_names):
+    """Возвращает первое свободное имя, сохраняя разрядность серии.
+
+    Значения ``1`` и ``01`` считаются одним логическим номером. Параметр в
+    ``{num:N}`` остаётся стартовым номером, как и в шаблонах импорта книг.
+    """
+    template = str(template or "").strip() or "Группа {num}"
+    names = {str(name) for name in existing_names}
+    placeholder = re.compile(r"\{num(?::(\d+))?\}")
+    matches = list(placeholder.finditer(template))
+
+    if not matches:
+        if template not in names:
+            return template
+        suffix = 2
+        while f"{template} {suffix}" in names:
+            suffix += 1
+        return f"{template} {suffix}"
+
+    start_index = int(matches[0].group(1) or 1)
+    pattern_parts = ["^"]
+    cursor = 0
+    for index, match in enumerate(matches):
+        pattern_parts.append(re.escape(template[cursor:match.start()]))
+        pattern_parts.append(
+            r"(?P<number>\d+)" if index == 0 else r"(?P=number)"
+        )
+        cursor = match.end()
+    pattern_parts.extend((re.escape(template[cursor:]), "$"))
+    rendered_pattern = re.compile("".join(pattern_parts))
+
+    used_numbers = set()
+    existing_width = 1
+    for name in names:
+        rendered_match = rendered_pattern.fullmatch(name)
+        if rendered_match is None:
+            continue
+        number_text = rendered_match.group("number")
+        used_numbers.add(int(number_text))
+        existing_width = max(existing_width, len(number_text))
+
+    number = start_index
+    while True:
+        if number not in used_numbers:
+            width = max(existing_width, len(str(number)))
+            candidate = placeholder.sub(str(number).zfill(width), template)
+            if candidate not in names:
+                return candidate
+        number += 1
+
+
 def ordered_export_file_ids(root_items, group_children, file_ids):
     """Разворачивает корневые файлы и группы в текущем порядке дерева."""
     known_files = set(file_ids)
@@ -459,6 +988,70 @@ def ordered_export_file_ids(root_items, group_children, file_ids):
     for file_id in file_ids:
         add(file_id)
     return ordered
+
+
+def plan_export_merge(
+    root_items,
+    group_children,
+    selected_items,
+    group_ids,
+    file_ids,
+):
+    """Строит безопасный план слияния в видимом порядке дерева.
+
+    Первая выбранная по дереву группа становится целевой. Если
+    групп нет, GUI создаст новую. Выбор группы означает всех её
+    детей; отдельно выбранный ребёнок не дублируется.
+    """
+    roots = tuple(root_items)
+    children = {
+        group_id: tuple(items)
+        for group_id, items in dict(group_children).items()
+    }
+    selected_order = tuple(selected_items)
+    selected = set(selected_order)
+    known_groups = set(group_ids)
+    known_files = set(file_ids)
+    selected_groups = []
+    ordered_files = []
+    seen_files = set()
+
+    def add_file(file_id):
+        if file_id in known_files and file_id not in seen_files:
+            seen_files.add(file_id)
+            ordered_files.append(file_id)
+
+    def add_group(group_id):
+        if group_id not in selected_groups:
+            selected_groups.append(group_id)
+        for file_id in children.get(group_id, ()):
+            add_file(file_id)
+
+    for item_id in roots:
+        if item_id in known_groups:
+            if item_id in selected:
+                add_group(item_id)
+            else:
+                for file_id in children.get(item_id, ()):
+                    if file_id in selected:
+                        add_file(file_id)
+        elif item_id in selected:
+            add_file(item_id)
+
+    # Временно рассинхронизированная модель не должна терять
+    # выбр: сначала добавляем осиротевшие группы, затем файлы.
+    for item_id in selected_order:
+        if item_id in known_groups and item_id not in selected_groups:
+            add_group(item_id)
+    for item_id in selected_order:
+        add_file(item_id)
+
+    target_group = selected_groups[0] if selected_groups else None
+    return {
+        "target_group": target_group,
+        "source_groups": tuple(selected_groups[1:]),
+        "file_ids": tuple(ordered_files),
+    }
 
 
 def split_export_file_ids(ordered_file_ids, durations, limit_seconds):
@@ -560,6 +1153,66 @@ def sanitize_filename_component(value, fallback="Без названия", max_l
     return text or fallback_text[:max_length] or "_"
 
 
+def normalize_display_text(value, fallback="Без названия"):
+    """Готовит однострочную UI-подпись, не меняя исходные метаданные."""
+    text = unicodedata.normalize("NFC", str(value or ""))
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if text:
+        return text
+    fallback_text = unicodedata.normalize("NFC", str(fallback or "Без названия"))
+    fallback_text = re.sub(
+        r"[\x00-\x08\x0b-\x1f\x7f-\x9f]+", "", fallback_text
+    )
+    fallback_text = re.sub(r"\s+", " ", fallback_text).strip()
+    return fallback_text or "Без названия"
+
+
+def middle_ellipsize(value, max_chars=56, fallback="Без названия"):
+    """Сокращает длинную подпись посередине, сохраняя начало и окончание."""
+    text = normalize_display_text(value, fallback=fallback)
+    max_chars = max(1, int(max_chars))
+    if len(text) <= max_chars:
+        return text
+    if max_chars == 1:
+        return "…"
+    remaining = max_chars - 1
+    head_length = (remaining + 1) // 2
+    tail_length = remaining - head_length
+    if tail_length <= 0:
+        return text[:head_length] + "…"
+    return text[:head_length] + "…" + text[-tail_length:]
+
+
+def middle_ellipsize_to_width(value, max_width, measure, fallback="Без названия"):
+    """Сокращает подпись по фактической ширине текущего шрифта в пикселях."""
+    text = normalize_display_text(value, fallback=fallback)
+    max_width = max(0, int(max_width))
+    if measure(text) <= max_width:
+        return text
+    if measure("…") > max_width:
+        return ""
+
+    low, high = 1, len(text)
+    best = "…"
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = middle_ellipsize(text, max_chars=middle, fallback=fallback)
+        if measure(candidate) <= max_width:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def format_export_activity_status(action, subject, max_subject_chars=56):
+    """Формирует компактный однострочный статус экспортной вкладки."""
+    action = normalize_display_text(action, fallback="Обработка")
+    subject = middle_ellipsize(subject, max_chars=max_subject_chars)
+    return f"{action}: {subject}"
+
+
 def _config_group_rules_data():
     """Точные группы профиля; UI-история намеренно сюда не входит."""
     return {
@@ -583,13 +1236,21 @@ def _config_group_rules_data():
             "enable_cache_lru", "enable_cache_ttl", "cache_max_entries",
             "cache_ttl_hours", "skip_existing",
         },
+        "normalizer": {
+            "normalizer_enabled", "normalizer_mode", "normalizer_options",
+            "glossary_enabled", "auto_abbreviations", "auto_short_words",
+        },
         "effects": {
             "fx_speed", "fx_pitch", "fx_echo", "fx_echo_delay",
-            "fx_echo_decay",
+            "fx_echo_decay", "export_apply_fx", "export_fx_speed",
+            "export_fx_pitch", "export_fx_echo", "export_fx_echo_delay",
+            "export_fx_echo_decay",
         },
         "tags": {
-            "output_format", "output_bitrate", "export_bitrate",
-            "export_sample_rate", "export_channels", "synthesis_mode",
+            "output_format", "output_bitrate", "output_sample_rate",
+            "output_channels", "export_format", "export_bitrate",
+            "export_sample_rate", "export_channels", "audio_profiles",
+            "synthesis_mode",
             "tag_title", "tag_artist", "tag_album_artist", "tag_album",
             "tag_genre", "tag_composer", "tag_year", "tag_cover",
             "default_group_name",
@@ -612,7 +1273,7 @@ def select_config_values(config, selected_groups, *, include_api_token=True):
     for group_name in selected_groups:
         selected_keys.update(rules.get(group_name, ()))
     selected = {
-        key: value
+        key: copy.deepcopy(value)
         for key, value in config.items()
         if key in selected_keys
     }
@@ -629,14 +1290,23 @@ def merge_config_values(
     include_api_token=True,
 ):
     """Возвращает копию конфига с выбранными полями импортируемого профиля."""
+    selected_groups = tuple(selected_groups)
     merged = dict(current_config)
-    merged.update(
-        select_config_values(
-            imported_config,
-            selected_groups,
-            include_api_token=include_api_token,
-        )
+    selected = select_config_values(
+        imported_config,
+        selected_groups,
+        include_api_token=include_api_token,
     )
+    # До v1.5 output_format одновременно управлял книгой и универсальным
+    # экспортом. Та же миграция, что выполняется при загрузке settings.json,
+    # нужна и при выборочном импорте старого профиля в уже новый конфиг.
+    if (
+        "tags" in selected_groups
+        and "output_format" in selected
+        and "export_format" not in imported_config
+    ):
+        selected["export_format"] = copy.deepcopy(selected["output_format"])
+    merged.update(selected)
     return merged
 
 
@@ -919,7 +1589,7 @@ def read_cache_index_with_backup(cache_path):
         if not candidate.exists():
             continue
         try:
-            with open(candidate, "r", encoding="utf-8") as file:
+            with open(candidate, "r", encoding="utf-8-sig") as file:
                 return validate_cache_index(json.load(file)), candidate, errors
         except Exception as exc:
             errors.append((candidate, exc))
@@ -1428,6 +2098,8 @@ def _audio_profile_compatibility_error(
         return "Некорректный битрейт аудиопрофиля."
     bitrate_kbps = int(match.group(1))
 
+    if fmt == "mp3" and not 8 <= bitrate_kbps <= 320:
+        return "MP3 поддерживает битрейт от 8 до 320 кбит/с."
     if fmt == "mp3" and sample_rate <= 12000 and bitrate_kbps > 64:
         return (
             "MP3 с частотой 8–12 кГц поддерживает битрейт не выше "
@@ -1447,6 +2119,8 @@ def _audio_profile_compatibility_error(
         )
 
     if fmt == "ogg":
+        if not 32 <= bitrate_kbps <= 500:
+            return "OGG/Vorbis поддерживает битрейт от 32 до 500 кбит/с."
         if sample_rate > 48000:
             return (
                 "OGG/Vorbis 88,2/96 кГц доступен только с битрейтом "
@@ -1454,11 +2128,18 @@ def _audio_profile_compatibility_error(
                 "частоту не выше 48 кГц."
             )
         maximums = {
+            (8000, 1): 32,
+            (8000, 2): 64,
+            (12000, 1): 48,
+            (12000, 2): 96,
+            (16000, 1): 96,
+            (16000, 2): 192,
             (22050, 1): 64,
             (22050, 2): 128,
             (24000, 1): 64,
             (24000, 2): 128,
             (32000, 1): 128,
+            (32000, 2): 320,
             (44100, 1): 192,
             (48000, 1): 192,
         }
@@ -1472,6 +2153,70 @@ def _audio_profile_compatibility_error(
                 "или используйте режим «Авто»."
             )
     return None
+
+
+def _select_book_audio_profile(
+    output_format,
+    *,
+    sample_rate="auto",
+    channels="auto",
+    bitrate="128k",
+):
+    """Разрешает профиль финальной книги из канонического 48 kHz mono-кэша."""
+    output_format = str(output_format).strip().lower()
+    if output_format not in AUDIO_PROFILE_FORMATS:
+        raise ValueError("Выбран неподдерживаемый формат финальной книги.")
+
+    requested_rate = str(sample_rate).strip().lower()
+    selected_rate = (
+        CACHE_AUDIO_SAMPLE_RATE if requested_rate == "auto" else int(requested_rate)
+    )
+    if output_format == "mp3":
+        compatible = _mp3_compatible_sample_rate(selected_rate)
+        if requested_rate != "auto" and compatible != selected_rate:
+            raise ValueError(
+                "MP3/libmp3lame не поддерживает выбранную частоту. "
+                "Выберите не более 48 кГц либо режим «Авто»."
+            )
+        selected_rate = compatible
+    elif output_format == "opus":
+        compatible = _opus_compatible_sample_rate(selected_rate)
+        if requested_rate != "auto" and compatible != selected_rate:
+            raise ValueError(
+                "Opus поддерживает только 8, 12, 16, 24 и 48 кГц."
+            )
+        selected_rate = compatible
+
+    requested_channels = str(channels).strip().lower()
+    if requested_channels not in AUDIO_PROFILE_CHANNELS:
+        raise ValueError("Некорректный режим каналов финальной книги.")
+    selected_channels = 2 if requested_channels == "stereo" else 1
+
+    requested_bitrate = str(bitrate).strip().lower()
+    if output_format == "wav":
+        selected_bitrate = None
+    elif requested_bitrate == "auto":
+        selected_bitrate = {
+            "mp3": "128k",
+            "opus": "48k",
+            # Для Vorbis отсутствие -b:a оставляет штатный quality/VBR режим.
+            "ogg": None,
+        }[output_format]
+    else:
+        selected_bitrate = requested_bitrate
+    error = _audio_profile_compatibility_error(
+        output_format,
+        selected_rate,
+        selected_channels,
+        selected_bitrate,
+    )
+    if error:
+        raise ValueError(error)
+    return {
+        "sample_rate": selected_rate,
+        "channels": selected_channels,
+        "bitrate": selected_bitrate,
+    }
 
 
 def _select_merge_audio_profile(
@@ -1631,6 +2376,20 @@ def _ffmpeg_audio_effect_filters(
             f"aecho=0.8:0.8:{int(echo_delay)}:{float(echo_decay)}"
         )
     return filters
+
+
+def _validate_windows_command_length(command, *, system_name=None, limit=30000):
+    """Даёт понятную ошибку до CreateProcess при слишком длинной FFmpeg-команде."""
+    current_system = system_name or platform.system()
+    if current_system != "Windows":
+        return
+    rendered_length = len(subprocess.list2cmdline([str(part) for part in command]))
+    if rendered_length >= int(limit):
+        raise ValueError(
+            "Слишком много файлов или слишком длинные пути для одной сборки "
+            "в Windows. Разделите группу на несколько частей или сократите "
+            "пути к исходным файлам."
+        )
 
 
 def _export_merged_audio_ffmpeg(
@@ -1827,6 +2586,7 @@ def _export_merged_audio_ffmpeg(
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
     try:
+        _validate_windows_command_length(command)
         process = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
@@ -2443,7 +3203,944 @@ try:
     logging.info("ru-normalizr загружен.")
 except ImportError:
     logging.warning("ru-normalizr не найден. Нормализация пропущена.")
+    NormalizeOptions = None
+    Normalizer = None
     normalizer = None
+
+
+NORMALIZER_PROFILE_SCHEMA = "silero-tts-studio-normalizer-profile"
+NORMALIZER_PROFILE_VERSION = 1
+NORMALIZER_MODES = ("tts", "safe")
+NORMALIZER_BOOLEAN_OPTIONS = (
+    "enable_caps_normalization",
+    "enable_first_word_decap",
+    "remove_links",
+    "enable_url_normalization",
+    "enable_year_normalization",
+    "enable_roman_normalization",
+    "enable_dates_time_normalization",
+    "enable_numeral_normalization",
+    "enable_abbreviation_expansion",
+    "enable_contextual_abbreviation_expansion",
+    "enable_years_ago_expansion",
+    "enable_initials_expansion",
+    "enable_letter_abbreviation_expansion",
+    "enable_dictionary_normalization",
+    "enable_latinization",
+    "enable_latinization_stress_marks",
+)
+NORMALIZER_ENUM_OPTIONS = {
+    "initials_vowel_mode": ("single", "double"),
+    "initials_pause_mode": ("preserve", "comma"),
+    "latinization_backend": ("ipa", "dictionary"),
+}
+NORMALIZER_SEQUENCE_OPTIONS = (
+    "dictionary_include_files",
+    "dictionary_exclude_files",
+)
+
+_NORMALIZER_FALLBACK_DEFAULTS = {
+    "safe": {
+        "enable_caps_normalization": False,
+        "enable_first_word_decap": False,
+        "remove_links": False,
+        "enable_url_normalization": False,
+        "enable_year_normalization": True,
+        "enable_roman_normalization": True,
+        "enable_dates_time_normalization": True,
+        "enable_numeral_normalization": True,
+        "enable_abbreviation_expansion": True,
+        "enable_contextual_abbreviation_expansion": True,
+        "enable_years_ago_expansion": True,
+        "enable_initials_expansion": False,
+        "initials_vowel_mode": "single",
+        "initials_pause_mode": "preserve",
+        "enable_letter_abbreviation_expansion": False,
+        "enable_dictionary_normalization": True,
+        "enable_latinization": False,
+        "latinization_backend": "ipa",
+        "enable_latinization_stress_marks": False,
+    },
+    "tts": {
+        "enable_caps_normalization": True,
+        "enable_first_word_decap": True,
+        "remove_links": True,
+        "enable_url_normalization": True,
+        "enable_year_normalization": True,
+        "enable_roman_normalization": True,
+        "enable_dates_time_normalization": True,
+        "enable_numeral_normalization": True,
+        "enable_abbreviation_expansion": True,
+        "enable_contextual_abbreviation_expansion": True,
+        "enable_years_ago_expansion": True,
+        "enable_initials_expansion": True,
+        "initials_vowel_mode": "double",
+        "initials_pause_mode": "comma",
+        "enable_letter_abbreviation_expansion": True,
+        "enable_dictionary_normalization": True,
+        "enable_latinization": True,
+        "latinization_backend": "ipa",
+        "enable_latinization_stress_marks": False,
+    },
+}
+for _mode_defaults in _NORMALIZER_FALLBACK_DEFAULTS.values():
+    _mode_defaults.update(
+        {
+            "remove_links_ignore_interval": [1000, 2200],
+            "latin_dictionary_filename": "latinization_rules.dic",
+            "dictionary_include_files": [],
+            "dictionary_exclude_files": [],
+            "dictionaries_path": "",
+        }
+    )
+
+
+def normalizer_mode_defaults(mode="tts"):
+    """Возвращает JSON-совместимые значения профиля ru-normalizr 0.3.x."""
+    mode = str(mode or "tts").lower().strip()
+    if mode not in NORMALIZER_MODES:
+        mode = "tts"
+    defaults = copy.deepcopy(_NORMALIZER_FALLBACK_DEFAULTS[mode])
+    if NormalizeOptions is None:
+        return defaults
+    try:
+        options = (
+            NormalizeOptions.tts() if mode == "tts" else NormalizeOptions.safe()
+        )
+        for key in NORMALIZER_BOOLEAN_OPTIONS:
+            defaults[key] = bool(getattr(options, key))
+        for key in NORMALIZER_ENUM_OPTIONS:
+            defaults[key] = str(getattr(options, key))
+        interval = getattr(options, "remove_links_ignore_interval")
+        defaults["remove_links_ignore_interval"] = [
+            int(interval[0]), int(interval[1])
+        ]
+        defaults["latin_dictionary_filename"] = str(
+            getattr(options, "latin_dictionary_filename")
+        )
+        for key in NORMALIZER_SEQUENCE_OPTIONS:
+            defaults[key] = [str(value) for value in getattr(options, key)]
+        path = getattr(options, "dictionaries_path")
+        defaults["dictionaries_path"] = str(path) if path is not None else ""
+    except Exception as exc:
+        logging.warning(
+            "Не удалось прочитать настройки ru-normalizr %s: %s", mode, exc
+        )
+    return defaults
+
+
+def normalize_normalizer_options(raw_options, mode="tts", *, full=False):
+    """Валидирует только публичные опции ru-normalizr.
+
+    В ``settings.json`` хранятся лишь явные переопределения, поэтому будущие
+    исправления библиотечных пресетов не блокируются копией старых defaults.
+    Песочница и экспорт профиля запрашивают ``full=True`` и получают полный
+    воспроизводимый снимок.
+    """
+    mode = str(mode or "tts").lower().strip()
+    if mode not in NORMALIZER_MODES:
+        mode = "tts"
+    defaults = normalizer_mode_defaults(mode)
+    raw = raw_options if isinstance(raw_options, dict) else {}
+    result = copy.deepcopy(defaults) if full else {}
+
+    for key in NORMALIZER_BOOLEAN_OPTIONS:
+        if key in raw:
+            result[key] = _config_bool(raw.get(key), default=defaults[key])
+
+    for key, allowed in NORMALIZER_ENUM_OPTIONS.items():
+        if key not in raw:
+            continue
+        value = str(raw.get(key, defaults[key])).lower().strip()
+        result[key] = value if value in allowed else defaults[key]
+
+    if "remove_links_ignore_interval" in raw:
+        interval = raw.get("remove_links_ignore_interval")
+        try:
+            if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+                raise ValueError
+            start, end = int(interval[0]), int(interval[1])
+            if start < 0 or end < start:
+                raise ValueError
+            result["remove_links_ignore_interval"] = [start, end]
+        except (TypeError, ValueError, OverflowError):
+            result["remove_links_ignore_interval"] = copy.deepcopy(
+                defaults["remove_links_ignore_interval"]
+            )
+
+    if "latin_dictionary_filename" in raw:
+        filename = str(raw.get("latin_dictionary_filename") or "").strip()
+        result["latin_dictionary_filename"] = (
+            filename or defaults["latin_dictionary_filename"]
+        )
+
+    for key in NORMALIZER_SEQUENCE_OPTIONS:
+        if key not in raw:
+            continue
+        values = raw.get(key)
+        if isinstance(values, str):
+            values = re.split(r"[,;\n]", values)
+        if not isinstance(values, (list, tuple)):
+            values = []
+        result[key] = _stable_unique(
+            [str(value).strip() for value in values if str(value).strip()]
+        )
+
+    if "dictionaries_path" in raw:
+        path = raw.get("dictionaries_path")
+        result["dictionaries_path"] = (
+            str(path).strip() if isinstance(path, (str, os.PathLike)) else ""
+        )
+
+    return result
+
+
+def resolved_normalizer_options(config):
+    mode = str(config.get("normalizer_mode", "tts")).lower().strip()
+    if mode not in NORMALIZER_MODES:
+        mode = "tts"
+    return normalize_normalizer_options(
+        config.get("normalizer_options", {}), mode, full=True
+    )
+
+
+def normalizer_settings_snapshot(config):
+    """Канонический снимок настроек, влияющих на pipeline нормализации."""
+    source = config if isinstance(config, dict) else {}
+    mode = str(source.get("normalizer_mode", "tts")).lower().strip()
+    if mode not in NORMALIZER_MODES:
+        mode = "tts"
+    return {
+        "normalizer_enabled": _config_bool(
+            source.get("normalizer_enabled", True), default=True
+        ),
+        "normalizer_mode": mode,
+        "normalizer_options": resolved_normalizer_options(source),
+        "glossary_enabled": _config_bool(
+            source.get("glossary_enabled", True), default=True
+        ),
+        "auto_abbreviations": _config_bool(
+            source.get("auto_abbreviations", True), default=True
+        ),
+        "auto_short_words": _config_bool(
+            source.get("auto_short_words", True), default=True
+        ),
+    }
+
+
+def describe_normalizer_settings(config):
+    """Короткое честное описание глобального профиля для интерфейса."""
+    state = normalizer_settings_snapshot(config)
+    mode = state["normalizer_mode"]
+    base_title = "TTS (для озвучки)" if mode == "tts" else "Safe (бережный)"
+    base_short = "TTS" if mode == "tts" else "Safe"
+    defaults = normalizer_mode_defaults(mode)
+    changed_options = sum(
+        state["normalizer_options"].get(key) != value
+        for key, value in defaults.items()
+    )
+    is_builtin = (
+        changed_options == 0
+        and state["normalizer_enabled"]
+        and state["glossary_enabled"]
+        and state["auto_abbreviations"]
+        and state["auto_short_words"]
+    )
+    profile = (
+        base_title if is_builtin else f"Пользовательский (база {base_short})"
+    )
+    studio_parts = []
+    if state["auto_abbreviations"]:
+        studio_parts.append("аббревиатуры")
+    if state["auto_short_words"]:
+        studio_parts.append("короткие сокращения")
+    studio_text = ", ".join(studio_parts) if studio_parts else "выкл."
+    details = (
+        f"ru-normalizr: {'вкл.' if state['normalizer_enabled'] else 'выкл.'}; "
+        f"глоссарий: {'вкл.' if state['glossary_enabled'] else 'выкл.'}; "
+        f"предобработка Studio: {studio_text}; "
+        f"изменено опций ru-normalizr: {changed_options}"
+    )
+    return {"profile": profile, "details": details}
+
+
+def _strict_normalizer_profile_options(raw_options, mode):
+    """Проверяет JSON-профиль, не маскируя опечатки значениями preset.
+
+    ``normalize_normalizer_options`` намеренно мягок при восстановлении
+    ``settings.json``: повреждённая пользовательская настройка не должна
+    мешать запуску Studio. Импорт отдельного переносимого профиля — явная
+    операция, поэтому неверный тип или неизвестное имя опции здесь должны
+    быть показаны пользователю, а не незаметно менять результат нормализации.
+    """
+    if not isinstance(raw_options, dict):
+        raise ValueError("normalizer.options должен быть JSON-объектом")
+
+    known_options = set(NORMALIZER_BOOLEAN_OPTIONS)
+    known_options.update(NORMALIZER_ENUM_OPTIONS)
+    known_options.update(NORMALIZER_SEQUENCE_OPTIONS)
+    known_options.update(
+        {
+            "remove_links_ignore_interval",
+            "latin_dictionary_filename",
+            "dictionaries_path",
+        }
+    )
+    unknown = sorted(set(raw_options) - known_options)
+    if unknown:
+        raise ValueError(
+            "неизвестная опция normalizer.options: " + ", ".join(unknown)
+        )
+    missing = sorted(known_options - set(raw_options))
+    if missing:
+        raise ValueError(
+            "в normalizer.options отсутствуют обязательные поля: "
+            + ", ".join(missing)
+        )
+
+    for key in NORMALIZER_BOOLEAN_OPTIONS:
+        if key in raw_options and not isinstance(raw_options[key], bool):
+            raise ValueError(f"normalizer.options.{key} должен быть boolean")
+
+    for key, allowed in NORMALIZER_ENUM_OPTIONS.items():
+        if key not in raw_options:
+            continue
+        value = raw_options[key]
+        if not isinstance(value, str) or value.strip().lower() not in allowed:
+            choices = ", ".join(allowed)
+            raise ValueError(
+                f"normalizer.options.{key} должен быть одним из: {choices}"
+            )
+
+    if "remove_links_ignore_interval" in raw_options:
+        interval = raw_options["remove_links_ignore_interval"]
+        if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+            raise ValueError(
+                "normalizer.options.remove_links_ignore_interval "
+                "должен содержать два целых числа"
+            )
+        start, end = interval
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or start < 0
+            or end < start
+        ):
+            raise ValueError(
+                "normalizer.options.remove_links_ignore_interval "
+                "должен содержать неотрицательные границы start <= end"
+            )
+
+    def validate_dictionary_name(value, field_name, *, basename_only=False):
+        location = f"normalizer.options.{field_name}"
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "\\" in value
+            or any(unicodedata.category(char) in {"Cc", "Cs"} for char in value)
+        ):
+            raise ValueError(
+                f"{location} должен быть переносимым именем .dic-файла"
+            )
+        path = PurePosixPath(value)
+        if (
+            path.is_absolute()
+            or path.as_posix() != value
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or path.suffix.lower() != ".dic"
+            or (basename_only and len(path.parts) != 1)
+        ):
+            raise ValueError(
+                f"{location} должен быть относительным именем .dic-файла "
+                "без '.' и '..'"
+            )
+        return value
+
+    validate_dictionary_name(
+        raw_options["latin_dictionary_filename"],
+        "latin_dictionary_filename",
+        basename_only=True,
+    )
+
+    for key in NORMALIZER_SEQUENCE_OPTIONS:
+        if key not in raw_options:
+            continue
+        values = raw_options[key]
+        if not isinstance(values, (list, tuple)):
+            raise ValueError(f"normalizer.options.{key} должен быть массивом")
+        for value in values:
+            validate_dictionary_name(value, key)
+        if len(set(values)) != len(values):
+            raise ValueError(
+                f"normalizer.options.{key} не должен содержать дубликаты"
+            )
+
+    if raw_options["dictionaries_path"] != "":
+        raise ValueError(
+            "normalizer.options.dictionaries_path должен быть пустым: "
+            "локальный путь не переносится в JSON-профиле"
+        )
+
+    return normalize_normalizer_options(raw_options, mode, full=True)
+
+
+def _strict_profile_bool(mapping, key, section_name):
+    value = mapping[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{section_name}.{key} должен быть boolean")
+    return value
+
+
+def _strict_profile_keys(mapping, expected, section_name):
+    keys = set(mapping)
+    expected = set(expected)
+    unknown = sorted(keys - expected)
+    if unknown:
+        raise ValueError(
+            f"неизвестные поля {section_name}: " + ", ".join(unknown)
+        )
+    missing = sorted(expected - keys)
+    if missing:
+        raise ValueError(
+            f"в {section_name} отсутствуют обязательные поля: "
+            + ", ".join(missing)
+        )
+
+
+def normalizer_profile_from_config(
+    config,
+    *,
+    name="Пользовательский",
+):
+    """Создаёт переносимый профиль без путей проекта и API-секретов."""
+    mode = str(config.get("normalizer_mode", "tts")).lower().strip()
+    if mode not in NORMALIZER_MODES:
+        mode = "tts"
+    options = resolved_normalizer_options(config)
+    options["dictionaries_path"] = ""
+    profile = {
+        "schema": NORMALIZER_PROFILE_SCHEMA,
+        "version": NORMALIZER_PROFILE_VERSION,
+        "name": name,
+        "normalizer": {
+            "enabled": _config_bool(
+                config.get("normalizer_enabled", True), default=True
+            ),
+            "mode": mode,
+            "options": options,
+        },
+        "preprocessing": {
+            "auto_abbreviations": _config_bool(
+                config.get("auto_abbreviations", True), default=True
+            ),
+            "auto_short_words": _config_bool(
+                config.get("auto_short_words", True), default=True
+            ),
+            "glossary_enabled": _config_bool(
+                config.get("glossary_enabled", True), default=True
+            ),
+        },
+    }
+    return normalize_normalizer_profile(profile)
+
+
+def normalize_normalizer_profile(profile):
+    """Читает профиль v1.5 и возвращает его канонический переносимый вид."""
+    if not isinstance(profile, dict):
+        raise ValueError("профиль нормализации должен быть JSON-объектом")
+    _strict_profile_keys(
+        profile,
+        {"schema", "version", "name", "normalizer", "preprocessing"},
+        "корне профиля",
+    )
+    schema = profile["schema"]
+    if schema != NORMALIZER_PROFILE_SCHEMA:
+        raise ValueError("неподдерживаемый формат профиля нормализации")
+    version = profile["version"]
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError("версия профиля нормализации должна быть целым числом")
+    if version != NORMALIZER_PROFILE_VERSION:
+        raise ValueError(
+            f"неподдерживаемая версия профиля нормализации: {version}"
+        )
+
+    section = profile["normalizer"]
+    if not isinstance(section, dict):
+        raise ValueError("секция normalizer должна быть JSON-объектом")
+    _strict_profile_keys(
+        section, {"enabled", "mode", "options"}, "normalizer"
+    )
+    mode_value = section["mode"]
+    if not isinstance(mode_value, str):
+        raise ValueError("режим нормализатора должен быть строкой")
+    mode = mode_value.lower().strip()
+    if mode not in NORMALIZER_MODES:
+        raise ValueError("режим нормализатора должен быть 'tts' или 'safe'")
+    options = _strict_normalizer_profile_options(section["options"], mode)
+
+    preprocessing = profile["preprocessing"]
+    if not isinstance(preprocessing, dict):
+        raise ValueError("секция preprocessing должна быть JSON-объектом")
+    _strict_profile_keys(
+        preprocessing,
+        {
+            "auto_abbreviations",
+            "auto_short_words",
+            "glossary_enabled",
+        },
+        "preprocessing",
+    )
+    raw_name = profile["name"]
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ValueError("имя профиля нормализации не должно быть пустым")
+    name = raw_name.strip()
+    if len(name) > 128 or any(
+        unicodedata.category(char) in {"Cc", "Cs"} for char in name
+    ):
+        raise ValueError(
+            "имя профиля нормализации должно быть короче 129 символов "
+            "и не содержать управляющих знаков"
+        )
+    return {
+        "schema": NORMALIZER_PROFILE_SCHEMA,
+        "version": NORMALIZER_PROFILE_VERSION,
+        "name": name,
+        "normalizer": {
+            "enabled": _strict_profile_bool(section, "enabled", "normalizer"),
+            "mode": mode,
+            "options": options,
+        },
+        "preprocessing": {
+            "auto_abbreviations": _strict_profile_bool(
+                preprocessing, "auto_abbreviations", "preprocessing"
+            ),
+            "auto_short_words": _strict_profile_bool(
+                preprocessing, "auto_short_words", "preprocessing"
+            ),
+            "glossary_enabled": _strict_profile_bool(
+                preprocessing, "glossary_enabled", "preprocessing"
+            ),
+        },
+    }
+
+
+def apply_normalizer_profile(config, profile):
+    """Применяет только параметры текста, не затрагивая остальные настройки."""
+    normalized = normalize_normalizer_profile(profile)
+    section = normalized["normalizer"]
+    preprocessing = normalized["preprocessing"]
+    merged = dict(config) if isinstance(config, dict) else {}
+    options = copy.deepcopy(section["options"])
+    options["dictionaries_path"] = resolved_normalizer_options(merged).get(
+        "dictionaries_path", ""
+    )
+    merged.update(
+        {
+            "normalizer_enabled": section["enabled"],
+            "normalizer_mode": section["mode"],
+            "normalizer_options": options,
+            "auto_abbreviations": preprocessing["auto_abbreviations"],
+            "auto_short_words": preprocessing["auto_short_words"],
+            "glossary_enabled": preprocessing["glossary_enabled"],
+        }
+    )
+    return merged
+
+
+AUDIO_PROFILE_SCHEMA = "silero-tts-studio-audio-profile"
+AUDIO_PROFILE_VERSION = 1
+AUDIO_PROFILE_FORMATS = ("mp3", "wav", "ogg", "opus")
+AUDIO_PROFILE_BITRATES = (
+    "auto", "32k", "48k", "64k", "96k", "128k", "192k", "256k", "320k"
+)
+AUDIO_PROFILE_SAMPLE_RATES = (
+    "auto", "8000", "12000", "16000", "22050", "24000", "32000",
+    "44100", "48000", "88200", "96000",
+)
+AUDIO_PROFILE_CHANNELS = ("auto", "mono", "stereo")
+
+
+def _audio_profile_number(value, name, minimum, maximum, *, integer=False):
+    try:
+        number = int(float(value)) if integer else float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"некорректное значение {name}") from None
+    if not math.isfinite(number) or number < minimum or number > maximum:
+        raise ValueError(
+            f"{name} должен быть в диапазоне {minimum:g}–{maximum:g}"
+        )
+    return number
+
+
+def normalize_audio_profile(profile, *, require_envelope=False):
+    """Проверяет один аудиопрофиль v1.5.
+
+    ``require_envelope`` используется для отдельного импортируемого JSON:
+    внутренний settings.json остаётся совместим с ранними prerelease-снимками,
+    а переносимый файл обязан явно объявить schema/version.
+    """
+    if not isinstance(profile, dict):
+        raise ValueError("аудиопрофиль должен быть JSON-объектом")
+    if require_envelope and "schema" not in profile:
+        raise ValueError("в аудиопрофиле отсутствует поле schema")
+    if require_envelope and "version" not in profile:
+        raise ValueError("в аудиопрофиле отсутствует поле version")
+    schema = profile.get("schema", AUDIO_PROFILE_SCHEMA)
+    if schema != AUDIO_PROFILE_SCHEMA:
+        raise ValueError("неподдерживаемый формат аудиопрофиля")
+    raw_version = profile.get("version", AUDIO_PROFILE_VERSION)
+    if isinstance(raw_version, bool) or (
+        require_envelope and not isinstance(raw_version, int)
+    ):
+        raise ValueError("некорректная версия аудиопрофиля") from None
+    try:
+        version = int(raw_version)
+    except (TypeError, ValueError):
+        raise ValueError("некорректная версия аудиопрофиля") from None
+    if version != AUDIO_PROFILE_VERSION:
+        raise ValueError(f"неподдерживаемая версия аудиопрофиля: {version}")
+
+    raw_name = profile.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ValueError("имя аудиопрофиля не должно быть пустым")
+    name = raw_name.strip()
+    if require_envelope and "audio" not in profile:
+        raise ValueError("в аудиопрофиле отсутствует секция audio")
+    audio = profile.get("audio", profile.get("settings", {}))
+    if not isinstance(audio, dict):
+        raise ValueError("секция audio должна быть JSON-объектом")
+    if require_envelope:
+        required_audio_fields = {
+            "format", "bitrate", "sample_rate", "channels", "effects"
+        }
+        missing_audio_fields = sorted(required_audio_fields.difference(audio))
+        if missing_audio_fields:
+            raise ValueError(
+                "в секции audio отсутствуют поля: "
+                + ", ".join(missing_audio_fields)
+            )
+
+    output_format = str(audio.get("format", "mp3")).strip().lower()
+    if output_format not in AUDIO_PROFILE_FORMATS:
+        raise ValueError("формат аудиопрофиля должен быть mp3, wav, ogg или opus")
+    bitrate = str(audio.get("bitrate", "auto")).strip().lower()
+    if bitrate != "auto" and not re.fullmatch(r"[1-9]\d*k", bitrate):
+        raise ValueError("битрейт должен иметь вид 48k либо значение auto")
+    if bitrate != "auto" and output_format != "wav":
+        bitrate_kbps = int(bitrate[:-1])
+        bitrate_limits = {
+            "mp3": (8, 320),
+            "ogg": (32, 500),
+            "opus": (6, 510),
+        }
+        minimum, maximum = bitrate_limits[output_format]
+        if not minimum <= bitrate_kbps <= maximum:
+            raise ValueError(
+                f"битрейт {output_format.upper()} должен быть в диапазоне "
+                f"{minimum}–{maximum} кбит/с"
+            )
+    sample_rate = str(audio.get("sample_rate", "auto")).strip().lower()
+    if sample_rate not in AUDIO_PROFILE_SAMPLE_RATES:
+        raise ValueError("аудиопрофиль содержит неподдерживаемую частоту")
+    channels = str(audio.get("channels", "auto")).strip().lower()
+    if channels not in AUDIO_PROFILE_CHANNELS:
+        raise ValueError("каналы должны иметь значение auto, mono или stereo")
+
+    effects = audio.get("effects", {})
+    if not isinstance(effects, dict):
+        raise ValueError("секция audio.effects должна быть JSON-объектом")
+    if require_envelope:
+        required_effect_fields = {
+            "enabled", "speed", "pitch", "echo", "echo_delay", "echo_decay"
+        }
+        missing_effect_fields = sorted(
+            required_effect_fields.difference(effects)
+        )
+        if missing_effect_fields:
+            raise ValueError(
+                "в секции audio.effects отсутствуют поля: "
+                + ", ".join(missing_effect_fields)
+            )
+    def effect_bool(key, default=False):
+        value = effects.get(key, default)
+        if require_envelope and not isinstance(value, bool):
+            raise ValueError(f"audio.effects.{key} должен быть true или false")
+        return _config_bool(value, default=default)
+
+    enabled = effect_bool("enabled")
+    speed = _audio_profile_number(
+        effects.get("speed", 1.0), "скорость", 0.5, 3.0
+    )
+    pitch = _audio_profile_number(
+        effects.get("pitch", 1.0), "тон", 0.5, 2.0
+    )
+    echo_delay = _audio_profile_number(
+        effects.get("echo_delay", 300),
+        "задержка эхо",
+        50,
+        1000,
+        integer=True,
+    )
+    echo_decay = _audio_profile_number(
+        effects.get("echo_decay", 0.3), "сила эхо", 0.1, 0.8
+    )
+
+    return {
+        "schema": AUDIO_PROFILE_SCHEMA,
+        "version": AUDIO_PROFILE_VERSION,
+        "name": name,
+        "audio": {
+            "format": output_format,
+            "bitrate": "auto" if output_format == "wav" else bitrate,
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "effects": {
+                "enabled": enabled,
+                "speed": speed,
+                "pitch": pitch,
+                "echo": effect_bool("echo"),
+                "echo_delay": echo_delay,
+                "echo_decay": echo_decay,
+            },
+        },
+    }
+
+
+def make_audio_profile(
+    name,
+    *,
+    output_format="mp3",
+    bitrate="auto",
+    sample_rate="auto",
+    channels="auto",
+    effects_enabled=False,
+    speed=1.0,
+    pitch=1.0,
+    echo=False,
+    echo_delay=300,
+    echo_decay=0.3,
+):
+    return normalize_audio_profile(
+        {
+            "schema": AUDIO_PROFILE_SCHEMA,
+            "version": AUDIO_PROFILE_VERSION,
+            "name": name,
+            "audio": {
+                "format": output_format,
+                "bitrate": bitrate,
+                "sample_rate": sample_rate,
+                "channels": channels,
+                "effects": {
+                    "enabled": effects_enabled,
+                    "speed": speed,
+                    "pitch": pitch,
+                    "echo": echo,
+                    "echo_delay": echo_delay,
+                    "echo_decay": echo_decay,
+                },
+            },
+        }
+    )
+
+
+def builtin_audio_profiles():
+    """Новые объекты встроенных профилей без общей изменяемой структуры."""
+    return [
+        make_audio_profile(
+            "Opus · речь 32 кбит/с",
+            output_format="opus",
+            bitrate="32k",
+            sample_rate="48000",
+            channels="mono",
+        ),
+        make_audio_profile(
+            "Opus · речь 48 кбит/с",
+            output_format="opus",
+            bitrate="48k",
+            sample_rate="48000",
+            channels="mono",
+        ),
+        make_audio_profile(
+            "MP3 · совместимый 128 кбит/с",
+            output_format="mp3",
+            bitrate="128k",
+            sample_rate="auto",
+            channels="auto",
+        ),
+        make_audio_profile(
+            "OGG/Vorbis · авто",
+            output_format="ogg",
+            bitrate="auto",
+            sample_rate="auto",
+            channels="auto",
+        ),
+        make_audio_profile(
+            "WAV · без потерь",
+            output_format="wav",
+            bitrate="auto",
+            sample_rate="auto",
+            channels="auto",
+        ),
+    ]
+
+
+def _effective_audio_profile_identity(profile):
+    """Сравнимые слышимые параметры без имени и неактивных эффектов."""
+    audio = copy.deepcopy(normalize_audio_profile(profile)["audio"])
+    if not audio["effects"]["enabled"]:
+        # Значения выключенных эффектов являются лишь заготовкой редактора и
+        # не меняют результат. Из-за них эквивалентные профили не должны
+        # ошибочно отображаться как разные.
+        audio["effects"] = {"enabled": False}
+    return audio
+
+
+def matching_audio_profile_name(profile, custom_profiles=None):
+    """Имя единственного точного совпадения либо ``None`` при неоднозначности."""
+    identity = _effective_audio_profile_identity(profile)
+    candidates = list(builtin_audio_profiles())
+    for candidate in custom_profiles or []:
+        try:
+            candidates.append(normalize_audio_profile(candidate))
+        except (TypeError, ValueError):
+            continue
+    matches = [
+        candidate["name"]
+        for candidate in candidates
+        if _effective_audio_profile_identity(candidate) == identity
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def describe_audio_profile(profile):
+    """Компактная расшифровка профиля без неоднозначного слова «активный»."""
+    audio = normalize_audio_profile(profile)["audio"]
+    format_names = {
+        "mp3": "MP3",
+        "wav": "WAV",
+        "ogg": "OGG/Vorbis",
+        "opus": "Opus (Ogg)",
+    }
+    parts = [format_names.get(audio["format"], audio["format"].upper())]
+    if audio["format"] == "wav":
+        parts.append("без потерь")
+    else:
+        bitrate = audio["bitrate"]
+        parts.append("битрейт: авто" if bitrate == "auto" else f"{bitrate[:-1]} кбит/с")
+
+    rate = audio["sample_rate"]
+    if rate == "auto":
+        parts.append("частота: авто")
+    else:
+        rate_khz = int(rate) / 1000
+        rate_text = f"{rate_khz:g}".replace(".", ",")
+        parts.append(f"{rate_text} кГц")
+
+    channel_names = {"auto": "каналы: авто", "mono": "моно", "stereo": "стерео"}
+    parts.append(channel_names[audio["channels"]])
+    effects = audio["effects"]
+    if not effects["enabled"]:
+        parts.append("эффекты: выкл.")
+    else:
+        effect_parts = []
+        if effects["speed"] != 1.0:
+            effect_parts.append(f"скорость {effects['speed']:g}×")
+        if effects["pitch"] != 1.0:
+            effect_parts.append(f"тон {effects['pitch']:g}")
+        if effects["echo"]:
+            effect_parts.append("эхо")
+        parts.append(
+            "эффекты: " + (", ".join(effect_parts) if effect_parts else "вкл.")
+        )
+    return " · ".join(parts)
+
+
+def audio_profile_name_conflict(name, custom_profiles, *, exclude_index=None):
+    identity = str(name or "").strip().casefold()
+    if not identity:
+        return True
+    if any(profile["name"].casefold() == identity for profile in builtin_audio_profiles()):
+        return True
+    for index, profile in enumerate(custom_profiles or []):
+        if index == exclude_index or not isinstance(profile, dict):
+            continue
+        if str(profile.get("name", "")).strip().casefold() == identity:
+            return True
+    return False
+
+
+def unique_audio_profile_name(name, custom_profiles):
+    base_name = str(name or "Пользовательский").strip() or "Пользовательский"
+    if not audio_profile_name_conflict(base_name, custom_profiles):
+        return base_name
+    suffix = 2
+    while audio_profile_name_conflict(f"{base_name} ({suffix})", custom_profiles):
+        suffix += 1
+    return f"{base_name} ({suffix})"
+
+
+def audio_profile_config_values(profile, target):
+    """Возвращает независимые ключи для book либо универсального export."""
+    normalized = normalize_audio_profile(profile)
+    audio = normalized["audio"]
+    effects = audio["effects"]
+    if target == "book":
+        values = {
+            "output_format": audio["format"],
+            "output_bitrate": audio["bitrate"],
+            "output_sample_rate": audio["sample_rate"],
+            "output_channels": audio["channels"],
+            "fx_speed": effects["speed"] if effects["enabled"] else 1.0,
+            "fx_pitch": effects["pitch"] if effects["enabled"] else 1.0,
+            "fx_echo": effects["echo"] if effects["enabled"] else False,
+            "fx_echo_delay": effects["echo_delay"],
+            "fx_echo_decay": effects["echo_decay"],
+        }
+    elif target == "export":
+        values = {
+            "export_format": audio["format"],
+            "export_bitrate": audio["bitrate"],
+            "export_sample_rate": audio["sample_rate"],
+            "export_channels": audio["channels"],
+            "export_apply_fx": effects["enabled"],
+            "export_fx_speed": effects["speed"],
+            "export_fx_pitch": effects["pitch"],
+            "export_fx_echo": effects["echo"],
+            "export_fx_echo_delay": effects["echo_delay"],
+            "export_fx_echo_decay": effects["echo_decay"],
+        }
+    else:
+        raise ValueError("target должен быть 'book' или 'export'")
+    return values
+
+
+def build_ru_normalizer(config):
+    """Создаёт экземпляр для снимка настроек конкретной операции."""
+    if Normalizer is None or NormalizeOptions is None:
+        return None
+    if _config_bool(config.get("text_is_prepared", False), default=False):
+        return None
+    if not _config_bool(config.get("normalizer_enabled", True), default=True):
+        return None
+    mode = str(config.get("normalizer_mode", "tts")).lower().strip()
+    if mode not in NORMALIZER_MODES:
+        mode = "tts"
+    values = resolved_normalizer_options(config)
+    kwargs = dict(values)
+    kwargs["remove_links_ignore_interval"] = tuple(
+        kwargs["remove_links_ignore_interval"]
+    )
+    for key in NORMALIZER_SEQUENCE_OPTIONS:
+        kwargs[key] = tuple(kwargs[key])
+    dictionaries_path = kwargs.get("dictionaries_path")
+    kwargs["dictionaries_path"] = (
+        Path(dictionaries_path).expanduser() if dictionaries_path else None
+    )
+    options = NormalizeOptions(mode=mode, **kwargs)
+    return Normalizer(options)
 
 # ================= КОНФИГУРАЦИЯ ПО УМОЛЧАНИЮ =================
 DEFAULT_CONFIG = {
@@ -2466,15 +4163,27 @@ DEFAULT_CONFIG = {
     # экспортируемого профиля и поэтому не переезжает на другой компьютер.
     "last_config_dir": "",
     "last_glossary_dir": "",
+    "last_audio_profile_dir": "",
+    "last_normalizer_text_dir": "",
     
     "output_format": "mp3",
     "output_bitrate": "128k",
+    "output_sample_rate": "auto",
+    "output_channels": "auto",
     # Параметры универсальной вкладки экспорта. ``auto`` сохраняет общий
     # профиль исходников, когда он однороден, и выбирает совместимый профиль
     # для смешанного набора. Это не связано с каноническим 48 kHz mono-кэшем.
+    "export_format": "mp3",
     "export_bitrate": "auto",
     "export_sample_rate": "auto",
     "export_channels": "auto",
+    "export_apply_fx": False,
+    "export_fx_speed": 1.0,
+    "export_fx_pitch": 1.0,
+    "export_fx_echo": False,
+    "export_fx_echo_delay": 300,
+    "export_fx_echo_decay": 0.3,
+    "audio_profiles": [],
     "synthesis_mode": "sentence",
     
     "tag_title": "{filename}",
@@ -2498,6 +4207,13 @@ DEFAULT_CONFIG = {
     "silence_threshold": -55.0,
     "auto_abbreviations": True,
     "auto_short_words": True,
+    # Профиль ru-normalizr v1.5. Пустой словарь означает актуальные значения
+    # встроенного TTS-пресета; явные overrides появляются только после того,
+    # как пользователь применил настройки из песочницы.
+    "normalizer_enabled": True,
+    "normalizer_mode": "tts",
+    "normalizer_options": {},
+    "glossary_enabled": True,
     
     "use_cache": True,
     "cache_save_frequency": 100,
@@ -2539,6 +4255,8 @@ DEFAULT_CONFIG = {
 
 def normalize_config(config):
     """Нормализует известные типы, сохраняя неизвестные ключи совместимости."""
+    raw_config = config if isinstance(config, dict) else {}
+    had_export_format = "export_format" in raw_config
     normalized = DEFAULT_CONFIG.copy()
     if isinstance(config, dict):
         normalized.update(config)
@@ -2546,7 +4264,9 @@ def normalize_config(config):
     boolean_keys = (
         "api_steps_enabled", "cache_include_steps", "auto_trim_silence",
         "auto_abbreviations", "auto_short_words", "use_cache",
+        "normalizer_enabled", "glossary_enabled",
         "enable_cache_lru", "enable_cache_ttl", "fx_echo",
+        "export_apply_fx", "export_fx_echo",
         "direct_save", "direct_force", "direct_autoplay",
         "skip_existing", "import_single_file",
     )
@@ -2561,12 +4281,14 @@ def normalize_config(config):
         "pause_separator": 0, "api_max_requests": 1, "max_retries": 1,
         "max_parallel_encodes": 0, "cache_save_frequency": 1,
         "cache_max_entries": 1, "fx_echo_delay": 1,
+        "export_fx_echo_delay": 1,
         "default_group_pause": 0, "ui_font_size": 6,
     }
     float_minimums = {
         "api_time_window": 0.0, "cache_ttl_hours": 0.000001,
         "fx_speed": 0.000001, "fx_pitch": 0.000001,
-        "fx_echo_decay": 0.0,
+        "fx_echo_decay": 0.0, "export_fx_speed": 0.000001,
+        "export_fx_pitch": 0.000001, "export_fx_echo_decay": 0.0,
     }
 
     for key, minimum in int_minimums.items():
@@ -2603,16 +4325,47 @@ def normalize_config(config):
         normalized["silence_threshold"] = DEFAULT_CONFIG["silence_threshold"]
 
     for key, allowed in (
-        ("output_format", {"mp3", "wav", "ogg", "opus"}),
+        ("output_format", set(AUDIO_PROFILE_FORMATS)),
+        ("export_format", set(AUDIO_PROFILE_FORMATS)),
         ("synthesis_mode", {"sentence", "paragraph", "full"}),
+        ("normalizer_mode", set(NORMALIZER_MODES)),
     ):
         value = str(normalized.get(key, DEFAULT_CONFIG[key])).lower().strip()
         normalized[key] = value if value in allowed else DEFAULT_CONFIG[key]
 
+    # До v1.5 универсальный экспорт ошибочно делил format с книжной сборкой.
+    # Однократная миграция сохраняет выбранное старое значение в обеих целях.
+    if not had_export_format:
+        normalized["export_format"] = normalized["output_format"]
+
+    normalized["normalizer_options"] = normalize_normalizer_options(
+        normalized.get("normalizer_options", {}),
+        normalized["normalizer_mode"],
+        full=False,
+    )
+
     bitrate = str(normalized.get("output_bitrate", "")).strip().lower()
     normalized["output_bitrate"] = (
-        bitrate if re.fullmatch(r"[1-9]\d*k", bitrate) else DEFAULT_CONFIG["output_bitrate"]
+        bitrate
+        if bitrate == "auto" or re.fullmatch(r"[1-9]\d*k", bitrate)
+        else DEFAULT_CONFIG["output_bitrate"]
     )
+
+    for prefix in ("output", "export"):
+        sample_key = f"{prefix}_sample_rate"
+        sample_rate = str(normalized.get(sample_key, "auto")).strip().lower()
+        normalized[sample_key] = (
+            sample_rate
+            if sample_rate in AUDIO_PROFILE_SAMPLE_RATES
+            else DEFAULT_CONFIG[sample_key]
+        )
+        channels_key = f"{prefix}_channels"
+        channels = str(normalized.get(channels_key, "auto")).strip().lower()
+        normalized[channels_key] = (
+            channels
+            if channels in AUDIO_PROFILE_CHANNELS
+            else DEFAULT_CONFIG[channels_key]
+        )
 
     export_bitrate = str(normalized.get("export_bitrate", "auto")).strip().lower()
     normalized["export_bitrate"] = (
@@ -2620,23 +4373,19 @@ def normalize_config(config):
         if export_bitrate == "auto" or re.fullmatch(r"[1-9]\d*k", export_bitrate)
         else DEFAULT_CONFIG["export_bitrate"]
     )
-    export_sample_rate = str(
-        normalized.get("export_sample_rate", "auto")
-    ).strip().lower()
-    normalized["export_sample_rate"] = (
-        export_sample_rate
-        if export_sample_rate == "auto" or export_sample_rate in {
-            "8000", "12000", "16000", "22050", "24000", "32000",
-            "44100", "48000", "88200", "96000"
-        }
-        else DEFAULT_CONFIG["export_sample_rate"]
-    )
-    export_channels = str(normalized.get("export_channels", "auto")).strip().lower()
-    normalized["export_channels"] = (
-        export_channels
-        if export_channels in {"auto", "mono", "stereo"}
-        else DEFAULT_CONFIG["export_channels"]
-    )
+    custom_profiles = normalized.get("audio_profiles", [])
+    normalized_profiles = []
+    if isinstance(custom_profiles, list):
+        for index, profile in enumerate(custom_profiles):
+            try:
+                normalized_profiles.append(normalize_audio_profile(profile))
+            except ValueError as exc:
+                logging.warning(
+                    "Некорректный пользовательский аудиопрофиль %d пропущен: %s",
+                    index + 1,
+                    exc,
+                )
+    normalized["audio_profiles"] = normalized_profiles
 
     for key, fallback in REQUIRED_DIRECTORY_DEFAULTS.items():
         value = normalized.get(key)
@@ -2647,6 +4396,7 @@ def normalize_config(config):
     for key in (
         "api_token", "api_url", "speaker", "export_dir",
         "last_browse_dir", "last_config_dir", "last_glossary_dir",
+        "last_audio_profile_dir", "last_normalizer_text_dir",
         "separator_symbols", "tag_title", "tag_artist",
         "tag_album_artist", "tag_album", "tag_genre", "tag_composer",
         "tag_year", "tag_cover", "default_group_name",
@@ -2824,7 +4574,7 @@ class TTSProcessor:
                 config[key] = self.cfg[key]
         config = self.cfg
         self.error_callback = error_callback
-        
+
         # Используем общий лимитер, если передан
         self.rate_limiter = shared_rate_limiter or RateLimiter(int(config["api_max_requests"]), float(config["api_time_window"]))
         
@@ -2850,10 +4600,12 @@ class TTSProcessor:
         # Снимок последней команды полезен для диагностики ошибок FFmpeg и
         # регрессионных тестов. До первой сборки у него есть явное значение.
         self._last_ffmpeg_save_command = None
+        self._normalizer = build_ru_normalizer(self.cfg)
         
         self.glossary_ignore_case = {}
         self.glossary_strict_case = {}
         self.glossary_regex = []
+        self.glossary_verbatim_regex = []
         self.load_glossary_file()
         
         self.is_stopped = False
@@ -3030,8 +4782,16 @@ class TTSProcessor:
         self._save_cache(force=True)
 
     def apply_regex_rules(self, text):
+        cfg = getattr(self, "cfg", {})
+        if not _config_bool(cfg.get("glossary_enabled", True), default=True):
+            return text
         for rule in self.glossary_regex:
             if not isinstance(rule, dict): continue
+            # Verbatim-RegEx применяется после разбиения на предложения. Его
+            # замена должна пережить ru-normalizr и финальную очистку, поэтому
+            # на раннем этапе подготовки абзаца такое правило не исполняем.
+            if _config_bool(rule.get("verbatim"), default=False):
+                continue
             pattern = rule.get("pattern") or rule.get("regex")
             repl = str(rule.get("repl") if rule.get("repl") is not None else "")
             if not pattern: continue
@@ -3069,6 +4829,14 @@ class TTSProcessor:
         """Единая предварительная обработка для синтеза и оптимизации кэша."""
         raw_text = strip_leading_text_bom(raw_text)
         raw_text = self._protect_separator_lines(raw_text, separator_token)
+        if _config_bool(
+            getattr(self, "cfg", {}).get("text_is_prepared", False),
+            default=False,
+        ):
+            # Внешний редактор ударений уже сформировал произносимую строку.
+            # Никакие пользовательские RegEx и типографика здесь не нужны;
+            # служебные строки-разделители уже защищены выше.
+            return raw_text
         raw_text = re.sub(r'[«»“”„]', '"', raw_text)
         raw_text = normalize_dialogue_line_starts(raw_text)
         raw_text = self.apply_regex_rules(raw_text)
@@ -3093,11 +4861,9 @@ class TTSProcessor:
         data = None
         for candidate in candidates:
             try:
-                with open(candidate, 'r', encoding='utf-8') as f:
+                with open(candidate, 'r', encoding='utf-8-sig') as f:
                     loaded = json.load(f)
-                if not isinstance(loaded, dict):
-                    raise ValueError("корень glossary.json должен быть JSON-объектом")
-                data = loaded
+                data = canonicalize_glossary_data(loaded)
                 if candidate == backup_path:
                     logging.warning(
                         "Глоссарий восстановлен из резервной копии %s",
@@ -3109,55 +4875,607 @@ class TTSProcessor:
         if data is None:
             return
 
-        # Очищаем словари и списки перед загрузкой (защита от дубликатов при перевызове)
+        self.load_glossary_data(data)
+
+    @staticmethod
+    def _glossary_word_pattern(source, *, ignore_case=False, whole_word=True):
+        flags = re.IGNORECASE if ignore_case else 0
+        escaped = re.escape(source)
+        if whole_word:
+            escaped = (
+                r"(?<![а-яА-Яa-zA-Z0-9_ёЁ])" + escaped
+                + r"(?![а-яА-Яa-zA-Z0-9_ёЁ])"
+            )
+        return re.compile(escaped, flags)
+
+    @classmethod
+    def _compile_glossary_term_rule(
+        cls, source, value, *, ignore_case=False
+    ):
+        spec = glossary_term_spec(value)
+        source_pattern = cls._glossary_word_pattern(
+            source,
+            ignore_case=ignore_case,
+            whole_word=spec["whole_word"],
+        )
+        match_pattern = source_pattern
+        inner_pattern = None
+        if spec["verbatim"] and not spec["whole_word"]:
+            # Частичная verbatim-замена защищает всё содержащее её слово.
+            # Иначе ru-normalizr добавляет пробелы вокруг служебного маркера и
+            # незаметно меняет границы слова. Внутри защищённого слова меняется
+            # только найденная пользователем подстрока.
+            word_chars = r"[а-яА-Яa-zA-Z0-9_ёЁ]"
+            flags = re.IGNORECASE if ignore_case else 0
+            match_pattern = re.compile(
+                r"(?<![а-яА-Яa-zA-Z0-9_ёЁ])"
+                + word_chars + "*" + re.escape(source) + word_chars + "*"
+                + r"(?![а-яА-Яa-zA-Z0-9_ёЁ])",
+                flags,
+            )
+            inner_pattern = re.compile(re.escape(source), flags)
+        return {
+            "pattern": match_pattern,
+            "inner_pattern": inner_pattern,
+            "replacement": spec["replacement"],
+            "verbatim": spec["verbatim"],
+            "ignore_case": bool(ignore_case),
+        }
+
+    def load_glossary_data(self, data):
+        """Компилирует JSON-объект без обращения к диску (в том числе для preview)."""
+        data = canonicalize_glossary_data(data)
+        shadowed_accents = glossary_shadowed_accent_rules(data)
+        if shadowed_accents:
+            preview = ", ".join(
+                conflict["accent"] for conflict in shadowed_accents[:5]
+            )
+            suffix = ", …" if len(shadowed_accents) > 5 else ""
+            logging.warning(
+                "В глоссарии %d правил ударения перекрыты правилами терминов "
+                "и не применяются (термин имеет приоритет): %s%s",
+                len(shadowed_accents),
+                preview,
+                suffix,
+            )
+
+        # Очищаем словари и списки перед загрузкой: редактор и песочница могут
+        # многократно применять один объект в течение сеанса.
         self.glossary_ignore_case = {}
         self.glossary_strict_case = {}
         self.compiled_strict_case = []
         self.compiled_ignore_case = []
 
-        for w in data.get("accents_ignore_case", []): 
+        accents_ignore_case = data.get("accents_ignore_case", [])
+        if not isinstance(accents_ignore_case, (list, tuple)):
+            accents_ignore_case = []
+        for w in accents_ignore_case:
             if isinstance(w, str) and w.strip():
                 self.glossary_ignore_case[w.replace("+", "").lower()] = w
                 
-        for w in data.get("accents_strict_case", []): 
+        accents_strict_case = data.get("accents_strict_case", [])
+        if not isinstance(accents_strict_case, (list, tuple)):
+            accents_strict_case = []
+        for w in accents_strict_case:
             if isinstance(w, str) and w.strip():
                 self.glossary_strict_case[w.replace("+", "")] = w
                 
-        for k, v in data.get("terms_ignore_case", {}).items(): 
+        terms_ignore_case = data.get("terms_ignore_case", {})
+        if not isinstance(terms_ignore_case, dict):
+            terms_ignore_case = {}
+        for k, v in terms_ignore_case.items():
             if isinstance(k, str) and k.strip():
-                self.glossary_ignore_case[k.lower()] = v
+                self.glossary_ignore_case[k.lower()] = copy.deepcopy(v)
                 
-        for k, v in data.get("terms_strict_case", {}).items(): 
+        terms_strict_case = data.get("terms_strict_case", {})
+        if not isinstance(terms_strict_case, dict):
+            terms_strict_case = {}
+        for k, v in terms_strict_case.items():
             if isinstance(k, str) and k.strip():
-                self.glossary_strict_case[k] = v
+                self.glossary_strict_case[k] = copy.deepcopy(v)
 
-        # Предкомпиляция RegEx
+        # Предкомпиляция терминов. Legacy-строки остаются обычными правилами;
+        # расширенный JSON-объект несёт verbatim/whole_word.
         for original, replacement in self.glossary_strict_case.items():
-            pattern = re.compile(r'(?<![а-яА-Яa-zA-Z0-9_ёЁ])' + re.escape(original) + r'(?![а-яА-Яa-zA-Z0-9_ёЁ])')
-            self.compiled_strict_case.append((pattern, replacement))
+            self.compiled_strict_case.append(
+                self._compile_glossary_term_rule(
+                    original, replacement, ignore_case=False
+                )
+            )
 
         for original_lower, replacement in self.glossary_ignore_case.items():
-            pattern = re.compile(r'(?<![а-яА-Яa-zA-Z0-9_ёЁ])' + re.escape(original_lower) + r'(?![а-яА-Яa-zA-Z0-9_ёЁ])', re.IGNORECASE)
-            self.compiled_ignore_case.append((pattern, replacement))
-                
-        self.glossary_regex = data.get("regex_rules", [])
+            self.compiled_ignore_case.append(
+                self._compile_glossary_term_rule(
+                    original_lower, replacement, ignore_case=True
+                )
+            )
+
+        regex_rules = data.get("regex_rules", [])
+        self.glossary_regex = (
+            copy.deepcopy(regex_rules) if isinstance(regex_rules, list) else []
+        )
+        self.glossary_verbatim_regex = []
+        for rule in self.glossary_regex:
+            if not isinstance(rule, dict) or not _config_bool(
+                rule.get("verbatim"), default=False
+            ):
+                continue
+            pattern = rule.get("pattern") or rule.get("regex")
+            if not pattern:
+                continue
+            repl = str(rule.get("repl") if rule.get("repl") is not None else "")
+            for index in range(1, 10):
+                repl = repl.replace(chr(index), f"\\g<{index}>")
+            try:
+                self.glossary_verbatim_regex.append(
+                    (re.compile(pattern, re.MULTILINE), repl, pattern)
+                )
+            except re.error as exc:
+                logging.error("Ошибка в RegEx '%s': %s", pattern, exc)
+
+    @staticmethod
+    def _case_aware_glossary_replacement(source, replacement, ignore_case):
+        replacement = str(replacement)
+        if not ignore_case:
+            return replacement
+        if source.isupper():
+            return replacement.upper()
+        if source.istitle() and replacement:
+            return replacement[0].upper() + replacement[1:]
+        return replacement
+
+    @classmethod
+    def _term_rule_replacement(cls, rule, match):
+        matched = match.group(0)
+        inner_pattern = rule.get("inner_pattern")
+        if inner_pattern is None:
+            return cls._case_aware_glossary_replacement(
+                matched, rule["replacement"], rule["ignore_case"]
+            )
+        return inner_pattern.sub(
+            lambda inner: cls._case_aware_glossary_replacement(
+                inner.group(0), rule["replacement"], rule["ignore_case"]
+            ),
+            matched,
+        )
+
+    @staticmethod
+    def _tagged_substitution(
+        segments,
+        pattern,
+        replacement_func,
+        *,
+        protect_adjacent_word=False,
+    ):
+        """Применяет правило только к ещё не защищённым частям текста."""
+        result = []
+        word_character = re.compile(r"[а-яА-Яa-zA-Z0-9_ёЁ]").fullmatch
+        for segment_text, is_verbatim in segments:
+            if is_verbatim or not segment_text:
+                result.append((segment_text, is_verbatim))
+                continue
+            matches = list(pattern.finditer(segment_text))
+            if not matches:
+                result.append((segment_text, False))
+                continue
+
+            if not protect_adjacent_word:
+                position = 0
+                for match in matches:
+                    if match.start() > position:
+                        result.append((segment_text[position:match.start()], False))
+                    result.append(
+                        (
+                            _VerbatimText(
+                                replacement_func(match),
+                                segment_text[match.start():match.end()],
+                            ),
+                            True,
+                        )
+                    )
+                    position = match.end()
+                if position < len(segment_text):
+                    result.append((segment_text[position:], False))
+                continue
+
+            # Verbatim-RegEx защищает всё содержащее совпадение слово, чтобы
+            # normalizer не изменил его остаток. Несколько совпадений в одном
+            # слове объединяем в один сегмент, но применяем каждую замену —
+            # семантика остаётся такой же, как у re.sub().
+            protected_regions = []
+            for match in matches:
+                protected_start = match.start()
+                protected_end = match.end()
+                while (
+                    protected_start > 0
+                    and word_character(segment_text[protected_start - 1])
+                ):
+                    protected_start -= 1
+                while (
+                    protected_end < len(segment_text)
+                    and word_character(segment_text[protected_end])
+                ):
+                    protected_end += 1
+                if protected_regions and protected_start <= protected_regions[-1][1]:
+                    protected_regions[-1][1] = max(
+                        protected_regions[-1][1], protected_end
+                    )
+                    protected_regions[-1][2].append(match)
+                else:
+                    protected_regions.append(
+                        [protected_start, protected_end, [match]]
+                    )
+
+            position = 0
+            for protected_start, protected_end, region_matches in protected_regions:
+                if protected_start > position:
+                    result.append((segment_text[position:protected_start], False))
+                replacement_parts = []
+                match_position = protected_start
+                for match in region_matches:
+                    replacement_parts.append(
+                        segment_text[match_position:match.start()]
+                    )
+                    replacement_parts.append(replacement_func(match))
+                    match_position = match.end()
+                replacement_parts.append(
+                    segment_text[match_position:protected_end]
+                )
+                result.append(
+                    (
+                        _VerbatimText(
+                            "".join(replacement_parts),
+                            segment_text[protected_start:protected_end],
+                        ),
+                        True,
+                    )
+                )
+                position = protected_end
+            if position < len(segment_text):
+                result.append((segment_text[position:], False))
+        return result
+
+    def _apply_verbatim_regex_segments(self, segments):
+        for pattern, replacement, source_pattern in getattr(
+            self, "glossary_verbatim_regex", []
+        ):
+            try:
+                segments = self._tagged_substitution(
+                    segments,
+                    pattern,
+                    lambda match, repl=replacement: match.expand(repl),
+                    protect_adjacent_word=True,
+                )
+            except Exception as exc:
+                logging.error("Ошибка в verbatim RegEx '%s': %s", source_pattern, exc)
+        return segments
+
+    def apply_glossary_segments(self, text):
+        """Возвращает обычные и verbatim-фрагменты без хрупкого text diff."""
+        cfg = getattr(self, "cfg", {})
+        if not _config_bool(cfg.get("glossary_enabled", True), default=True):
+            return [(text, False)]
+
+        segments = self._apply_verbatim_regex_segments([(text, False)])
+        for rule in getattr(self, "compiled_strict_case", []):
+            if not isinstance(rule, dict):
+                pattern, replacement = rule[:2]
+                rule = {
+                    "pattern": pattern,
+                    "inner_pattern": None,
+                    "replacement": replacement,
+                    "verbatim": False,
+                    "ignore_case": False,
+                }
+            if rule.get("verbatim"):
+                segments = self._tagged_substitution(
+                    segments,
+                    rule["pattern"],
+                    lambda match, current=rule: self._term_rule_replacement(
+                        current, match
+                    ),
+                )
+            else:
+                segments = [
+                    (
+                        segment_text
+                        if is_verbatim
+                        else rule["pattern"].sub(
+                            lambda match, current=rule: self._term_rule_replacement(
+                                current, match
+                            ),
+                            segment_text,
+                        ),
+                        is_verbatim,
+                    )
+                    for segment_text, is_verbatim in segments
+                ]
+
+        for rule in getattr(self, "compiled_ignore_case", []):
+            if not isinstance(rule, dict):
+                pattern, replacement = rule[:2]
+                rule = {
+                    "pattern": pattern,
+                    "inner_pattern": None,
+                    "replacement": replacement,
+                    "verbatim": False,
+                    "ignore_case": True,
+                }
+            if rule.get("verbatim"):
+                segments = self._tagged_substitution(
+                    segments,
+                    rule["pattern"],
+                    lambda match, current=rule: self._term_rule_replacement(
+                        current, match
+                    ),
+                )
+            else:
+                segments = [
+                    (
+                        segment_text
+                        if is_verbatim
+                        else rule["pattern"].sub(
+                            lambda match, current=rule: self._term_rule_replacement(
+                                current, match
+                            ),
+                            segment_text,
+                        ),
+                        is_verbatim,
+                    )
+                    for segment_text, is_verbatim in segments
+                ]
+        return segments
 
     def apply_glossary(self, text):
-        # Использование предкомпилированных регулярных выражений
-        for pattern, replacement in getattr(self, 'compiled_strict_case', []):
-            text = pattern.sub(replacement, text)
-            
-        for pattern, replacement in getattr(self, 'compiled_ignore_case', []):
-            def match_func(m):
-                w = m.group(0)
-                if w.isupper(): return replacement.upper()
-                elif w.istitle(): return replacement[0].upper() + replacement[1:] if replacement else ""
-                return replacement
-            text = pattern.sub(match_func, text)
+        return "".join(
+            segment for segment, _is_verbatim in self.apply_glossary_segments(text)
+        )
+
+    @staticmethod
+    def _segments_to_markers(segments):
+        occupied = "".join(
+            str(segment)
+            + (getattr(segment, "source", "") if is_verbatim else "")
+            for segment, is_verbatim in segments
+        )
+        marker_map = {}
+        rendered = []
+        codepoint = 0xF0000
+        for segment, is_verbatim in segments:
+            if not is_verbatim:
+                rendered.append(segment)
+                continue
+            while codepoint <= 0xFFFFD and chr(codepoint) in occupied:
+                codepoint += 1
+            if codepoint > 0xFFFFD:
+                raise ValueError("слишком много verbatim-фрагментов в одном чанке")
+            marker = chr(codepoint)
+            codepoint += 1
+            marker_map[marker] = str(segment)
+            rendered.append(marker)
+        return "".join(rendered), marker_map
+
+    @staticmethod
+    def _contextual_verbatim_text(segments):
+        return "".join(
+            getattr(segment, "source", str(segment))
+            if is_verbatim
+            else str(segment)
+            for segment, is_verbatim in segments
+        )
+
+    @classmethod
+    def _mark_surviving_verbatim_sources(cls, normalized, segments):
+        """Заменяет пережившие normalizer исходники на безопасные маркеры.
+
+        Поиск идёт слева направо в порядке сегментов. Это позволяет выполнить
+        ru-normalizr всего один раз в обычном случае и при этом не закрывать от
+        него значимый контекст вроде ``Глава IV`` или ``2 кг``.
+        """
+        _protected_text, marker_map = cls._segments_to_markers(segments)
+        entries = []
+        marker_iter = iter(marker_map)
+        for segment, is_verbatim in segments:
+            if not is_verbatim:
+                continue
+            source = getattr(segment, "source", str(segment))
+            if not source:
+                raise ValueError("пустой verbatim-фрагмент нельзя локализовать")
+            entries.append((next(marker_iter), source))
+
+        if not entries:
+            return normalized, marker_map
+
+        parts = []
+        cursor = 0
+        for marker, source in entries:
+            start = normalized.find(source, cursor)
+            end = start + len(source)
+            if start < 0:
+                match = re.search(
+                    re.escape(source),
+                    normalized[cursor:],
+                    flags=re.IGNORECASE,
+                )
+                if match is None:
+                    raise ValueError(
+                        "ru-normalizr изменил исходный verbatim-фрагмент"
+                    )
+                start = cursor + match.start()
+                end = cursor + match.end()
+            parts.append(normalized[cursor:start])
+            parts.append(marker)
+            cursor = end
+        parts.append(normalized[cursor:])
+        rendered = "".join(parts)
+        if not all(rendered.count(marker) == 1 for marker in marker_map):
+            raise ValueError("не удалось однозначно расставить verbatim-маркеры")
+        return rendered, marker_map
+
+    def _normalize_glossary_segments(self, segments):
+        active_normalizer = getattr(self, "_normalizer", normalizer)
+        if active_normalizer is None:
+            return self._segments_to_markers(segments)
+
+        # Сначала оставляем исходные термины видимыми normalizer. Если они не
+        # изменились, точные замены локализуются в результате без text diff и
+        # без потери контекста соседних чисел, римских чисел и единиц измерения.
+        try:
+            contextual_text = self._contextual_verbatim_text(segments)
+            normalized = active_normalizer.normalize(contextual_text)
+            return self._mark_surviving_verbatim_sources(normalized, segments)
+        except Exception as contextual_exc:
+            logging.warning(
+                "Verbatim применён через резервную защиту: ru-normalizr "
+                "изменил исходный фрагмент, поэтому грамматический контекст "
+                "рядом с ним может отличаться; text='%s'; reason=%s",
+                _log_text_preview(contextual_text),
+                contextual_exc,
+            )
+
+        # Если сам исходник должен был нормализоваться (например, RegEx нашёл
+        # число), выполняем прежний непрозрачный проход с PUA-маркерами.
+        protected_text, marker_map = self._segments_to_markers(segments)
+        try:
+            normalized = active_normalizer.normalize(protected_text)
+            if all(normalized.count(marker) == 1 for marker in marker_map):
+                return normalized, marker_map
+            raise ValueError("ru-normalizr изменил служебный verbatim-маркер")
+        except Exception as exc:
+            logging.warning(
+                "Не удалось нормализовать фразу единым проходом (%s); "
+                "используется безопасная сегментная обработка.",
+                exc,
+            )
+            fallback_segments = []
+            for segment, is_verbatim in segments:
+                if is_verbatim:
+                    fallback_segments.append((segment, True))
+                    continue
+                try:
+                    segment = active_normalizer.normalize(segment)
+                except Exception as segment_exc:
+                    logging.warning(
+                        "Ошибка нормализации фрагмента '%s...': %s",
+                        segment[:30],
+                        segment_exc,
+                    )
+                fallback_segments.append((segment, False))
+            return self._segments_to_markers(fallback_segments)
+
+    @staticmethod
+    def _restore_verbatim_markers(text, marker_map):
+        for marker, replacement in marker_map.items():
+            text = text.replace(marker, replacement)
         return text
+
+    @staticmethod
+    def _ends_with_pause_punctuation(text, marker_map):
+        stripped = text.rstrip()
+        if not stripped:
+            return False
+        replacement = marker_map.get(stripped[-1])
+        if replacement is not None:
+            return bool(re.search(r"[.!?…:;]$", replacement.rstrip()))
+        return bool(re.search(r"[.!?…:;]$", stripped))
+
+    @classmethod
+    def normalization_context(cls, config, glossary_data=None):
+        """Создаёт лёгкий процессор для песочницы без кэша, сети и папок."""
+        context = object.__new__(cls)
+        context.cfg = normalize_config(config)
+        context._normalizer = build_ru_normalizer(context.cfg)
+        raw_separators = str(context.cfg.get("separator_symbols", ""))
+        if "," in raw_separators and "\n" not in raw_separators:
+            raw_separators = raw_separators.replace(",", "\n")
+        context.separators = [
+            item.strip() for item in raw_separators.split("\n") if item.strip()
+        ]
+        context.glossary_ignore_case = {}
+        context.glossary_strict_case = {}
+        context.glossary_regex = []
+        context.glossary_verbatim_regex = []
+        context.load_glossary_data(glossary_data or empty_glossary_data())
+        return context
+
+    def preview_normalization(self, raw_text):
+        """Нормализует предпросмотр теми же стадиями, что и синтез.
+
+        В результат не входят паузы и аудиогруппировка, но подготовка текста,
+        пользовательские RegEx, sentenize, глоссарий, ru-normalizr, фильтрация
+        неподдерживаемых чанков и финальная очистка вызываются теми же методами.
+        """
+        separator_token = "___NORMALIZER_PREVIEW_SEPARATOR_TOKEN___"
+        prepared = self._prepare_raw_text(raw_text, separator_token)
+        normalized_paragraphs = []
+        file_paragraphs = []
+        skipped = []
+        sentence_count = 0
+        for paragraph in (
+            value.strip() for value in prepared.split("\n") if value.strip()
+        ):
+            if paragraph == separator_token:
+                normalized_paragraphs.append("[ПАУЗА РАЗДЕЛИТЕЛЯ]")
+                # Preview показывает понятную подпись, а сохраняемый TXT обязан
+                # остаться пригодным для повторного синтеза. Любой настроенный
+                # разделитель имеет ту же длительность, поэтому используем
+                # первый как каноническое переносимое представление паузы.
+                if self.separators:
+                    file_paragraphs.append(self.separators[0])
+                continue
+            normalized_sentences = []
+            for sentence in (item.text for item in sentenize(paragraph)):
+                normalized = self.process_sentence_text(sentence)
+                if not contains_synthesizable_text(normalized):
+                    skipped.append(
+                        {"source": sentence, "normalized": normalized}
+                    )
+                    continue
+                normalized_sentences.append(normalized)
+                sentence_count += 1
+            if normalized_sentences:
+                normalized_paragraph = " ".join(normalized_sentences)
+                normalized_paragraphs.append(normalized_paragraph)
+                file_paragraph = normalized_paragraph
+                if (
+                    paragraph_starts_with_speech(paragraph)
+                    and not paragraph_starts_with_speech(file_paragraph)
+                ):
+                    # Тире не произносится, но после повторной загрузки снова
+                    # включает pause_speech перед этим абзацем.
+                    file_paragraph = f"— {file_paragraph}"
+                file_paragraphs.append(file_paragraph)
+        return {
+            "source": str(raw_text or ""),
+            "prepared": prepared,
+            "normalized_text": "\n\n".join(normalized_paragraphs),
+            "normalized_text_for_file": "\n\n".join(file_paragraphs),
+            "sentence_count": sentence_count,
+            "skipped": skipped,
+        }
 
     def process_sentence_text(self, text):
         """Полный цикл обработки одного предложения (сохраняет чистый исходник отдельно)"""
+        if _config_bool(
+            self.cfg.get("text_is_prepared", False), default=False
+        ):
+            # Структурное тире уже повлияло на pause_speech и снимается перед
+            # API. Остальной текст проходит буквально: сохраняются апострофы,
+            # плюсы ударений, цифры и пунктуация внешнего редактора.
+            prepared = strip_dialogue_prefix(str(text).strip()).strip()
+            for char in prepared:
+                codepoint = ord(char)
+                if unicodedata.category(char) == "Cc" or (
+                    0xE000 <= codepoint <= 0xF8FF
+                    or 0xF0000 <= codepoint <= 0xFFFFD
+                    or 0x100000 <= codepoint <= 0x10FFFD
+                ):
+                    raise ValueError(
+                        "подготовленный текст содержит служебный или "
+                        "управляющий символ"
+                    )
+            return prepared
+
         # Обычно это уже выполнено для всего абзаца, но повторяем защиту здесь:
         # функция также используется напрямую при тестировании и из старых
         # интеграций. Иначе ru-normalizr успеет принять ``- 62-й`` за минус.
@@ -3195,14 +5513,15 @@ class TTSProcessor:
             text = re.sub(r'\b([а-яА-ЯёЁa-zA-Z]{1,3})\.', r'\1', text)
 
         # 5. Глоссарий терминов и ударений
-        text = self.apply_glossary(text)
+        glossary_segments = self.apply_glossary_segments(text)
 
-        # 6. Нормализация (числа в слова)
-        if normalizer:
-            try:
-                text = normalizer.normalize(text)
-            except Exception as e:
-                logging.warning(f"Ошибка нормализации для фразы '{text[:30]}...': {e}")
+        # 6. Нормализация (числа в слова). Сначала ru-normalizr видит исходные
+        # verbatim-термины ради контекста, после чего их точные замены занимают
+        # по одному Private Use codepoint до финальной очистки. Если исходник
+        # был изменён, автоматически используется защищённый резервный проход.
+        text, verbatim_markers = self._normalize_glossary_segments(
+            glossary_segments
+        )
 
         # Защитный маркер ru-normalizr не должен попадать ни в API, ни в ключ
         # кэша. В нормальном пути он относится лишь к настоящему минусу:
@@ -3216,7 +5535,9 @@ class TTSProcessor:
 
         # 8. Восстановление или добавление финальной пунктуации
         # Если в конце нет знака препинания, который дает паузу (. ! ? … : ;)
-        if text and not re.search(r'[.!?…:;]$', text):
+        if text and not self._ends_with_pause_punctuation(
+            text, verbatim_markers
+        ):
             if term_punct:
                 # Возвращаем оригинальную пунктуацию (очищенную от кавычек)
                 clean_punct = re.sub(r'["\'»”]', '', term_punct)
@@ -3225,7 +5546,9 @@ class TTSProcessor:
                 # Если пунктуации не было вообще (например, заголовок), ставим точку
                 text += "."
 
-        return text
+        # Восстанавливаем в самом конце: ни ru-normalizr, ни очистка кавычек и
+        # спецсимволов не могут изменить ``уб+о'го`` или другую точную замену.
+        return self._restore_verbatim_markers(text, verbatim_markers)
 
     def get_hash(self, text):
         """Возвращает совместимый ключ кэша с опциональным namespace steps.
@@ -3857,6 +6180,12 @@ class TTSProcessor:
                 )
 
                 fmt = self.cfg["output_format"].lower()
+                output_profile = _select_book_audio_profile(
+                    fmt,
+                    sample_rate=self.cfg.get("output_sample_rate", "auto"),
+                    channels=self.cfg.get("output_channels", "auto"),
+                    bitrate=self.cfg.get("output_bitrate", "128k"),
+                )
                 has_cover = False
                 xiph_cover = None
                 apply_tags = _config_bool(
@@ -3902,7 +6231,9 @@ class TTSProcessor:
                     cmd.extend(["-af", ",".join(filters)])
     
                 if fmt == "mp3":
-                    cmd.extend(["-c:a", "libmp3lame", "-b:a", self.cfg["output_bitrate"]])
+                    cmd.extend([
+                        "-c:a", "libmp3lame", "-b:a", output_profile["bitrate"]
+                    ])
                     if has_cover:
                         # Для Windows пишем обложку как JPEG в ID3v2.3/APIC:
                         # PNG формально допустим, но Проводник/Media Player
@@ -3917,9 +6248,11 @@ class TTSProcessor:
                         ])
                 elif fmt == "ogg":
                     cmd.extend(["-c:a", "libvorbis"])
+                    if output_profile["bitrate"]:
+                        cmd.extend(["-b:a", output_profile["bitrate"]])
                 elif fmt == "opus":
                     cmd.extend([
-                        "-c:a", "libopus", "-b:a", self.cfg["output_bitrate"]
+                        "-c:a", "libopus", "-b:a", output_profile["bitrate"]
                     ])
                 elif fmt == "wav":
                     # RIFF хранит размер чанков в 32 битах. Для длинных книг
@@ -3927,6 +6260,11 @@ class TTSProcessor:
                     # финального заголовка заканчивается ошибкой упаковки
                     # ``'L' format requires 0 <= number <= 4294967295``.
                     cmd.extend(["-c:a", "pcm_s16le", "-rf64", "auto"])
+
+                cmd.extend([
+                    "-ar", str(output_profile["sample_rate"]),
+                    "-ac", str(output_profile["channels"]),
+                ])
     
                 if apply_tags:
                     base_name = out_filepath.stem
@@ -4053,8 +6391,15 @@ class TTSProcessor:
         else:
             _encode()
 
-    def get_all_possible_hashes(self, raw_text):
-        """Собирает канонические хэши содержимого для всех режимов синтеза."""
+    def get_all_possible_hashes(self, raw_text, include_prepared=False):
+        """Собирает канонические хэши содержимого для всех режимов синтеза.
+
+        Оптимизатор кэша передаёт ``include_prepared=True``: один и тот же TXT
+        пользователь мог синтезировать как исходный или как уже подготовленный.
+        Поэтому при очистке нужно сохранить объединение обоих наборов. Обычный
+        dry-run остаётся привязан к режиму текущего запуска.
+        """
+        source_text = raw_text
         hashes = set()
         speaker = self.cfg["speaker"]
 
@@ -4110,6 +6455,16 @@ class TTSProcessor:
         if current_full_text_clean:
             full_clean = "\n".join(current_full_text_clean)
             add_hash(full_clean)
+
+        if include_prepared and not _config_bool(
+            self.cfg.get("text_is_prepared", False), default=False
+        ):
+            prepared_config = copy.deepcopy(self.cfg)
+            prepared_config["text_is_prepared"] = True
+            prepared_context = self.normalization_context(
+                prepared_config, empty_glossary_data()
+            )
+            hashes.update(prepared_context.get_all_possible_hashes(source_text))
 
         return hashes
     
@@ -4424,6 +6779,13 @@ class TTSApp:
         x = int((screen_width - w) / 2)
         y = int((screen_height - h) / 2)
         self.root.geometry(f"{w}x{h}+{x}+{y}")
+        # Не позволяем вручную сжать окно до состояния, в котором нижние
+        # действия экспортной вкладки и кнопки тегов оказываются за границей.
+        # На маленьком экране предел автоматически уменьшается до доступного.
+        self.root.minsize(
+            max(360, min(900, screen_width - 40)),
+            max(320, min(520, screen_height - 80)),
+        )
         
         self.processor = None
         self.batch_processor = None
@@ -4479,6 +6841,7 @@ class TTSApp:
         self.tab_utils = ttk.Frame(self.notebook)
         self.tab_settings = ttk.Frame(self.notebook)
         self.tab_glossary = ttk.Frame(self.notebook)
+        self.tab_normalizer = ttk.Frame(self.notebook)
         self.tab_cache = ttk.Frame(self.notebook)
         self.tab_help = ttk.Frame(self.notebook)
         
@@ -4488,6 +6851,7 @@ class TTSApp:
         self.notebook.add(self.tab_utils, text="Экспорт и Сборка")
         self.notebook.add(self.tab_settings, text="Настройки")
         self.notebook.add(self.tab_glossary, text="Глоссарий")
+        self.notebook.add(self.tab_normalizer, text="Нормализатор")
         self.notebook.add(self.tab_cache, text="Кэш")
         self.notebook.add(self.tab_help, text="Справка")
         
@@ -4497,6 +6861,7 @@ class TTSApp:
         self.setup_utils_tab()
         self.setup_settings_tab()
         self.setup_glossary_tab()
+        self.setup_normalizer_tab()
         self.setup_cache_tab()
         self.setup_help_tab()
         
@@ -4538,17 +6903,57 @@ class TTSApp:
         self._ui_queue.put((callback, args, kwargs))
 
     def _restore_focus_on_app_click(self, event):
-        """Возвращает локальный Tk-фокус на виджет, по которому уже кликнули."""
+        """Подтверждает локальный фокус после клика и обновляет Aqua controls."""
         widget = getattr(event, "widget", None)
         if widget is None or getattr(self, "_is_closing", False):
             return
         try:
             if widget.winfo_toplevel() is not self.root:
                 return
-            current_focus = self.root.focus_get()
-            if current_focus is None:
-                widget.focus_set()
         except (AttributeError, tk.TclError):
+            return
+
+        def restore_after_click():
+            if getattr(self, "_is_closing", False):
+                return
+            try:
+                if not self.root.winfo_exists() or self.root.state() == "iconic":
+                    return
+                # К моменту idle штатные bindings Entry/Button/Treeview уже
+                # выбрали правильный дочерний виджет. Повторный focus_set на
+                # нём активирует локальный Tk-контекст, но не заменяет выбор
+                # пользователя. Для клика по пустому Frame сохраняется старое
+                # поле; если фокуса действительно нет, используем сам виджет.
+                target = self.root.focus_get()
+                try:
+                    if target is not None and target.winfo_toplevel() is not self.root:
+                        target = None
+                except (AttributeError, tk.TclError):
+                    target = None
+                if target is None:
+                    target = widget
+                try:
+                    if not target.winfo_exists():
+                        target = self.root
+                except (AttributeError, tk.TclError):
+                    target = self.root
+                target.focus_set()
+
+                # Нативные Progressbar/Scale Aqua иногда продолжают выглядеть
+                # неактивными, хотя клик уже вернул NSWindow приложению. Тот же
+                # debounced redraw используется после Map/Activate и не меняет
+                # выбранную тему или значения виджетов.
+                if (
+                    sys.platform == "darwin"
+                    and not getattr(self, "_mac_window_active", False)
+                ):
+                    self._schedule_mac_restore_refresh()
+            except tk.TclError:
+                pass
+
+        try:
+            self.root.after_idle(restore_after_click)
+        except tk.TclError:
             pass
 
     def _run_messagebox(self, dialog_function, title, message, **options):
@@ -4609,6 +7014,11 @@ class TTSApp:
 
     def _ask_yes_no(self, title, message, **options):
         return self._run_messagebox(messagebox.askyesno, title, message, **options)
+
+    def _ask_yes_no_cancel(self, title, message, **options):
+        return self._run_messagebox(
+            messagebox.askyesnocancel, title, message, **options
+        )
 
     def _create_synthesis_processor(self, config):
         """Создаёт процессор и делит RAM-кэш между одновременно активными вкладками."""
@@ -4702,6 +7112,7 @@ class TTSApp:
             return
 
         self._mac_startup_focus_done = False
+        self._mac_window_active = False
         self._mac_startup_focus_after_id = None
         self._mac_startup_map_bind_id = self.root.bind("<Map>", self._on_mac_initial_map, add="+")
         # Повторный Map корневого toplevel после сворачивания не должен снова
@@ -4717,6 +7128,9 @@ class TTSApp:
         # и потому дополняет (но не заменяет) <Map>.
         self._mac_restore_activate_bind_id = self.root.bind(
             "<Activate>", self._on_mac_restore_activate, add="+"
+        )
+        self._mac_restore_deactivate_bind_id = self.root.bind(
+            "<Deactivate>", self._on_mac_restore_deactivate, add="+"
         )
         # update_idletasks() во время построения большого интерфейса иногда успевает
         # отобразить root до установки bind. after_idle служит одноразовой страховкой.
@@ -4736,9 +7150,17 @@ class TTSApp:
 
     def _on_mac_restore_activate(self, event):
         """Повторяет redraw, когда восстановленное Aqua-окно стало активным."""
-        if event.widget is not self.root or not self._mac_startup_focus_done:
+        if event.widget is not self.root:
+            return
+        self._mac_window_active = True
+        if not self._mac_startup_focus_done:
             return
         self._schedule_mac_restore_refresh()
+
+    def _on_mac_restore_deactivate(self, event):
+        """Запоминает потерю native-активности без принудительного фокуса."""
+        if event.widget is self.root:
+            self._mac_window_active = False
 
     def _schedule_mac_restore_refresh(self):
         """Объединяет близкие Map/Activate в одну отложенную перерисовку."""
@@ -4823,6 +7245,7 @@ class TTSApp:
                 pass
             self._mac_startup_map_bind_id = None
         self._force_mac_focus()
+        self._schedule_mac_restore_refresh()
 
     def _force_mac_focus(self, *args):
         """Активирует приложение и поднимает окно; вызывается только при старте."""
@@ -4860,6 +7283,67 @@ class TTSApp:
                 self.root.attributes("-topmost", False)
         except tk.TclError:
             pass
+
+    def _paste_clipboard_once(self, event):
+        """Вставляет буфер один раз для physical и виртуального Paste event."""
+        widget = getattr(event, "widget", None)
+        if not isinstance(widget, (tk.Text, tk.Entry, ttk.Entry)):
+            try:
+                widget = self.root.focus_get()
+            except tk.TclError:
+                widget = None
+        if not isinstance(widget, (tk.Text, tk.Entry, ttk.Entry)):
+            return "break"
+
+        try:
+            clipboard_text = self.root.clipboard_get()
+        except Exception:
+            clipboard_text = ""
+        if not clipboard_text and sys.platform == "darwin":
+            try:
+                clipboard_text = subprocess.check_output(
+                    ["/usr/bin/pbpaste"],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                clipboard_text = ""
+        if not clipboard_text:
+            return "break"
+
+        # Tk сопоставляет Ctrl/Command+V с <<Paste>>, а Studio дополнительно
+        # ловит физическую клавишу ради кириллической раскладки. Оба callback
+        # могут прийти в одном event-loop turn. Guard живёт ровно до idle и
+        # не мешает следующему самостоятельному нажатию.
+        if getattr(self, "_clipboard_paste_widget", None) is widget:
+            return "break"
+        self._clipboard_paste_widget = widget
+
+        def clear_paste_guard():
+            if getattr(self, "_clipboard_paste_widget", None) is widget:
+                self._clipboard_paste_widget = None
+
+        try:
+            self.root.after_idle(clear_paste_guard)
+        except tk.TclError:
+            clear_paste_guard()
+
+        clipboard_text = normalize_clipboard_text(clipboard_text)
+        try:
+            if isinstance(widget, tk.Text):
+                if widget.tag_ranges(tk.SEL):
+                    widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                widget.insert(tk.INSERT, clipboard_text)
+            else:
+                try:
+                    if widget.selection_present():
+                        widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                except (AttributeError, tk.TclError):
+                    pass
+                widget.insert(tk.INSERT, clipboard_text)
+        except (AttributeError, tk.TclError):
+            pass
+        return "break"
         
     def _fix_cyrillic_clipboard(self):
         """Универсальный и надежный обработчик горячих клавиш без дублей (Win/Linux, RU/EN)"""
@@ -4923,39 +7407,8 @@ class TTSApp:
             return "break"
     
         def smart_paste(event):
-            w = get_target_widget(event)
-            if not w:
-                return "break"
-    
-            try:
-                clip = self.root.clipboard_get()
-            except Exception:
-                return "break"
-    
-            if clip:
-                clip = normalize_clipboard_text(clip)
-    
-                try:
-                    if isinstance(w, tk.Text):
-                        if w.tag_ranges(tk.SEL):
-                            w.delete(tk.SEL_FIRST, tk.SEL_LAST)
-                        w.insert(tk.INSERT, clip)
-                    elif isinstance(w, (tk.Entry, ttk.Entry)):
-                        try:
-                            if hasattr(w, 'selection_present') and w.selection_present():
-                                w.delete(tk.SEL_FIRST, tk.SEL_LAST)
-                            else:
-                                sel = w.selection_range()
-                                if sel:
-                                    w.delete(sel[0], sel[1])
-                        except Exception:
-                            pass
-                        w.insert(tk.INSERT, clip)
-                except Exception:
-                    pass
-    
-            return "break"
-    
+            return self._paste_clipboard_once(event)
+
         def smart_select_all(event):
             w = get_target_widget(event)
             if not w:
@@ -5014,8 +7467,11 @@ class TTSApp:
     
             return None
     
-        # 1. Отключаем дефолтную вставку Tkinter на английской раскладке, чтобы убрать задвоение
+        # 1. Физические и виртуальное событие ведут в один обработчик.
+        # Это сохраняет кириллические keycode-fallbacks и исключает двойную
+        # вставку, когда Tk также генерирует стандартный <<Paste>>.
         for w_class in ('Text', 'Entry', 'TEntry'):
+            self.root.bind_class(w_class, '<<Paste>>', smart_paste)
             self.root.bind_class(w_class, '<Control-v>', smart_paste)
             self.root.bind_class(w_class, '<Control-V>', smart_paste)
             self.root.bind_class(w_class, '<Control-c>', smart_copy)
@@ -5048,6 +7504,64 @@ class TTSApp:
     def _post_status_label(self, label, text, status="info"):
         """Потокобезопасный вариант _set_status_label()."""
         self._post_to_ui(self._set_status_label, label, text, status)
+
+    def _render_export_activity_status(self):
+        """Подгоняет рабочий статус под текущую ширину окна и шрифт."""
+        activity = getattr(self, "_export_status_activity", None)
+        label = getattr(self, "lbl_export_status", None)
+        if not activity or label is None:
+            return
+        action, subject, status = activity
+        prefix = f"{normalize_display_text(action, fallback='Обработка')}: "
+        text = format_export_activity_status(action, subject)
+        try:
+            frame_width = int(label.master.winfo_width())
+            if frame_width > 1:
+                max_text_width = min(
+                    max(80, int(frame_width * 0.58)),
+                    max(20, frame_width - 20),
+                )
+                font_name = str(label.cget("font") or "TkDefaultFont")
+                try:
+                    label_font = tkfont.nametofont(font_name, root=self.root)
+                except tk.TclError:
+                    label_font = tkfont.nametofont(
+                        "TkDefaultFont", root=self.root
+                    )
+                subject_width = max(
+                    8, max_text_width - label_font.measure(prefix)
+                )
+                fitted_subject = middle_ellipsize_to_width(
+                    subject,
+                    subject_width,
+                    label_font.measure,
+                )
+                text = prefix + fitted_subject
+        except (AttributeError, RuntimeError, tk.TclError, TypeError, ValueError):
+            # До первого показа окна или во время его закрытия достаточно
+            # консервативного ограничения по символам.
+            pass
+        self._set_status_label(label, text, status)
+
+    def _set_export_activity_status(self, action, subject, status="warning"):
+        """Показывает имя без изменения title, тегов или выходного пути."""
+        self._export_status_activity = (action, subject, status)
+        self._render_export_activity_status()
+
+    def _post_export_activity_status(self, action, subject, status="warning"):
+        """Потокобезопасно публикует рабочий статус экспорта."""
+        self._post_to_ui(
+            self._set_export_activity_status, action, subject, status
+        )
+
+    def _set_export_status(self, text, status="info"):
+        """Устанавливает обычный статус и отменяет адаптивное имя операции."""
+        self._export_status_activity = None
+        self._set_status_label(self.lbl_export_status, text, status)
+
+    def _post_export_status(self, text, status="info"):
+        """Потокобезопасный вариант _set_export_status()."""
+        self._post_to_ui(self._set_export_status, text, status)
 
     def _detect_dark_appearance(self):
         """Безопасно определяет системную тёмную тему, не вызывая AppKit."""
@@ -5164,8 +7678,20 @@ class TTSApp:
         self._disable_export_settings()
         self.update_total_export_duration()
     
+    def _export_tree_interaction_blocked(self, tree):
+        """Не даёт macOS-обходам Treeview менять замороженный экспорт."""
+        return (
+            tree is getattr(self, "export_tree", None)
+            and (
+                getattr(self, "_export_lock", False)
+                or getattr(self, "_export_running", False)
+            )
+        )
+
     def _mac_multiselect(self, event, tree):
         """Атомарное выделение с гарантированной зачисткой призраков на macOS"""
+        if self._export_tree_interaction_blocked(tree):
+            return "break"
         try:
             tree.focus_set()
         except Exception:
@@ -5195,6 +7721,8 @@ class TTSApp:
         tree.bind("<Command-ButtonPress-1>", lambda e, t=tree: self._mac_multiselect(e, t))
 
     def _mac_tree_button_press(self, event, tree):
+        if self._export_tree_interaction_blocked(tree):
+            return "break"
         try:
             tree.focus_set()
         except Exception:
@@ -5210,6 +7738,8 @@ class TTSApp:
         return bool(state & (0x0001 | 0x0004 | 0x0008 | 0x0010))
 
     def _mac_ensure_tree_plain_click(self, tree, item):
+        if self._export_tree_interaction_blocked(tree):
+            return
         try:
             if not tree.winfo_exists() or not tree.exists(item):
                 return
@@ -5226,6 +7756,9 @@ class TTSApp:
         """Обработка горячих клавиш macOS и безопасный патч первого клика"""
         # Универсальные хоткеи для работы с буфером обмена
         for widget_cls in ("Text", "Entry", "TEntry"):
+            self.root.bind_class(
+                widget_cls, "<<Paste>>", self._paste_clipboard_once
+            )
             self.root.bind_class(widget_cls, "<Command-Key>", self._dispatch_mac_cmd)
 
 
@@ -5242,33 +7775,7 @@ class TTSApp:
 
         # --- ВСТАВКА (⌘V) С АВТО-ДЕКОДИРОВАНИЕМ КИРИЛЛИЦЫ И ПУТЕЙ FINDER ---
         if kc == 9 or char in ('v', 'м', '\x16'):
-            clip = ""
-            try:
-                clip = self.root.clipboard_get()
-            except Exception:
-                pass
-            
-            if not clip:
-                try:
-                    clip = subprocess.check_output(["pbpaste"], text=True, stderr=subprocess.DEVNULL)
-                except Exception:
-                    clip = ""
-
-            if clip:
-                try:
-                    clip = normalize_clipboard_text(clip)
-
-                    if isinstance(w, tk.Text):
-                        if w.tag_ranges(tk.SEL):
-                            w.delete(tk.SEL_FIRST, tk.SEL_LAST)
-                        w.insert(tk.INSERT, clip)
-                    elif isinstance(w, (ttk.Entry, tk.Entry)):
-                        if w.selection_present():
-                            w.delete(tk.SEL_FIRST, tk.SEL_LAST)
-                        w.insert(tk.INSERT, clip)
-                except Exception as e:
-                    logging.debug(f"Ошибка вставки на Mac: {e}")
-            return "break"
+            return self._paste_clipboard_once(event)
 
         # --- КОПИРОВАНИЕ (⌘C) ---
         elif kc == 8 or char in ('c', 'с', '\x03'):
@@ -5361,10 +7868,27 @@ class TTSApp:
                 file.flush()
                 os.fsync(file.fileno())
             if backup and path.exists():
-                # Сначала готовим резервную копию во временном имени. Если
-                # копирование прервалось, существующий .bak не повреждается.
-                shutil.copy2(path, backup_temp_path)
-                os.replace(backup_temp_path, backup_path)
+                # Повреждённый primary не должен вытеснить последнюю рабочую
+                # резервную копию. Это особенно важно после запуска, который
+                # уже восстановил настройки из .bak.
+                preserve_current = True
+                try:
+                    with open(path, "r", encoding="utf-8-sig") as current_file:
+                        current_data = json.load(current_file)
+                    if isinstance(data, dict) and not isinstance(current_data, dict):
+                        raise ValueError("корень текущего JSON не является объектом")
+                except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                    preserve_current = False
+                    logging.warning(
+                        "Повреждённый JSON %s не записан поверх резервной копии: %s",
+                        path,
+                        exc,
+                    )
+                if preserve_current:
+                    # Сначала готовим резервную копию во временном имени. Если
+                    # копирование прервалось, существующий .bak не повреждается.
+                    shutil.copy2(path, backup_temp_path)
+                    os.replace(backup_temp_path, backup_path)
             os.replace(temp_path, path)
         finally:
             temp_path.unlink(missing_ok=True)
@@ -5468,6 +7992,8 @@ class TTSApp:
     def _tree_select_all(self, event):
         """Рекурсивно выделяет все элементы (включая вложенные файлы) в дереве Экспорта"""
         tree = event.widget
+        if self._export_tree_interaction_blocked(tree):
+            return "break"
         def get_all(item=""):
             res = []
             for c in tree.get_children(item):
@@ -5516,6 +8042,27 @@ class TTSApp:
                 "затем закройте приложение.",
             )
             return
+
+        glossary_dirty = bool(getattr(self, "_glossary_dirty", False))
+        glossary_editor = getattr(self, "txt_glossary", None)
+        if glossary_editor is not None:
+            try:
+                glossary_dirty = glossary_dirty or bool(
+                    glossary_editor.edit_modified()
+                )
+            except tk.TclError:
+                pass
+        if glossary_dirty:
+            save_glossary = self._ask_yes_no_cancel(
+                "Глоссарий изменён",
+                "В редакторе глоссария есть несохранённые изменения.\n\n"
+                "Сохранить их перед закрытием?",
+                icon="warning",
+            )
+            if save_glossary is None:
+                return
+            if save_glossary and not self.save_glossary_ui(show_popup=False):
+                return
         self._is_closing = True
 
         appearance_after_id = getattr(self, "_appearance_check_after_id", None)
@@ -5572,6 +8119,10 @@ class TTSApp:
         size = self.font_size_var.get()
         if hasattr(self, 'direct_text'): self.direct_text.config(font=("Arial", size))
         if hasattr(self, 'txt_glossary'): self.txt_glossary.config(font=("Courier", size))
+        if hasattr(self, 'normalizer_source_text'):
+            self.normalizer_source_text.config(font=("Arial", size))
+        if hasattr(self, 'normalizer_result_text'):
+            self.normalizer_result_text.config(font=("Arial", size))
         if hasattr(self, 'help_text_widget'): self.help_text_widget.config(font=("Arial", size))
         self.config["ui_font_size"] = size
         
@@ -5604,9 +8155,6 @@ class TTSApp:
 
     def _refresh_status_colors(self):
         """Перекрашивает постоянные статусы, не меняя их текущий смысл."""
-        # Canvas не относится к ttk и сам не перечитывает фон после выбора
-        # нативной темы/смены системного appearance.
-        self._sync_export_basic_canvas_theme()
         if hasattr(self, "tree"):
             self.tree.tag_configure("queued", foreground=self.get_status_color("muted"))
             self.tree.tag_configure("success", foreground=self.get_status_color("success"))
@@ -5703,14 +8251,13 @@ class TTSApp:
     def load_settings(self, path=SETTINGS_FILE):
         """Безопасная загрузка настроек с авто-созданием папки"""
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         loaded_config = {}
         backup_path = path.with_suffix(path.suffix + ".bak")
         candidates = [candidate for candidate in (path, backup_path) if candidate.exists()]
         for candidate in candidates:
             try:
-                with open(candidate, 'r', encoding='utf-8') as f:
+                with open(candidate, 'r', encoding='utf-8-sig') as f:
                     loaded_config = json.load(f)
                 if not isinstance(loaded_config, dict):
                     raise ValueError("корень settings.json должен быть JSON-объектом")
@@ -5719,6 +8266,17 @@ class TTSApp:
                         "Настройки восстановлены из резервной копии %s",
                         backup_path,
                     )
+                    try:
+                        # Лечим primary без ротации: исправный .bak остаётся
+                        # страховкой и не будет затёрт повреждённым файлом при
+                        # следующем автосохранении.
+                        self._write_json_atomic(path, loaded_config)
+                    except Exception as recovery_exc:
+                        logging.error(
+                            "Не удалось восстановить основной файл настроек %s: %s",
+                            path,
+                            recovery_exc,
+                        )
                 break
             except Exception as e:
                 logging.error(f"Ошибка загрузки конфига {candidate}: {e}")
@@ -5734,7 +8292,7 @@ class TTSApp:
         # сеанса. Удаляем также значение, случайно сохранённое prerelease-
         # версиями, чтобы приложение всегда стартовало в безопасном режиме.
         cfg.pop("direct_apply_tags", None)
-        # Emotion пока не является поддерживаемой настройкой ветки 1.x.
+        # Emotion пока не является поддерживаемой настройкой.
         cfg.pop("api_emotion_enabled", None)
         cfg.pop("api_emotion", None)
         return cfg
@@ -5760,7 +8318,7 @@ class TTSApp:
         # TTS-вывода: у внешних файлов есть собственные частота и каналы, а
         # режим ``auto`` должен сохраняться между запусками.
         for key, attr_name in (
-            ("output_format", "export_fmt_var"),
+            ("export_format", "export_fmt_var"),
             ("export_bitrate", "export_bitrate_var"),
             ("export_sample_rate", "export_sample_rate_var"),
             ("export_channels", "export_channels_var"),
@@ -5769,6 +8327,21 @@ class TTSApp:
             if variable is not None:
                 try:
                     self.config[key] = str(variable.get()).strip().lower()
+                except tk.TclError:
+                    pass
+
+        for key, attr_name in (
+            ("export_apply_fx", "export_apply_fx_var"),
+            ("export_fx_speed", "exp_speed_var"),
+            ("export_fx_pitch", "exp_pitch_var"),
+            ("export_fx_echo", "exp_echo_var"),
+            ("export_fx_echo_delay", "exp_delay_var"),
+            ("export_fx_echo_decay", "exp_decay_var"),
+        ):
+            variable = getattr(self, attr_name, None)
+            if variable is not None:
+                try:
+                    self.config[key] = variable.get()
                 except tk.TclError:
                     pass
 
@@ -5823,36 +8396,63 @@ class TTSApp:
             self._confirmed_steps_warnings.add(warning_key)
         return True
             
-    def save_settings(self, path=SETTINGS_FILE, show_popup=False):
-        """Безопасное сохранение настроек с авто-созданием папки и уведомлением"""
-        # Сначала забираем свежий текст из Entry, затем валидируем именно его.
-        # Обратный порядок снова сохранял введённый недоступный Windows-путь
-        # после того, как ensure_dirs уже проверил старое значение config.
-        self.update_config_from_ui()
-        self.ensure_dirs()
+    def _persist_settings_snapshot(self, snapshot, path=SETTINGS_FILE):
+        """Атомарно пишет уже подготовленный снимок, не читая остальные поля UI."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_json_atomic(path, snapshot, backup=True)
 
-        # Обычные автосохранения (пути, шрифт, закрытие окна) не должны
-        # блокироваться временно недописанным полем «Другое». Строгая проверка
-        # выполняется непосредственно перед синтезом/оптимизацией кэша.
-
-        # === НОВОЕ: Обновляем глобальный лимитер ===
-        self.shared_rate_limiter.update_limits(
-            self.config.get("api_max_requests", 15),
-            self.config.get("api_time_window", 15.0),
-        )
-        
+    def save_settings(self, path=SETTINGS_FILE, show_popup=False):
+        """Безопасное сохранение настроек с авто-созданием папки и уведомлением"""
         try:
-            self._write_json_atomic(path, self.config, backup=True)
-            if show_popup:
-                self._show_info("Успех", "Настройки успешно сохранены!")
-            return True
+            # Сначала забираем свежий текст из Entry, затем валидируем именно
+            # его. Весь путь сохранения находится внутри одного error boundary:
+            # недоступный каталог не должен ронять callback Tk.
+            self.update_config_from_ui()
+            self.ensure_dirs()
+            path = Path(path)
+
+            # Обычные автосохранения (пути, шрифт, закрытие окна) не должны
+            # блокироваться временно недописанным полем «Другое». Строгая
+            # проверка выполняется перед синтезом/оптимизацией кэша.
+            self._persist_settings_snapshot(self.config, path)
         except Exception as e:
             logging.error(f"Ошибка сохранения конфига {path}: {e}")
             if show_popup:
                 self._show_error("Ошибка", f"Не удалось сохранить настройки:\n{e}")
             return False
+
+        try:
+            self.shared_rate_limiter.update_limits(
+                self.config.get("api_max_requests", 15),
+                self.config.get("api_time_window", 15.0),
+            )
+        except Exception:
+            # settings.json уже атомарно записан; сбой необязательного runtime-
+            # обновления не должен выдавать ложную ошибку сохранения.
+            logging.exception("Не удалось обновить лимитер после сохранения")
+
+        # Файл уже успешно заменён. Ошибка необязательной перерисовки не должна
+        # выдавать ложное «сохранение не удалось» и провоцировать откат памяти
+        # при том, что settings.json содержит новый снимок.
+        for refresh in (
+            self._refresh_global_normalizer_settings_summary,
+            self._refresh_normalizer_scope_status,
+            self._refresh_audio_profile_summaries,
+        ):
+            try:
+                refresh()
+            except Exception:
+                logging.exception(
+                    "Не удалось обновить интерфейс после сохранения настроек"
+                )
+        try:
+            self._sync_glossary_editor_cache(prompt_if_dirty=show_popup)
+        except Exception:
+            logging.exception("Не удалось синхронизировать редактор глоссария")
+        if show_popup:
+            self._show_info("Успех", "Настройки успешно сохранены!")
+        return True
 
     def _schedule_settings_save(self, *_args, delay_ms=350):
         """Объединяет серию печати в одну запись settings.json."""
@@ -6002,7 +8602,14 @@ class TTSApp:
             if hasattr(self, 'export_outdir_var'):
                 self.export_outdir_var.set(str(self.config.get("export_dir", "")))
             if hasattr(self, 'export_fmt_var'):
-                self.export_fmt_var.set(str(self.config.get("output_format", "mp3")))
+                self.export_fmt_var.set(
+                    str(
+                        self.config.get(
+                            "export_format",
+                            self.config.get("output_format", "mp3"),
+                        )
+                    )
+                )
             if hasattr(self, 'export_bitrate_var'):
                 self.export_bitrate_var.set(str(self.config.get("export_bitrate", "auto")))
             if hasattr(self, "export_sample_rate_var"):
@@ -6046,15 +8653,32 @@ class TTSApp:
                     if hasattr(self, 'lbl_dir_decay'): self.lbl_dir_decay.config(text=f"{ey:.1f}")
     
                 if hasattr(self, 'exp_speed_var'):
-                    self.exp_speed_var.set(sp)
-                    self.exp_pitch_var.set(pt)
-                    self.exp_echo_var.set(ec)
-                    self.exp_delay_var.set(ed)
-                    self.exp_decay_var.set(ey)
-                    if hasattr(self, 'lbl_exp_speed'): self.lbl_exp_speed.config(text=f"{sp:.1f}x")
-                    if hasattr(self, 'lbl_exp_pitch'): self.lbl_exp_pitch.config(text=f"{pt:.2f}")
-                    if hasattr(self, 'lbl_exp_delay'): self.lbl_exp_delay.config(text=f"{ed}")
-                    if hasattr(self, 'lbl_exp_decay'): self.lbl_exp_decay.config(text=f"{ey:.1f}")
+                    export_sp = float(self.config.get("export_fx_speed", sp))
+                    export_pt = float(self.config.get("export_fx_pitch", pt))
+                    export_ec = _config_bool(
+                        self.config.get("export_fx_echo", ec)
+                    )
+                    export_ed = int(
+                        float(self.config.get("export_fx_echo_delay", ed))
+                    )
+                    export_ey = float(
+                        self.config.get("export_fx_echo_decay", ey)
+                    )
+                    self.exp_speed_var.set(export_sp)
+                    self.exp_pitch_var.set(export_pt)
+                    self.exp_echo_var.set(export_ec)
+                    self.exp_delay_var.set(export_ed)
+                    self.exp_decay_var.set(export_ey)
+                    if hasattr(self, 'export_apply_fx_var'):
+                        self.export_apply_fx_var.set(
+                            _config_bool(
+                                self.config.get("export_apply_fx", False)
+                            )
+                        )
+                    if hasattr(self, 'lbl_exp_speed'): self.lbl_exp_speed.config(text=f"{export_sp:.1f}x")
+                    if hasattr(self, 'lbl_exp_pitch'): self.lbl_exp_pitch.config(text=f"{export_pt:.2f}")
+                    if hasattr(self, 'lbl_exp_delay'): self.lbl_exp_delay.config(text=f"{export_ed}")
+                    if hasattr(self, 'lbl_exp_decay'): self.lbl_exp_decay.config(text=f"{export_ey:.1f}")
             except Exception as e:
                 logging.error(f"Ошибка ползунков: {e}")
     
@@ -6067,6 +8691,13 @@ class TTSApp:
     
         finally:
             self._is_updating_ui = False
+        if (
+            hasattr(self, "normalizer_preview_vars")
+            and self.normalizer_preview_vars
+        ):
+            self._load_normalizer_preview_from_config()
+        self._refresh_global_normalizer_settings_summary()
+        self._refresh_audio_profile_summaries()
 
     def import_config(self):
         filepath = filedialog.askopenfilename(
@@ -6075,9 +8706,9 @@ class TTSApp:
         )
         if not filepath: return
         self._remember_dialog_directory("last_config_dir", filepath)
-        
+
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with open(filepath, 'r', encoding='utf-8-sig') as f:
                 imported_data = json.load(f)
             if not isinstance(imported_data, dict): raise ValueError()
         except Exception as e:
@@ -6097,8 +8728,15 @@ class TTSApp:
             "folders": (tk.BooleanVar(value=True), "Пути к папкам"),
             "pauses": (tk.BooleanVar(value=True), "Паузы и Разделители"),
             "cache": (tk.BooleanVar(value=True), "Настройки Кэша"),
+            "normalizer": (
+                tk.BooleanVar(value=True),
+                "Нормализатор и применение глоссария",
+            ),
             "effects": (tk.BooleanVar(value=True), "Эффекты (Скорость, Тон)"),
-            "tags": (tk.BooleanVar(value=True), "Вывод и Теги ID3"),
+            "tags": (
+                tk.BooleanVar(value=True),
+                "Вывод, аудиопрофили и Теги ID3",
+            ),
             "workspace": (
                 tk.BooleanVar(value=True),
                 "Параметры вкладок (прямой синтез и импорт книг)",
@@ -6121,50 +8759,77 @@ class TTSApp:
                 for group_key, (var, _) in vars_dict.items()
                 if var.get()
             ]
-
-            previous_config = self.config.copy()
-            self.config = normalize_config(
-                merge_config_values(
-                    self.config,
-                    imported_data,
-                    selected_groups,
-                    include_api_token=include_api_token_var.get(),
+            try:
+                candidate_config = normalize_config(
+                    merge_config_values(
+                        self.config,
+                        imported_data,
+                        selected_groups,
+                        include_api_token=include_api_token_var.get(),
+                    )
                 )
-            )
-                            
-            self.set_ui_from_config()
-            if not self._validate_api_steps_ui(confirm_large=False):
-                self.config = previous_config
-                self.set_ui_from_config()
+                ensure_config_directories(candidate_config)
+                resolved_steps = resolve_api_steps(candidate_config)
+                if resolved_steps is not None:
+                    candidate_config["api_steps"] = resolved_steps
+                # Сначала фиксируем весь снимок на диске. При ошибке текущие
+                # config и UI остаются без изменений, а диалог можно повторить.
+                self._persist_settings_snapshot(candidate_config)
+            except ValueError as exc:
+                self._show_error(
+                    "Некорректные настройки",
+                    str(exc),
+                    parent=dialog,
+                )
                 return
+            except Exception as exc:
+                logging.error("Не удалось сохранить импорт настроек: %s", exc)
+                self._show_error(
+                    "Ошибка сохранения",
+                    f"Импорт не применён:\n{exc}",
+                    parent=dialog,
+                )
+                return
+
+            self.config = candidate_config
+            try:
+                self.shared_rate_limiter.update_limits(
+                    self.config.get("api_max_requests", 15),
+                    self.config.get("api_time_window", 15.0),
+                )
+            except Exception:
+                logging.exception(
+                    "Настройки импортированы, но runtime-лимитер не обновлён"
+                )
             dialog.destroy()
-            self.save_settings(SETTINGS_FILE)
             self.full_ui_refresh()
+            self._sync_glossary_editor_cache(prompt_if_dirty=True)
             self.load_files()
             self._show_info("Успех", "Выбранные настройки успешно применены!")
             
         ttk.Button(dialog, text="Импортировать", command=do_import).pack(pady=15)
-        self._center_popup(dialog, 430, 315, fit_screen=True)
+        self._center_popup(dialog, 470, 350, fit_screen=True)
 
     def reset_config(self):
         """Сброс рабочих настроек с сохранением темы оформления и размера шрифта"""
         if self._ask_yes_no("Сбросить настройки", "Сбросить рабочие настройки (паузы, лимиты, пути) к значениям по умолчанию?"):
             try:
-                self.ensure_dirs()
-                
                 # 1. Сохраняем текущие визуальные предпочтения пользователя
                 current_font_size = self.config.get("ui_font_size", 10)
 
                 # 2. Загружаем дефолты и восстанавливаем визуал
-                full_config = DEFAULT_CONFIG.copy()
-                full_config["ui_font_size"] = current_font_size
-                self.config = full_config
+                candidate_config = normalize_config(copy.deepcopy(DEFAULT_CONFIG))
+                candidate_config["ui_font_size"] = current_font_size
+                ensure_config_directories(candidate_config)
 
-                # 3. Записываем обновленные дефолты в settings.json на диск
-                self._write_json_atomic(SETTINGS_FILE, self.config, backup=True)
+                # 3. Записываем снимок до изменения работающего приложения.
+                # Если диск недоступен, прежние config и UI остаются целыми.
+                self._persist_settings_snapshot(candidate_config)
+                self.config = candidate_config
 
                 # 4. Полный проход (перетасовка) для идеально чистой перерисоки
                 self.full_ui_refresh()
+                self._sync_glossary_editor_cache(prompt_if_dirty=True)
                 self.load_files()
 
                 self._show_info("Успех", "Все рабочие настройки сброшены!\n(Тема и размер шрифта сохранены).")
@@ -6238,6 +8903,19 @@ class TTSApp:
         self.btn_go_current = ttk.Button(prog_frame, text="📍 К текущему файлу", command=self.scroll_to_current, state=tk.DISABLED)
         self.btn_go_current.grid(row=3, column=2, sticky=tk.W, pady=(5,0))
 
+        self.batch_prepared_text_var = tk.BooleanVar(value=False)
+        self.chk_batch_prepared_text = ttk.Checkbutton(
+            prog_frame,
+            text=(
+                "Текст уже подготовлен: не применять RegEx, глоссарий и "
+                "нормализацию (только этот запуск)"
+            ),
+            variable=self.batch_prepared_text_var,
+        )
+        self.chk_batch_prepared_text.grid(
+            row=4, column=0, columnspan=3, sticky=tk.W, pady=(5, 0)
+        )
+
         # --- ОБНОВЛЕННЫЙ БЛОК КНОПОК ---
         btn_frame = ttk.Frame(self.tab_main, padding=10)
         btn_frame.pack(fill=tk.X)
@@ -6273,7 +8951,7 @@ class TTSApp:
         font_cb.pack(side=tk.RIGHT)
         ttk.Label(header_frame, text="Шрифт:").pack(side=tk.RIGHT, padx=5)
         font_cb.bind("<<ComboboxSelected>>", lambda e: self.root.after(10, self.update_fonts))
-        
+
         self.direct_text = tk.Text(frame, wrap=tk.WORD, height=7, undo=True, maxundo=50)
         self.direct_text.pack(fill=tk.BOTH, expand=True, pady=5)
         
@@ -6333,6 +9011,13 @@ class TTSApp:
             text="Применить теги из настроек",
             variable=self.settings_vars["direct_apply_tags"],
         ).pack(side=tk.LEFT, padx=5)
+        self.direct_prepared_text_var = tk.BooleanVar(value=False)
+        self.chk_direct_prepared_text = ttk.Checkbutton(
+            direct_options_frame,
+            text="Текст уже подготовлен (только этот запуск)",
+            variable=self.direct_prepared_text_var,
+        )
+        self.chk_direct_prepared_text.pack(side=tk.RIGHT, padx=5)
         self._register_palette_widget(
             ttk.Label(
                 direct_options_frame,
@@ -6699,20 +9384,31 @@ class TTSApp:
 
         # === 1. ПРОГРЕСС-БАР (Пакуем в самый низ, чтобы не пропадал) ===
         prog_frame = ttk.Frame(frame)
-        prog_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
-        self.lbl_export_status = ttk.Label(prog_frame, text="Ожидание...", foreground=self.get_status_color("info"))
+        prog_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(3, 0))
+        self.lbl_export_status = ttk.Label(
+            prog_frame,
+            text="Ожидание...",
+            anchor=tk.W,
+            foreground=self.get_status_color("info"),
+        )
         self.lbl_export_status.pack(side=tk.LEFT)
         self._status_label_kinds[self.lbl_export_status] = "info"
+        self._export_status_activity = None
         self.export_progress = ttk.Progressbar(prog_frame, orient=tk.HORIZONTAL, length=400, mode='determinate')
         self.export_progress.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(10, 0))
+        prog_frame.bind(
+            "<Configure>",
+            lambda _event: self._render_export_activity_status(),
+            add="+",
+        )
 
         # === 2. ПАНЕЛЬ ЭКСПОРТА ===
-        self.export_frame = ttk.LabelFrame(frame, text="Экспорт", padding=5)
-        self.export_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+        self.export_frame = ttk.LabelFrame(frame, text="Экспорт", padding=4)
+        self.export_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(3, 2))
         export_frame = self.export_frame
         
         row1 = ttk.Frame(export_frame)
-        row1.pack(fill=tk.X, pady=2)
+        row1.pack(fill=tk.X, pady=1)
         ttk.Label(row1, text="Папка:").pack(side=tk.LEFT, padx=5)
         
         self.export_outdir_var = tk.StringVar(value=self.config.get("export_dir", ""))
@@ -6730,9 +9426,11 @@ class TTSApp:
         self.ent_export_dir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
         row2 = ttk.Frame(export_frame)
-        row2.pack(fill=tk.X, pady=2)
+        row2.pack(fill=tk.X, pady=1)
         ttk.Label(row2, text="Формат:").pack(side=tk.LEFT, padx=(5, 2))
-        self.export_fmt_var = tk.StringVar(value=self.config.get("output_format", "mp3"))
+        self.export_fmt_var = tk.StringVar(
+            value=self.config.get("export_format", self.config.get("output_format", "mp3"))
+        )
         self.cb_export_fmt = ttk.Combobox(
             row2,
             textvariable=self.export_fmt_var,
@@ -6784,64 +9482,168 @@ class TTSApp:
         )
         self.cb_export_channels.pack(side=tk.LEFT)
 
+        self.btn_audio_profiles_export = ttk.Button(
+            row2,
+            text="🎛 Аудиопрофили…",
+            command=lambda: self.open_audio_profiles_dialog("export"),
+        )
+        self.btn_audio_profiles_export.pack(side=tk.RIGHT, padx=(10, 5))
+
         self.export_fmt_var.trace_add(
             "write", lambda *_args: self._sync_export_mode_controls()
         )
         
-        self.export_apply_fx_var = tk.BooleanVar(value=False)
-        self.chk_export_fx = ttk.Checkbutton(row2, text="Наложить эффекты", variable=self.export_apply_fx_var)
-        self.chk_export_fx.pack(side=tk.LEFT, padx=10)
+        self.export_apply_fx_var = tk.BooleanVar(
+            value=_config_bool(self.config.get("export_apply_fx", False))
+        )
 
         # Режим обновления тегов отключает параметры сборки, поэтому
         # сам флаг размещается ниже этих параметров, в строке действий.
         self.export_tags_only_var = tk.BooleanVar(value=False)
 
         row3 = ttk.Frame(export_frame)
-        row3.pack(fill=tk.X, pady=2)
+        row3.pack(fill=tk.X, pady=1)
+
+        self.chk_export_fx = ttk.Checkbutton(
+            row3,
+            text="Наложить эффекты",
+            variable=self.export_apply_fx_var,
+        )
+        self.chk_export_fx.pack(side=tk.LEFT, padx=(5, 8))
         
         ttk.Label(row3, text="Скор:").pack(side=tk.LEFT, padx=1)
-        self.exp_speed_var = tk.DoubleVar(value=self.config.get("fx_speed", 1.0))
+        self.exp_speed_var = tk.DoubleVar(
+            value=self.config.get("export_fx_speed", self.config.get("fx_speed", 1.0))
+        )
         self.lbl_exp_speed = ttk.Label(row3, text=f"{self.exp_speed_var.get():.1f}x", width=4)
         self.lbl_exp_speed.pack(side=tk.LEFT)
-        ttk.Scale(row3, from_=0.5, to_=3.0, variable=self.exp_speed_var, command=lambda v: self.lbl_exp_speed.config(text=f"{float(v):.1f}x")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        self.scale_exp_speed = ttk.Scale(
+            row3,
+            from_=0.5,
+            to=3.0,
+            variable=self.exp_speed_var,
+            command=lambda value: self.lbl_exp_speed.config(
+                text=f"{float(value):.1f}x"
+            ),
+        )
+        self.scale_exp_speed.pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=2
+        )
         
         ttk.Label(row3, text="Тон:").pack(side=tk.LEFT, padx=(4, 1))
-        self.exp_pitch_var = tk.DoubleVar(value=self.config.get("fx_pitch", 1.0))
+        self.exp_pitch_var = tk.DoubleVar(
+            value=self.config.get("export_fx_pitch", self.config.get("fx_pitch", 1.0))
+        )
         self.lbl_exp_pitch = ttk.Label(row3, text=f"{self.exp_pitch_var.get():.2f}", width=4)
         self.lbl_exp_pitch.pack(side=tk.LEFT)
-        ttk.Scale(row3, from_=0.5, to_=2.0, variable=self.exp_pitch_var, command=lambda v: self.lbl_exp_pitch.config(text=f"{float(v):.2f}")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        self.scale_exp_pitch = ttk.Scale(
+            row3,
+            from_=0.5,
+            to=2.0,
+            variable=self.exp_pitch_var,
+            command=lambda value: self.lbl_exp_pitch.config(
+                text=f"{float(value):.2f}"
+            ),
+        )
+        self.scale_exp_pitch.pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=2
+        )
         
-        self.exp_echo_var = tk.BooleanVar(value=self.config.get("fx_echo", False))
-        ttk.Checkbutton(row3, text="Эхо", variable=self.exp_echo_var).pack(side=tk.LEFT, padx=(4, 2))
+        self.exp_echo_var = tk.BooleanVar(
+            value=self.config.get("export_fx_echo", self.config.get("fx_echo", False))
+        )
+        self.chk_exp_echo = ttk.Checkbutton(
+            row3, text="Эхо", variable=self.exp_echo_var
+        )
+        self.chk_exp_echo.pack(side=tk.LEFT, padx=(4, 2))
         
         ttk.Label(row3, text="Зад:").pack(side=tk.LEFT, padx=1)
-        self.exp_delay_var = tk.IntVar(value=self.config.get("fx_echo_delay", 300))
+        self.exp_delay_var = tk.IntVar(
+            value=self.config.get(
+                "export_fx_echo_delay", self.config.get("fx_echo_delay", 300)
+            )
+        )
         self.lbl_exp_delay = ttk.Label(row3, text=f"{self.exp_delay_var.get()}", width=4)
         self.lbl_exp_delay.pack(side=tk.LEFT)
-        ttk.Scale(row3, from_=50, to_=1000, variable=self.exp_delay_var, command=lambda v: self.lbl_exp_delay.config(text=f"{int(float(v))}")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        self.scale_exp_delay = ttk.Scale(
+            row3,
+            from_=50,
+            to=1000,
+            variable=self.exp_delay_var,
+            command=lambda value: self.lbl_exp_delay.config(
+                text=f"{int(float(value))}"
+            ),
+        )
+        self.scale_exp_delay.pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=2
+        )
         
         ttk.Label(row3, text="Сил:").pack(side=tk.LEFT, padx=(4, 1))
-        self.exp_decay_var = tk.DoubleVar(value=self.config.get("fx_echo_decay", 0.3))
+        self.exp_decay_var = tk.DoubleVar(
+            value=self.config.get(
+                "export_fx_echo_decay", self.config.get("fx_echo_decay", 0.3)
+            )
+        )
         self.lbl_exp_decay = ttk.Label(row3, text=f"{self.exp_decay_var.get():.1f}", width=3)
         self.lbl_exp_decay.pack(side=tk.LEFT)
-        ttk.Scale(row3, from_=0.1, to_=0.8, variable=self.exp_decay_var, command=lambda v: self.lbl_exp_decay.config(text=f"{float(v):.1f}")).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        ttk.Button(row3, text="🔄 Сброс", command=self.reset_export_fx).pack(side=tk.RIGHT, padx=2)
+        self.scale_exp_decay = ttk.Scale(
+            row3,
+            from_=0.1,
+            to=0.8,
+            variable=self.exp_decay_var,
+            command=lambda value: self.lbl_exp_decay.config(
+                text=f"{float(value):.1f}"
+            ),
+        )
+        self.scale_exp_decay.pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=2
+        )
+        self.btn_reset_export_fx = ttk.Button(
+            row3, text="🔄 Сброс", command=self.reset_export_fx
+        )
+        self.btn_reset_export_fx.pack(side=tk.RIGHT, padx=2)
+        self.export_fx_value_controls = (
+            self.scale_exp_speed,
+            self.scale_exp_pitch,
+            self.chk_exp_echo,
+            self.scale_exp_delay,
+            self.scale_exp_decay,
+            self.btn_reset_export_fx,
+        )
+
+        # Сводка получает собственную строку: длинное имя/расшифровка больше не
+        # сжимает ни флажок тегов, ни кнопки запуска.
+        profile_summary_row = ttk.Frame(export_frame)
+        profile_summary_row.pack(fill=tk.X, pady=(0, 1))
+        self.lbl_export_audio_profile_summary = self._register_palette_widget(
+            ttk.Label(
+                profile_summary_row,
+                text="",
+                foreground=self.get_status_color("muted"),
+                font=("", 9),
+                anchor=tk.W,
+                justify=tk.LEFT,
+            ),
+            "muted",
+        )
+        self.lbl_export_audio_profile_summary.pack(
+            fill=tk.X, expand=True, padx=5
+        )
+
+        def resize_profile_summary(event):
+            try:
+                self.lbl_export_audio_profile_summary.configure(
+                    wraplength=max(320, event.width - 10)
+                )
+            except tk.TclError:
+                pass
+
+        profile_summary_row.bind("<Configure>", resize_profile_summary, add="+")
 
         # Команды сборки вынесены в отдельную строку: параметры профиля и
         # эффекты остаются доступными даже при небольшой ширине окна.
         row4 = ttk.Frame(export_frame)
-        row4.pack(fill=tk.X, pady=(2, 0))
-        self.chk_export_tags_only = ttk.Checkbutton(
-            row4,
-            text="Только обновить теги в исходных файлах",
-            variable=self.export_tags_only_var,
-        )
-        self.chk_export_tags_only.pack(side=tk.LEFT, padx=5)
-
-        # Блокировка UI при включении режима "только теги".
-        self.export_tags_only_var.trace_add(
-            "write", lambda *_args: self._sync_export_mode_controls()
-        )
+        row4.pack(fill=tk.X, pady=(1, 0))
 
         export_actions = ttk.Frame(row4)
         export_actions.pack(side=tk.RIGHT)
@@ -6859,10 +9661,39 @@ class TTSApp:
         )
         self.btn_export_stop.pack(side=tk.LEFT)
 
+        self.chk_export_tags_only = ttk.Checkbutton(
+            row4,
+            text="Только обновить теги в исходных файлах",
+            variable=self.export_tags_only_var,
+        )
+        self.chk_export_tags_only.pack(side=tk.LEFT, padx=5)
+
+        # Блокировка UI при включении режима "только теги".
+        self.export_tags_only_var.trace_add(
+            "write", lambda *_args: self._sync_export_mode_controls()
+        )
+
+        for variable in (
+            self.export_fmt_var,
+            self.export_bitrate_var,
+            self.export_sample_rate_var,
+            self.export_channels_var,
+            self.export_apply_fx_var,
+            self.exp_speed_var,
+            self.exp_pitch_var,
+            self.exp_echo_var,
+            self.exp_delay_var,
+            self.exp_decay_var,
+        ):
+            variable.trace_add(
+                "write", lambda *_args: self._refresh_audio_profile_summaries()
+            )
+        self._refresh_audio_profile_summaries()
+
         # === 3. ПАНЕЛЬ КНОПОК (В ДВА РЯДА) ===
         self.export_mid_frame = ttk.Frame(frame)
-        self.export_mid_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
-        
+        self.export_mid_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(3, 2))
+
         mid_row1 = ttk.Frame(self.export_mid_frame)
         mid_row1.pack(fill=tk.X, pady=1)
         self.btn_export_add_group = ttk.Button(mid_row1, text="📁 Добавить группу", command=self.add_export_group)
@@ -6871,7 +9702,11 @@ class TTSApp:
         self.btn_export_add_folder.pack(side=tk.LEFT, padx=1)
         self.btn_export_add_files = ttk.Button(mid_row1, text="🎵 Добавить аудио", command=self.add_export_files)
         self.btn_export_add_files.pack(side=tk.LEFT, padx=1)
-        self.btn_export_group_selected = ttk.Button(mid_row1, text="📦 В новую группу", command=self.group_selected_into_new)
+        self.btn_export_group_selected = ttk.Button(
+            mid_row1,
+            text="🔗 Объединить",
+            command=self.merge_selected_export_items,
+        )
         self.btn_export_group_selected.pack(side=tk.LEFT, padx=(10, 1))
         # ИСПРАВЛЕНИЕ: Разгруппировать перенесено в первый ряд!
         self.btn_export_ungroup = ttk.Button(mid_row1, text="📤 Разгруппировать", command=self.ungroup_export_items)
@@ -6887,6 +9722,12 @@ class TTSApp:
         self.btn_export_up.pack(side=tk.LEFT, padx=1)
         self.btn_export_auto_split = ttk.Button(mid_row2, text="⏱ Авто-разбивка", command=self.auto_split_export)
         self.btn_export_auto_split.pack(side=tk.LEFT, padx=(10, 1))
+        self.btn_export_clear = ttk.Button(
+            mid_row2,
+            text="🧹 Очистить всё",
+            command=self.clear_export_project,
+        )
+        self.btn_export_clear.pack(side=tk.RIGHT, padx=1)
 
         # === 4. ВЕРХНЯЯ ПАНЕЛЬ С ДЕРЕВОМ ===
         # Изменены веса, чтобы дерево занимало больше места (weight=4 vs weight=1)
@@ -6935,91 +9776,79 @@ class TTSApp:
         self.grp_notebook = ttk.Notebook(self.group_settings_frame)
         self.grp_notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         
-        self.grp_tab_basic = ttk.Frame(self.grp_notebook)
+        self.grp_tab_basic = ttk.Frame(self.grp_notebook, padding=5)
         self.grp_tab_tags = ttk.Frame(self.grp_notebook, padding=5)
         self.grp_notebook.add(self.grp_tab_basic, text="Основные")
         self.grp_notebook.add(self.grp_tab_tags, text="Теги")
 
-        # На невысоких экранах нижняя кнопка массового применения раньше
-        # обрезалась ноутбуком. Прокручиваем только эту компактную вкладку,
-        # причём полосу показываем лишь при фактическом переполнении. Фон
-        # обычного Canvas явно синхронизируется с ttk, иначе на Aqua/в тёмной
-        # теме он выглядит как белое поле внутри системной панели.
-        canvas_background = ttk.Style(self.root).lookup("TFrame", "background")
-        if not canvas_background:
-            canvas_background = self.root.cget("background")
-        self.grp_basic_canvas = tk.Canvas(
-            self.grp_tab_basic,
-            width=270,
-            height=1,
-            background=canvas_background,
-            highlightthickness=0,
-            borderwidth=0,
-            takefocus=False,
-        )
-        self.grp_basic_scrollbar = ttk.Scrollbar(
-            self.grp_tab_basic,
-            orient=tk.VERTICAL,
-            command=self.grp_basic_canvas.yview,
-        )
-        self._grp_basic_scrollbar_visible = False
-        self.grp_basic_canvas.configure(
-            yscrollcommand=self._set_export_basic_scrollbar
-        )
-        self.grp_basic_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Все основные поля помещаются в пять компактных строк. ttk-only
+        # разметка не создаёт непрозрачного Canvas, который на Aqua/Tk 9 мог
+        # выглядеть белой полосой на фоне нативной вкладки.
+        self.grp_basic_content = ttk.Frame(self.grp_tab_basic)
+        self.grp_basic_content.pack(fill=tk.BOTH, expand=True)
+        self.grp_basic_content.columnconfigure(1, weight=1)
+        self.grp_basic_content.columnconfigure(3, weight=1)
 
-        self.grp_basic_content = ttk.Frame(self.grp_basic_canvas, padding=5)
-        self._grp_basic_window = self.grp_basic_canvas.create_window(
-            (0, 0), window=self.grp_basic_content, anchor="nw"
+        self.lbl_grp_name = ttk.Label(
+            self.grp_basic_content, text="Имя группы / Название трека:"
         )
-        self.grp_basic_content.bind(
-            "<Configure>",
-            self._update_export_basic_scroll_region,
-        )
-        self.grp_basic_canvas.bind(
-            "<Configure>",
-            self._resize_export_basic_content,
-        )
-
-        self.lbl_grp_name = ttk.Label(self.grp_basic_content, text="Имя группы / Название трека:")
-        self.lbl_grp_name.pack(anchor=tk.W, pady=(0, 2))
+        self.lbl_grp_name.grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=2)
         self.grp_name_var = tk.StringVar()
         self.grp_name_var.trace_add("write", self.save_export_item_settings)
-        ttk.Entry(self.grp_basic_content, textvariable=self.grp_name_var).pack(fill=tk.X, pady=(0, 10))
+        ttk.Entry(
+            self.grp_basic_content, textvariable=self.grp_name_var
+        ).grid(row=0, column=1, columnspan=3, sticky=tk.EW, pady=2)
         
         self.grp_merge_var = tk.BooleanVar()
         self.grp_merge_var.trace_add("write", self.save_export_item_settings)
         self.grp_merge_var.trace_add(
             "write", lambda *_args: self._sync_group_subfolder_state()
         )
-        self.chk_merge = ttk.Checkbutton(self.grp_basic_content, text="Склеить файлы в один трек", variable=self.grp_merge_var)
-        self.chk_merge.pack(anchor=tk.W, pady=2)
+        flags_row = ttk.Frame(self.grp_basic_content)
+        flags_row.grid(
+            row=1, column=0, columnspan=4, sticky=tk.W, pady=2
+        )
+        self.chk_merge = ttk.Checkbutton(
+            flags_row,
+            text="Склеить файлы в один трек",
+            variable=self.grp_merge_var,
+        )
+        self.chk_merge.pack(side=tk.LEFT)
         
         self.grp_subfolder_var = tk.BooleanVar(value=True)
         self.grp_subfolder_var.trace_add("write", self.save_export_item_settings)
-        self.chk_subfolder = ttk.Checkbutton(self.grp_basic_content, text="Сохранять в подпапку", variable=self.grp_subfolder_var)
-        self.chk_subfolder.pack(anchor=tk.W, pady=(0, 5))
+        self.chk_subfolder = ttk.Checkbutton(
+            flags_row,
+            text="Сохранять в подпапку",
+            variable=self.grp_subfolder_var,
+        )
+        self.chk_subfolder.pack(side=tk.LEFT, padx=(6, 0))
         self.lbl_subfolder_hint = self._register_palette_widget(
             ttk.Label(
                 self.grp_basic_content,
                 text="Доступно только когда файлы группы не склеиваются.",
                 foreground=self.get_status_color("muted"),
                 font=("", 8, "italic"),
+                wraplength=390,
             ),
             "muted",
         )
-        self.lbl_subfolder_hint.pack(anchor=tk.W, pady=(0, 5))
+        self.lbl_subfolder_hint.grid(
+            row=2, column=0, columnspan=4, sticky=tk.W, pady=(0, 2)
+        )
         
-        ttk.Label(self.grp_basic_content, text="Пауза между файлами (мс):").pack(anchor=tk.W, pady=(5, 2))
+        ttk.Label(
+            self.grp_basic_content, text="Пауза между файлами (мс):"
+        ).grid(row=3, column=0, sticky=tk.W, padx=(0, 6), pady=2)
         self.grp_pause_var = tk.IntVar()
         self.grp_pause_var.trace_add("write", self.save_export_item_settings)
         self.ent_pause = ttk.Entry(self.grp_basic_content, textvariable=self.grp_pause_var, width=10)
-        self.ent_pause.pack(anchor=tk.W, pady=(0, 10))
+        self.ent_pause.grid(row=3, column=1, sticky=tk.W, pady=2)
         
-        # ЭЛЕГАНТНАЯ КНОПКА МАССОВОГО ПРИМЕНЕНИЯ
         self.btn_mass_apply_basic = ttk.Button(self.grp_basic_content, text="⚙️ Применить ко всем группам...", command=self.open_mass_apply_dialog)
-        self.btn_mass_apply_basic.pack(anchor=tk.W, pady=5)
-        self._bind_export_basic_scroll_events(self.grp_tab_basic)
+        self.btn_mass_apply_basic.grid(
+            row=4, column=0, columnspan=4, sticky=tk.W, pady=(4, 2)
+        )
         
         # -- Вкладка: Теги --
         tag_grid = ttk.Frame(self.grp_tab_tags)
@@ -7078,91 +9907,6 @@ class TTSApp:
         self._disable_export_settings()
         
     # --- Логика интерфейса Сборщика ---
-    def _sync_export_basic_canvas_theme(self):
-        """Убирает нетематический фон Canvas внутри ttk-вкладки."""
-        canvas = getattr(self, "grp_basic_canvas", None)
-        if canvas is None:
-            return
-        try:
-            background = ttk.Style(self.root).lookup("TFrame", "background")
-            if not background:
-                background = self.root.cget("background")
-            canvas.configure(background=background)
-        except (AttributeError, tk.TclError):
-            pass
-
-    def _set_export_basic_scrollbar(self, first, last):
-        """Автоматически показывает полосу только для прокручиваемого вида."""
-        try:
-            first_value = float(first)
-            last_value = float(last)
-        except (TypeError, ValueError):
-            first_value, last_value = 0.0, 1.0
-
-        self.grp_basic_scrollbar.set(first, last)
-        overflow = first_value > 0.0 or last_value < 1.0
-        visible = bool(
-            getattr(self, "_grp_basic_scrollbar_visible", False)
-        )
-        if overflow and not visible:
-            # ``before`` сохраняет правильный порядок pack: полоса получает
-            # свою узкую полосу справа, а Canvas занимает остаток.
-            self.grp_basic_scrollbar.pack(
-                side=tk.RIGHT,
-                fill=tk.Y,
-                before=self.grp_basic_canvas,
-            )
-            self._grp_basic_scrollbar_visible = True
-        elif not overflow and visible:
-            self.grp_basic_scrollbar.pack_forget()
-            self._grp_basic_scrollbar_visible = False
-            self.grp_basic_canvas.yview_moveto(0)
-
-    def _update_export_basic_scroll_region(self, _event=None):
-        """Пересчитывает реальную область после изменения размеров полей."""
-        bbox = self.grp_basic_canvas.bbox("all")
-        self.grp_basic_canvas.configure(scrollregion=bbox or (0, 0, 0, 0))
-
-    def _resize_export_basic_content(self, event):
-        """Растягивает ttk-содержимое по ширине видимой части Canvas."""
-        self.grp_basic_canvas.itemconfigure(
-            self._grp_basic_window,
-            width=max(1, event.width),
-        )
-        self._update_export_basic_scroll_region()
-
-    def _bind_export_basic_scroll_events(self, widget):
-        """Делает колесо доступным над всеми дочерними полями."""
-        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-            widget.bind(
-                sequence,
-                self._scroll_export_basic_settings,
-                add="+",
-            )
-        for child in widget.winfo_children():
-            self._bind_export_basic_scroll_events(child)
-
-    def _scroll_export_basic_settings(self, event):
-        """Прокручивает компактную вкладку основных настроек группы."""
-        if not getattr(self, "_grp_basic_scrollbar_visible", False):
-            return None
-        event_num = getattr(event, "num", None)
-        event_delta = getattr(event, "delta", 0)
-        if event_num == 4:
-            units = -1
-        elif event_num == 5:
-            units = 1
-        elif event_delta:
-            # Windows посылает кратные 120, macOS может передавать
-            # меньшие значения трекпада.
-            units = -max(1, abs(int(event_delta)) // 120)
-            if event_delta < 0:
-                units = -units
-        else:
-            return None
-        self.grp_basic_canvas.yview_scroll(units, "units")
-        return "break"
-
     def _sync_export_mode_controls(self):
         """Восстанавливает специальные состояния полей режима экспорта."""
         if getattr(self, "_export_running", False):
@@ -7181,6 +9925,11 @@ class TTSApp:
         self.cb_export_sample_rate.configure(state=combo_state)
         self.cb_export_channels.configure(state=combo_state)
         self.chk_export_fx.configure(state=normal_state)
+        for control in getattr(self, "export_fx_value_controls", ()):
+            control.configure(state=normal_state)
+        audio_profiles_button = getattr(self, "btn_audio_profiles_export", None)
+        if audio_profiles_button is not None:
+            audio_profiles_button.configure(state=normal_state)
         self.btn_export_start.configure(state=tk.NORMAL)
         self.btn_export_stop.configure(state=tk.DISABLED)
         self.chk_export_tags_only.configure(state=tk.NORMAL)
@@ -7263,7 +10012,10 @@ class TTSApp:
         self._sync_group_subfolder_state()
 
     def on_export_tree_select(self, event):
-        if getattr(self, "_export_running", False):
+        if (
+            getattr(self, "_export_lock", False)
+            or getattr(self, "_export_running", False)
+        ):
             return
         selected = self.export_tree.selection()
         if not selected:
@@ -7272,33 +10024,35 @@ class TTSApp:
             return
             
         item = selected[0]
-        self._is_updating_ui = True 
-        self.current_selected_export_item = item
-        
-        # Передаем сам item, чтобы функция поняла, файл это, группа или корень
-        self._enable_export_settings(item)
-        
         is_group = item in self.export_groups
         settings = self.export_groups.get(item) if is_group else self.export_files.get(item)
-        if not settings: 
-            self._is_updating_ui = False
+        if settings is None:
+            self.current_selected_export_item = None
+            self._disable_export_settings()
             return
-        
-        self.grp_name_var.set(settings.get("name" if is_group else "title", ""))
-        self.grp_artist_var.set(settings.get("artist", ""))
-        self.grp_album_var.set(settings.get("album", ""))
-        self.grp_album_artist_var.set(settings.get("album_artist", ""))
-        self.grp_genre_var.set(settings.get("genre", ""))
-        self.grp_composer_var.set(settings.get("composer", ""))
-        self.grp_year_var.set(settings.get("year", ""))
-        self.grp_cover_var.set(settings.get("cover", ""))
-        
-        if is_group:
-            self.grp_merge_var.set(settings.get("merge", True))
-            self.grp_subfolder_var.set(settings.get("subfolder", True))
-            self.grp_pause_var.set(settings.get("pause", 1000))
-            
-        self._is_updating_ui = False
+
+        self._is_updating_ui = True
+        try:
+            self.current_selected_export_item = item
+
+            # Передаём сам item, чтобы функция различила файл, группу и корень.
+            self._enable_export_settings(item)
+
+            self.grp_name_var.set(settings.get("name" if is_group else "title", ""))
+            self.grp_artist_var.set(settings.get("artist", ""))
+            self.grp_album_var.set(settings.get("album", ""))
+            self.grp_album_artist_var.set(settings.get("album_artist", ""))
+            self.grp_genre_var.set(settings.get("genre", ""))
+            self.grp_composer_var.set(settings.get("composer", ""))
+            self.grp_year_var.set(settings.get("year", ""))
+            self.grp_cover_var.set(settings.get("cover", ""))
+
+            if is_group:
+                self.grp_merge_var.set(settings.get("merge", True))
+                self.grp_subfolder_var.set(settings.get("subfolder", True))
+                self.grp_pause_var.set(settings.get("pause", 1000))
+        finally:
+            self._is_updating_ui = False
         self._sync_group_subfolder_state()
 
     def save_export_item_settings(self, *args):
@@ -7495,27 +10249,152 @@ class TTSApp:
         for group_id in affected_groups:
             self.update_group_duration(group_id)
 
-    def group_selected_into_new(self):
-        """Забирает выделенные файлы из любых мест и переносит в новую чистую группу"""
+    def merge_selected_export_items(self):
+        """Объединяет группы и/или файлы без изменения аудио на диске."""
         if getattr(self, "_export_running", False) or getattr(self, "_export_lock", False):
             return
-        selected_items = self.export_tree.selection()
-        files_to_move = [item for item in selected_items if item in self.export_files]
-        
-        if not files_to_move:
-            self._show_warning("Внимание", "Выделите аудиофайлы в списке для объединения в группу.")
+        selected_items = tuple(self.export_tree.selection())
+        if not selected_items:
+            self._show_warning(
+                "Внимание",
+                "Выделите группы или аудиофайлы для объединения.",
+            )
             return
 
-        new_g_id = self.add_export_group()
-        
-        for f_id in files_to_move:
-            old_parent = self.export_tree.parent(f_id)
-            self.export_tree.move(f_id, new_g_id, tk.END)
-            if old_parent:
-                self.update_group_duration(old_parent)
+        plan = plan_export_merge(
+            self.export_tree.get_children(""),
+            {
+                group_id: self.export_tree.get_children(group_id)
+                for group_id in self.export_groups
+            },
+            selected_items,
+            self.export_groups,
+            self.export_files,
+        )
+        target_group = plan["target_group"]
+        source_groups = plan["source_groups"]
+        files_to_move = plan["file_ids"]
 
-        self.update_group_duration(new_g_id)
-        self.export_tree.selection_set(new_g_id)
+        selected_groups = tuple(
+            group_id
+            for group_id in (target_group, *source_groups)
+            if group_id is not None
+        )
+        unknown_children = [
+            child_id
+            for group_id in selected_groups
+            for child_id in self.export_tree.get_children(group_id)
+            if child_id not in self.export_files
+        ]
+        if unknown_children:
+            self._show_error(
+                "Не удалось объединить",
+                "Структура списка временно рассинхронизирована. Обновите "
+                "список или перезапустите приложение; слияние не выполнялось.",
+            )
+            logging.error(
+                "Слияние экспорта отменено: неизвестные дочерние узлы %s",
+                unknown_children,
+            )
+            return
+
+        roots = tuple(self.export_tree.get_children(""))
+        root_positions = {item_id: index for index, item_id in enumerate(roots)}
+        contributing_positions = [
+            root_positions[group_id]
+            for group_id in selected_groups
+            if group_id in root_positions
+        ]
+        for file_id in files_to_move:
+            parent_id = self.export_tree.parent(file_id)
+            root_id = parent_id or file_id
+            if root_id in root_positions:
+                contributing_positions.append(root_positions[root_id])
+
+        file_needs_move = any(
+            self.export_tree.exists(file_id)
+            and self.export_tree.parent(file_id) != target_group
+            for file_id in files_to_move
+        )
+        if target_group is not None and not source_groups and not file_needs_move:
+            self._show_info(
+                "Объединять нечего",
+                (
+                    "В выбранной группе нет аудиофайлов."
+                    if not files_to_move
+                    else (
+                        "Выбрана только одна готовая группа — объединять нечего."
+                        if selected_items == (target_group,)
+                        else "Все выбранные файлы уже находятся в этой группе."
+                    )
+                ),
+            )
+            return
+        if target_group is None and not files_to_move:
+            self._show_warning(
+                "Пусто",
+                "В выбранных элементах нет аудиофайлов.",
+            )
+            return
+
+        if source_groups:
+            target_name = self.export_groups.get(target_group, {}).get(
+                "name", "целевая группа"
+            )
+            if not self._ask_yes_no(
+                "Объединить группы",
+                f"Сохранить имя, теги и настройки группы «{target_name}» "
+                f"и перенести в неё выбранные файлы?\n\n"
+                f"Остальные выбранные группы ({len(source_groups)}) "
+                "будут удалены из проекта. Порядок файлов будет взят из "
+                "текущего дерева, а итоговая группа займёт место первого "
+                "выбранного источника. Файлы на диске не изменятся.",
+                icon="warning",
+            ):
+                return
+
+        if target_group is None:
+            target_group = self.add_export_group()
+            if target_group is None:
+                return
+        if contributing_positions:
+            self.export_tree.move(target_group, "", min(contributing_positions))
+
+        affected_groups = set()
+        for file_id in files_to_move:
+            if not self.export_tree.exists(file_id):
+                continue
+            previous_parent = self.export_tree.parent(file_id)
+            if previous_parent in self.export_groups and previous_parent != target_group:
+                affected_groups.add(previous_parent)
+            self.export_tree.move(file_id, target_group, tk.END)
+
+        for group_id in source_groups:
+            if not self.export_tree.exists(group_id):
+                self.export_groups.pop(group_id, None)
+                continue
+            if self.export_tree.get_children(group_id):
+                logging.warning(
+                    "Группа %s не удалена после слияния: остались неизвестные дочерние узлы",
+                    group_id,
+                )
+                continue
+            self.export_groups.pop(group_id, None)
+            self.export_tree.delete(group_id)
+
+        for group_id in affected_groups:
+            if group_id != target_group and self.export_tree.exists(group_id):
+                self.update_group_duration(group_id)
+
+        self.update_group_duration(target_group)
+        self.current_selected_export_item = None
+        self.export_tree.selection_set(target_group)
+        self.export_tree.focus(target_group)
+        self.on_export_tree_select(None)
+
+    def group_selected_into_new(self):
+        """Совместимое имя прежней команды для внешних вызовов."""
+        return self.merge_selected_export_items()
     
     def add_export_group(self, name=None):
         if getattr(self, "_export_running", False) or getattr(self, "_export_lock", False):
@@ -7524,18 +10403,10 @@ class TTSApp:
         
         if not name:
             template = self.settings_vars["default_group_name"].get()
-            
-            # Определяем стартовый номер (например "{num:0}" -> 0, "{num}" -> 1)
-            match_start = re.search(r'\{num:(\d+)\}', template)
-            start_index = int(match_start.group(1)) if match_start else 1
-            
-            num = start_index
-            while True:
-                # Заменяем как {num:0}, так и {num}
-                g_name = re.sub(r'\{num(?::\d+)?\}', str(num), template)
-                if not any(g["name"] == g_name for g in self.export_groups.values()):
-                    break
-                num += 1
+            g_name = next_sequence_name(
+                template,
+                (group.get("name", "") for group in self.export_groups.values()),
+            )
         else:
             g_name = name
             
@@ -7565,8 +10436,9 @@ class TTSApp:
             self._sync_export_mode_controls()
             selected = self.export_tree.selection() if hasattr(self, "export_tree") else ()
             if selected:
-                self._enable_export_settings(selected[0])
+                self.on_export_tree_select(None)
             else:
+                self.current_selected_export_item = None
                 self._disable_export_settings()
 
     def _set_export_running_state(self, running):
@@ -7595,8 +10467,9 @@ class TTSApp:
             self._sync_export_mode_controls()
             selected = self.export_tree.selection()
             if selected:
-                self._enable_export_settings(selected[0])
+                self.on_export_tree_select(None)
             else:
+                self.current_selected_export_item = None
                 self._disable_export_settings()
 
     def add_export_files(self, files=None, target_group=None):
@@ -7650,7 +10523,9 @@ class TTSApp:
             # существующим элементом.
             files = unique_new_file_paths(files, existing_paths)
 
-            self._set_status_label(self.lbl_export_status, "Чтение тегов и извлечение обложек...", "warning")
+            self._set_export_status(
+                "Чтение тегов и извлечение обложек…", "warning"
+            )
             
             # === ФОНОВЫЙ ПОТОК ===
             def run_import():
@@ -7678,7 +10553,9 @@ class TTSApp:
                                     }
                                     self.export_tree.insert(target_group, tk.END, iid=fid, text=m["title"], values=(self.format_duration(m["duration"]),))
                                 
-                                self._set_status_label(self.lbl_export_status, f"Добавлено {curr}/{total_files}...", "warning")
+                                self._set_export_status(
+                                    f"Добавлено {curr}/{total_files}…", "warning"
+                                )
                             
                             self._post_to_ui(update_ui, batch_data.copy(), i + 1)
                             batch_data.clear() # Очищаем накопитель для следующей пачки
@@ -7691,9 +10568,11 @@ class TTSApp:
                         self.update_total_export_duration()
                         
                         if added_count == 0:
-                            self._set_status_label(self.lbl_export_status, "Файлы уже присутствуют.", "info")
+                            self._set_export_status(
+                                "Файлы уже присутствуют.", "info"
+                            )
                         else:
-                            self._set_status_label(self.lbl_export_status, "Ожидание...", "info")
+                            self._set_export_status("Ожидание...", "info")
                             
                         self._export_lock = False
                         self._export_import_thread = None
@@ -7704,7 +10583,9 @@ class TTSApp:
                 except Exception as e:
                     logging.error(f"Ошибка при добавлении файлов: {e}")
                     def fail_ui():
-                        self._set_status_label(self.lbl_export_status, "Ошибка при добавлении!", "error")
+                        self._set_export_status(
+                            "Ошибка при добавлении!", "error"
+                        )
                         self._export_lock = False
                         self._export_import_thread = None
                         self._set_export_ui_state(tk.NORMAL)
@@ -7883,6 +10764,39 @@ class TTSApp:
         self.current_selected_export_item = None
         self._disable_export_settings()
 
+    def clear_export_project(self):
+        """Очищает только текущий список, никогда не удаляя аудио с диска."""
+        if getattr(self, "_export_running", False) or getattr(self, "_export_lock", False):
+            return
+
+        root_items = tuple(self.export_tree.get_children(""))
+        file_count = len(self.export_files)
+        group_count = len(self.export_groups)
+        if not root_items and not file_count and not group_count:
+            self._show_info("Пусто", "Список экспорта уже пуст.")
+            return
+
+        if not self._ask_yes_no(
+            "Очистить весь список",
+            f"Убрать из проекта все группы ({group_count}) "
+            f"и аудиофайлы ({file_count})?\n\n"
+            "Сами файлы на диске не будут удалены.",
+            icon="warning",
+        ):
+            return
+
+        for item_id in root_items:
+            if self.export_tree.exists(item_id):
+                self.export_tree.delete(item_id)
+        self.export_groups.clear()
+        self.export_files.clear()
+        self.group_counter = 0
+        self.current_selected_export_item = None
+        self._disable_export_settings()
+        self.update_total_export_duration()
+        self.export_progress["value"] = 0
+        self._set_export_status("Ожидание...", "info")
+
     def auto_split_export(self):
         if getattr(self, "_export_running", False) or getattr(self, "_export_lock", False):
             return
@@ -7985,7 +10899,7 @@ class TTSApp:
     def stop_export_process(self):
         self.is_export_stopped = True
         self.btn_export_stop.config(state=tk.DISABLED)
-        self._set_status_label(self.lbl_export_status, "Остановка сборки (ожидание завершения текущего файла)...", "warning")
+        self._set_export_status("Остановка…", "warning")
 
     def _finish_export_process_ui(self, outcome):
         """Возвращает UI сборщика в устойчивое состояние после worker-потока.
@@ -7999,22 +10913,29 @@ class TTSApp:
         self._set_export_running_state(False)
         if outcome == "stopped":
             self.export_progress.configure(value=0)
-            self._set_status_label(
-                self.lbl_export_status,
-                "Ожидание...",
-                "info",
-            )
+            self._set_export_status("Ожидание...", "info")
         self.is_export_stopped = False
 
     def _update_file_tags_inplace(self, fp, f_tags, cov, title_for_status):
         """Обновляет теги файла прямо в его исходной папке на диске без конвертации"""
-        self._post_status_label(
-            self.lbl_export_status,
-            f"Обновление тегов: {title_for_status}...",
-            "warning",
-        )
-
         source_path = Path(fp)
+        # Тестовые/внешние вызовы могут использовать helper без полностью
+        # построенного Tk-приложения. В реальном worker очередь всегда есть.
+        if hasattr(self, "_ui_queue"):
+            self._post_export_activity_status(
+                "Теги",
+                title_for_status or source_path.name,
+                "warning",
+            )
+        elif hasattr(self, "_post_status_label"):
+            self._post_status_label(
+                self.lbl_export_status,
+                format_export_activity_status(
+                    "Теги", title_for_status or source_path.name
+                ),
+                "warning",
+            )
+
         if not source_path.is_file():
             logging.error("Исходный аудиофайл для тегирования не найден: %s", fp)
             return False
@@ -8227,6 +11148,10 @@ class TTSApp:
                         group.get("name"), fallback="Группа"
                     )
                     children = group_children.get(item_id, ())
+                    # Пустая группа не создаёт файл в worker, значит и
+                    # preflight не должен резервировать для неё выходное имя.
+                    if not children:
+                        continue
                     if group.get("merge"):
                         planned_outputs.append(out_dir / f"{group_name}.{fmt}")
                     else:
@@ -8351,8 +11276,6 @@ class TTSApp:
                             files = group_children.get(g_id, ())
                             if not files: continue
                             
-                            self._post_status_label(self.lbl_export_status, f"Обработка: {g_name}...", "text")
-
                             if g_set["merge"]:
                                 pause_ms = g_set["pause"]
 
@@ -8366,19 +11289,12 @@ class TTSApp:
                                     if self.is_export_stopped:
                                         break
                                     merge_sources.append(export_files[f_id]["path"])
-                                    processed_files += 1
-                                    pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
-                                    self._post_to_ui(self.export_progress.config, value=pct)
 
                                 if self.is_export_stopped:
                                     break
-                                self._post_status_label(
-                                    self.lbl_export_status,
-                                    (
-                                        f"Потоковая склейка, эффекты и сохранение {g_name}..."
-                                        if apply_fx
-                                        else f"Потоковая склейка и сохранение {g_name}..."
-                                    ),
+                                self._post_export_activity_status(
+                                    "Склейка",
+                                    g_name,
                                     "warning",
                                 )
                                 g_set["title"] = g_name
@@ -8401,6 +11317,15 @@ class TTSApp:
                                     tags=tags,
                                     cover=g_set.get("cover"),
                                     cancelled=lambda: self.is_export_stopped,
+                                )
+                                processed_files += len(files)
+                                pct = (
+                                    int((processed_files / total_files) * 100)
+                                    if total_files > 0
+                                    else 0
+                                )
+                                self._post_to_ui(
+                                    self.export_progress.config, value=pct
                                 )
                                 
                             else:
@@ -8427,7 +11352,11 @@ class TTSApp:
                                             
                                     cov = f_set.get("cover") or g_set.get("cover")
                                     
-                                    self._post_status_label(self.lbl_export_status, f"Конвертация: {f_set['title']}...", "warning")
+                                    self._post_export_activity_status(
+                                        "Экспорт",
+                                        f_set["title"],
+                                        "warning",
+                                    )
                                     safe_name = sanitize_filename_component(
                                         f_set["title"], fallback=Path(fp).stem
                                     )
@@ -8467,7 +11396,11 @@ class TTSApp:
                             f_tags = build_tags(f_set)
                             cov = f_set.get("cover")
                             
-                            self._post_status_label(self.lbl_export_status, f"Конвертация: {f_set['title']}...", "text")
+                            self._post_export_activity_status(
+                                "Экспорт",
+                                f_set["title"],
+                                "warning",
+                            )
                             safe_name = sanitize_filename_component(
                                 f_set["title"], fallback=Path(fp).stem
                             )
@@ -8489,14 +11422,14 @@ class TTSApp:
                                 cover=cov,
                                 cancelled=lambda: self.is_export_stopped,
                             )
-                            
+
                             processed_files += 1
                             pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
                             self._post_to_ui(self.export_progress.config, value=pct)
 
                 if self.is_export_stopped:
                     outcome = "stopped"
-                    self._post_status_label(self.lbl_export_status, "Сборка прервана!", "error")
+                    self._post_export_status("Сборка прервана!", "warning")
                     self._post_to_ui(self._show_warning, "Остановлено", "Процесс сборки был прерван пользователем.")
                 else:
                     if failed_files:
@@ -8505,14 +11438,14 @@ class TTSApp:
                             f"Обработка завершена с ошибками: {failed_files}.\n"
                             "Подробности записаны в журнал."
                         )
-                        self._post_status_label(
-                            self.lbl_export_status, "Готово с ошибками.", "warning"
+                        self._post_export_status(
+                            "Готово с ошибками.", "warning"
                         )
                         self._post_to_ui(self._show_warning, "Готово", msg)
                     else:
                         outcome = "success"
                         msg = "Теги успешно обновлены в исходных файлах!" if tags_only else f"Сборка успешно завершена!\nСохранено в: {out_dir}"
-                        self._post_status_label(self.lbl_export_status, "Готово!", "success")
+                        self._post_export_status("Готово!", "success")
                         self._post_to_ui(self._show_info, "Успех", msg)
                 
             except InterruptedError:
@@ -8520,9 +11453,7 @@ class TTSApp:
                 # helper уже завершил дочерний процесс и удалил временный файл.
                 outcome = "stopped"
                 self.is_export_stopped = True
-                self._post_status_label(
-                    self.lbl_export_status, "Сборка прервана!", "warning"
-                )
+                self._post_export_status("Сборка прервана!", "warning")
                 self._post_to_ui(
                     self._show_warning,
                     "Остановлено",
@@ -8532,7 +11463,7 @@ class TTSApp:
                 outcome = "error"
                 logging.exception("Ошибка сборки")
                 error_message = f"Произошла ошибка при сборке:\n{e}"
-                self._post_status_label(self.lbl_export_status, "Ошибка!", "error")
+                self._post_export_status("Ошибка!", "error")
                 self._post_to_ui(self._show_error, "Ошибка", error_message)
             finally:
                 self._post_to_ui(self._finish_export_process_ui, outcome)
@@ -8543,9 +11474,7 @@ class TTSApp:
         except Exception as exc:
             self._export_thread = None
             self._set_export_running_state(False)
-            self._set_status_label(
-                self.lbl_export_status, "Ошибка запуска сборки.", "error"
-            )
+            self._set_export_status("Ошибка запуска сборки.", "error")
             logging.exception("Не удалось запустить поток экспорта")
             self._show_error(
                 "Ошибка", f"Не удалось запустить сборку:\n{exc}"
@@ -8599,6 +11528,7 @@ class TTSApp:
         tab_folders = ttk.Frame(set_notebook, padding=10)
         tab_pauses = ttk.Frame(set_notebook, padding=10)
         tab_cache = ttk.Frame(set_notebook, padding=10)
+        tab_normalization = ttk.Frame(set_notebook, padding=10)
         tab_effects = ttk.Frame(set_notebook, padding=10)
         tab_output = ttk.Frame(set_notebook, padding=10)
         
@@ -8606,6 +11536,7 @@ class TTSApp:
         set_notebook.add(tab_folders, text="Папки")
         set_notebook.add(tab_pauses, text="Паузы и Разделители")
         set_notebook.add(tab_cache, text="Обработка и Кэш")
+        set_notebook.add(tab_normalization, text="Нормализация")
         set_notebook.add(tab_effects, text="Эффекты (Постобработка)")
         set_notebook.add(tab_output, text="Вывод и Теги")
 
@@ -8804,25 +11735,103 @@ class TTSApp:
         self.separator_entries = []
 
         # 4. Кэш
-        add_check(tab_cache, "Авто-исправление аббревиатур (И.И. -> И-И)", "auto_abbreviations", 0)
-        add_check(tab_cache, "Авто-сокращения (г., ул., ур. -> г, ул, ур)", "auto_short_words", 1)
-        add_check(tab_cache, "Авто-обрезка тишины от Silero", "auto_trim_silence", 2)
-        add_entry(tab_cache, "Порог тишины (dBFS):", "silence_threshold", 3, tk.DoubleVar)
-        ttk.Separator(tab_cache, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=2, sticky="ew", pady=10)
-        add_check(tab_cache, "Включить кэширование", "use_cache", 5)
-        add_entry(tab_cache, "Сохранять кэш на диск каждые (фраз):", "cache_save_frequency", 6, tk.IntVar)
-        add_check(tab_cache, "Ограничить количество записей (LRU):", "enable_cache_lru", 7)
-        add_entry(tab_cache, "Макс. записей в кэше:", "cache_max_entries", 8, tk.IntVar)
-        add_check(tab_cache, "Удалять старые записи по времени (TTL):", "enable_cache_ttl", 9)
-        add_entry(tab_cache, "Время жизни кэша (часов):", "cache_ttl_hours", 10, tk.DoubleVar)
+        add_check(tab_cache, "Авто-обрезка тишины от Silero", "auto_trim_silence", 0)
+        add_entry(tab_cache, "Порог тишины (dBFS):", "silence_threshold", 1, tk.DoubleVar)
+        ttk.Separator(tab_cache, orient=tk.HORIZONTAL).grid(row=2, column=0, columnspan=2, sticky="ew", pady=10)
+        add_check(tab_cache, "Включить кэширование", "use_cache", 3)
+        add_entry(tab_cache, "Сохранять кэш на диск каждые (фраз):", "cache_save_frequency", 4, tk.IntVar)
+        add_check(tab_cache, "Ограничить количество записей (LRU):", "enable_cache_lru", 5)
+        add_entry(tab_cache, "Макс. записей в кэше:", "cache_max_entries", 6, tk.IntVar)
+        add_check(tab_cache, "Удалять старые записи по времени (TTL):", "enable_cache_ttl", 7)
+        add_entry(tab_cache, "Время жизни кэша (часов):", "cache_ttl_hours", 8, tk.DoubleVar)
 
-        # 5. Эффекты
+        # 5. Нормализация. Полный редактор остаётся в песочнице, а здесь всегда
+        # виден именно сохранённый глобальный снимок, а не локальные пробы.
+        global_normalizer_frame = ttk.LabelFrame(
+            tab_normalization,
+            text="Сохранено глобально",
+            padding=10,
+        )
+        global_normalizer_frame.grid(
+            row=0, column=0, columnspan=2, sticky=tk.EW, padx=5, pady=(0, 10)
+        )
+        global_normalizer_frame.columnconfigure(0, weight=1)
+        self.lbl_settings_normalizer_profile = ttk.Label(
+            global_normalizer_frame,
+            text="",
+            font=("", 10, "bold"),
+        )
+        self.lbl_settings_normalizer_profile.grid(row=0, column=0, sticky=tk.W)
+        self.lbl_settings_normalizer_details = self._register_palette_widget(
+            ttk.Label(
+                global_normalizer_frame,
+                text="",
+                wraplength=680,
+                justify=tk.LEFT,
+                foreground=self.get_status_color("muted"),
+            ),
+            "muted",
+        )
+        self.lbl_settings_normalizer_details.grid(
+            row=1, column=0, sticky=tk.EW, pady=(4, 8)
+        )
+        ttk.Button(
+            global_normalizer_frame,
+            text="Открыть вкладку «Нормализатор»",
+            command=self._open_normalizer_tab_from_settings,
+        ).grid(row=2, column=0, sticky=tk.W)
+
+        self._register_palette_widget(
+            ttk.Label(
+                tab_normalization,
+                text=(
+                    "Параметры во вкладке «Нормализатор» сначала локальны. "
+                    "Глобальными они становятся только после кнопки "
+                    "«Применить глобально»."
+                ),
+                wraplength=700,
+                justify=tk.LEFT,
+                foreground=self.get_status_color("muted"),
+            ),
+            "muted",
+        ).grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 10))
+
+        studio_normalizer_frame = ttk.LabelFrame(
+            tab_normalization,
+            text="Предобработка Studio (сохраняется кнопкой «Сохранить» ниже)",
+            padding=8,
+        )
+        studio_normalizer_frame.grid(
+            row=2, column=0, columnspan=2, sticky=tk.EW, padx=5
+        )
+        add_check(
+            studio_normalizer_frame,
+            "Авто-исправление аббревиатур (И.И. → И-И)",
+            "auto_abbreviations",
+            0,
+        )
+        add_check(
+            studio_normalizer_frame,
+            "Авто-сокращения (г., ул., ур. → г, ул, ур)",
+            "auto_short_words",
+            1,
+        )
+        self._refresh_global_normalizer_settings_summary()
+
+        # 6. Эффекты
         self._register_palette_widget(
             ttk.Label(
                 tab_effects,
-                text="Эти эффекты применяются к аудио ПОСЛЕ генерации (без затрат API).",
+                text=(
+                    "Текущие эффекты книги и Прямого синтеза применяются ПОСЛЕ "
+                    "генерации (без затрат API). Применение аудиопрофиля к книге "
+                    "заменяет эти значения; последующая ручная правка не меняет "
+                    "сохранённый профиль. У вкладки «Экспорт и сборка» свои эффекты."
+                ),
                 font=("", 9, "italic"),
                 foreground=self.get_status_color("muted"),
+                wraplength=700,
+                justify=tk.LEFT,
             ),
             "muted",
         ).grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
@@ -8869,7 +11878,7 @@ class TTSApp:
 
         tab_effects.columnconfigure(1, weight=1)
 
-        # 6. Вывод и Теги
+        # 7. Вывод и Теги
         add_combobox(tab_output, "Режим синтеза:", "synthesis_mode", 0, ["sentence", "paragraph", "full"])
         add_combobox(
             tab_output,
@@ -8880,17 +11889,64 @@ class TTSApp:
         )
         add_combobox(
             tab_output,
-            "Битрейт (для mp3/opus):",
+            "Битрейт (для сжатых форматов):",
             "output_bitrate",
             2,
-            ["32k", "48k", "64k", "128k", "192k", "256k", "320k"],
+            ["auto", "32k", "48k", "64k", "96k", "128k", "192k", "256k", "320k"],
         )
-        ttk.Separator(tab_output, orient=tk.HORIZONTAL).grid(row=3, column=0, columnspan=2, sticky="ew", pady=10)
-        ttk.Label(tab_output, text="Теги (для mp3/ogg/opus):").grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=5)
-        
+        add_combobox(
+            tab_output,
+            "Частота финального файла:",
+            "output_sample_rate",
+            3,
+            list(AUDIO_PROFILE_SAMPLE_RATES),
+        )
+        add_combobox(
+            tab_output,
+            "Каналы финального файла:",
+            "output_channels",
+            4,
+            list(AUDIO_PROFILE_CHANNELS),
+        )
+        ttk.Button(
+            tab_output,
+            text="🎛 Управление аудиопрофилями…",
+            command=lambda: self.open_audio_profiles_dialog("book"),
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(6, 2))
+        self.lbl_book_audio_profile_summary = self._register_palette_widget(
+            ttk.Label(
+                tab_output,
+                text="",
+                wraplength=700,
+                justify=tk.LEFT,
+                foreground=self.get_status_color("muted"),
+            ),
+            "muted",
+        )
+        self.lbl_book_audio_profile_summary.grid(
+            row=6, column=0, columnspan=2, sticky=tk.EW, padx=5, pady=(3, 2)
+        )
+        self._register_palette_widget(
+            ttk.Label(
+                tab_output,
+                text=(
+                    "Профиль копирует параметры в эту область и не остаётся "
+                    "связанным с полями. Поэтому ниже показано текущее совпадение, "
+                    "а не скрытый «активный профиль»."
+                ),
+                wraplength=700,
+                justify=tk.LEFT,
+                foreground=self.get_status_color("muted"),
+                font=("", 9, "italic"),
+            ),
+            "muted",
+        ).grid(row=7, column=0, columnspan=2, sticky=tk.EW, padx=5, pady=(2, 0))
+        ttk.Separator(tab_output, orient=tk.HORIZONTAL).grid(row=8, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Label(tab_output, text="Теги (для mp3/ogg/opus):").grid(row=9, column=0, columnspan=2, sticky=tk.W, padx=5)
+
         tags_frame = ttk.Frame(tab_output)
-        tags_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=5)
-        
+        tags_frame.grid(row=10, column=0, columnspan=2, sticky="ew", padx=5)
+
         def add_tag_grid(parent, label, key, r, c, is_file=False):
             ttk.Label(parent, text=label).grid(row=r, column=c, sticky=tk.W, pady=2, padx=5)
             var = tk.StringVar(value=self.config.get(key, ""))
@@ -8920,7 +11976,31 @@ class TTSApp:
         tags_frame.columnconfigure(1, weight=1)
         tags_frame.columnconfigure(3, weight=1)
 
-        for tab in (tab_api, tab_folders, tab_pauses, tab_cache, tab_effects, tab_output):
+        for variable in (
+            self.settings_vars["output_format"],
+            self.settings_vars["output_bitrate"],
+            self.settings_vars["output_sample_rate"],
+            self.settings_vars["output_channels"],
+            self.settings_vars["fx_speed"],
+            self.settings_vars["fx_pitch"],
+            self.settings_vars["fx_echo"],
+            self.settings_vars["fx_echo_delay"],
+            self.settings_vars["fx_echo_decay"],
+        ):
+            variable.trace_add(
+                "write", lambda *_args: self._refresh_audio_profile_summaries()
+            )
+        self._refresh_audio_profile_summaries()
+
+        for tab in (
+            tab_api,
+            tab_folders,
+            tab_pauses,
+            tab_cache,
+            tab_normalization,
+            tab_effects,
+            tab_output,
+        ):
             tab.columnconfigure(1, weight=1)
 
         self.set_ui_from_config()
@@ -8929,6 +12009,9 @@ class TTSApp:
     def setup_glossary_tab(self):
         frame = ttk.Frame(self.tab_glossary, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
+        self._glossary_loaded_path = None
+        self._glossary_dirty = False
+        self._glossary_ui_loading = False
         
         add_frame = ttk.LabelFrame(frame, text="Добавить правило", padding=10)
         add_frame.pack(fill=tk.X, pady=(0, 10))
@@ -8939,19 +12022,44 @@ class TTSApp:
         ttk.Radiobutton(add_frame, text="RegEx (Паттерн)", variable=self.glos_type, value="regex", command=self.toggle_glos_fields).grid(row=0, column=2, sticky=tk.W)
         
         self.glos_strict = tk.BooleanVar(value=False)
-        ttk.Checkbutton(add_frame, text="Чувствительно к регистру (не для RegEx)", variable=self.glos_strict).grid(row=0, column=3, padx=15, sticky=tk.W)
+        self.chk_glos_strict = ttk.Checkbutton(
+            add_frame,
+            text="Чувствительно к регистру",
+            variable=self.glos_strict,
+        )
+        self.chk_glos_strict.grid(row=0, column=3, padx=15, sticky=tk.W)
+
+        self.glos_verbatim = tk.BooleanVar(value=False)
+        self.chk_glos_verbatim = ttk.Checkbutton(
+            add_frame,
+            text="Не нормализовать замену (verbatim)",
+            variable=self.glos_verbatim,
+        )
+        self.chk_glos_verbatim.grid(
+            row=1, column=0, columnspan=2, sticky=tk.W, pady=(5, 0)
+        )
+
+        self.glos_whole_word = tk.BooleanVar(value=True)
+        self.chk_glos_whole_word = ttk.Checkbutton(
+            add_frame,
+            text="Только слово целиком",
+            variable=self.glos_whole_word,
+        )
+        self.chk_glos_whole_word.grid(
+            row=1, column=2, columnspan=2, sticky=tk.W, pady=(5, 0)
+        )
         
         # Поля раположены СТРОГО друг под другом
         self.lbl_glos_word1 = ttk.Label(add_frame, text="Слово (с '+' или исходное):")
-        self.lbl_glos_word1.grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(5,0))
+        self.lbl_glos_word1.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(5,0))
         self.glos_word1 = tk.StringVar()
-        ttk.Entry(add_frame, textvariable=self.glos_word1).grid(row=2, column=0, columnspan=4, sticky=tk.EW, pady=(0,5))
+        ttk.Entry(add_frame, textvariable=self.glos_word1).grid(row=3, column=0, columnspan=4, sticky=tk.EW, pady=(0,5))
         
         self.lbl_glos_word2 = ttk.Label(add_frame, text="Замена:")
         self.glos_word2 = tk.StringVar()
         self.ent_glos_word2 = ttk.Entry(add_frame, textvariable=self.glos_word2)
         
-        ttk.Button(add_frame, text="➕ Добавить в JSON", command=self.add_glossary_rule).grid(row=5, column=0, columnspan=4, pady=10)
+        ttk.Button(add_frame, text="➕ Добавить в JSON", command=self.add_glossary_rule).grid(row=6, column=0, columnspan=4, pady=10)
         
         self.toggle_glos_fields()
 
@@ -8959,7 +12067,16 @@ class TTSApp:
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
         ttk.Button(btn_frame, text="💾 Сохранить файл", command=self.save_glossary_ui).pack(side=tk.LEFT)
-        ttk.Button(btn_frame, text="🔄 Перезагрузить", command=self.load_glossary_ui).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="🔄 Перезагрузить",
+            command=self.reload_glossary_ui,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="🗑 Удалить правила…",
+            command=self.open_glossary_delete_dialog,
+        ).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="📂 Импорт", command=self.import_glossary).pack(side=tk.RIGHT, padx=5)
         ttk.Button(btn_frame, text="📤 Экспорт", command=self.export_glossary).pack(side=tk.RIGHT, padx=5)
 
@@ -8971,10 +12088,12 @@ class TTSApp:
         font_cb.pack(side=tk.RIGHT)
         ttk.Label(lbl_frame, text="Шрифт:").pack(side=tk.RIGHT, padx=5)
         font_cb.bind("<<ComboboxSelected>>", lambda e: self.root.after(10, self.update_fonts))
-        
+
         # 3. В самом конце пакуем текстовое поле, чтобы оно сжималось/растягивалось
         self.txt_glossary = tk.Text(frame, wrap=tk.WORD, font=("Courier", self.font_size_var.get()), undo=True, maxundo=50)
         self.txt_glossary.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=5)
+        self.txt_glossary.bind("<<Modified>>", self._on_glossary_modified)
+        self.txt_glossary.edit_modified(False)
 
         self.load_glossary_ui()
 
@@ -8982,87 +12101,2371 @@ class TTSApp:
         gtype = self.glos_type.get()
         if gtype == "term":
             self.lbl_glos_word1.config(text="Исходное слово:")
-            self.lbl_glos_word2.grid(row=3, column=0, columnspan=4, sticky=tk.W)
-            self.ent_glos_word2.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(0,5))
+            self.lbl_glos_word2.grid(row=4, column=0, columnspan=4, sticky=tk.W)
+            self.ent_glos_word2.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(0,5))
+            self.chk_glos_strict.configure(state=tk.NORMAL)
+            self.chk_glos_verbatim.configure(state=tk.NORMAL)
+            self.chk_glos_whole_word.configure(state=tk.NORMAL)
         elif gtype == "regex":
             self.lbl_glos_word1.config(text="Регулярное выражение:")
-            self.lbl_glos_word2.grid(row=3, column=0, columnspan=4, sticky=tk.W)
-            self.ent_glos_word2.grid(row=4, column=0, columnspan=4, sticky=tk.EW, pady=(0,5))
+            self.lbl_glos_word2.grid(row=4, column=0, columnspan=4, sticky=tk.W)
+            self.ent_glos_word2.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(0,5))
+            self.chk_glos_strict.configure(state=tk.DISABLED)
+            self.chk_glos_verbatim.configure(state=tk.NORMAL)
+            self.chk_glos_whole_word.configure(state=tk.DISABLED)
         else:
             self.lbl_glos_word1.config(text="Слово (с '+' или исходное):")
             self.lbl_glos_word2.grid_remove()
             self.ent_glos_word2.grid_remove()
+            self.chk_glos_strict.configure(state=tk.NORMAL)
+            self.chk_glos_verbatim.configure(state=tk.DISABLED)
+            self.chk_glos_whole_word.configure(state=tk.DISABLED)
 
     def add_glossary_rule(self):
         w1 = self.glos_word1.get().strip()
         w2 = self.glos_word2.get() # Разрешаем пустоту
         strict = self.glos_strict.get()
+        verbatim = self.glos_verbatim.get()
+        whole_word = self.glos_whole_word.get()
         gtype = self.glos_type.get()
-        
-        if not w1: return 
-        
+
+        if not w1: return
+
         try:
             content = self.txt_glossary.get(1.0, tk.END).strip()
-            data = json.loads(content) if content else {"accents_ignore_case": [], "accents_strict_case": [], "terms_ignore_case": {}, "terms_strict_case": {}, "regex_rules": []}
-            
+            data = canonicalize_glossary_data(
+                json.loads(content) if content else empty_glossary_data()
+            )
+            previous_shadowed = {
+                conflict["key"] for conflict in glossary_shadowed_accent_rules(data)
+            }
+
             if gtype == "accent":
                 if strict: data.setdefault("accents_strict_case", []).append(w1)
                 else: data.setdefault("accents_ignore_case", []).append(w1)
             elif gtype == "term":
-                if strict: data.setdefault("terms_strict_case", {})[w1] = w2
-                else: data.setdefault("terms_ignore_case", {})[w1] = w2
+                value = make_glossary_term_value(
+                    w2,
+                    verbatim=verbatim,
+                    whole_word=whole_word,
+                )
+                if strict: data.setdefault("terms_strict_case", {})[w1] = value
+                else: data.setdefault("terms_ignore_case", {})[w1] = value
             elif gtype == "regex":
-                data.setdefault("regex_rules", []).append({"pattern": w1, "repl": w2})
-                
-            self.txt_glossary.delete(1.0, tk.END)
-            self.txt_glossary.insert(tk.END, json.dumps(data, indent=4, ensure_ascii=False))
+                rule = {"pattern": w1, "repl": w2}
+                if verbatim:
+                    rule["verbatim"] = True
+                data.setdefault("regex_rules", []).append(rule)
+
+            self._replace_glossary_editor_data(data)
             self.glos_word1.set("")
             self.glos_word2.set("")
+            current_shadowed = {
+                conflict["key"] for conflict in glossary_shadowed_accent_rules(data)
+            }
+            if current_shadowed - previous_shadowed:
+                self._show_warning(
+                    "Конфликт правил",
+                    "Для одного исходного слова одновременно заданы ударение "
+                    "и термин. Оба правила сохранены, но термин имеет приоритет, "
+                    "поэтому совпадающее ударение применяться не будет.",
+                )
         except Exception as e:
             self._show_error("Ошибка", f"Не удалось обновить JSON: {e}")
 
+    def _mark_glossary_editor_dirty(self):
+        """Единообразно помечает JSON и инвалидирует preview."""
+        self._glossary_dirty = True
+        if not hasattr(self, "normalizer_source_text"):
+            return
+        glossary_switch = getattr(self, "normalizer_preview_glossary_var", None)
+        if glossary_switch is not None and not glossary_switch.get():
+            return
+        self._schedule_normalizer_preview()
+
+    def _replace_glossary_editor_data(self, data):
+        """Заменяет JSON в редакторе и синхронно помечает его изменённым."""
+        normalized = canonicalize_glossary_data(data)
+        self._glossary_ui_loading = True
+        try:
+            try:
+                self.txt_glossary.edit_separator()
+            except tk.TclError:
+                pass
+            self.txt_glossary.delete(1.0, tk.END)
+            self.txt_glossary.insert(
+                tk.END, json.dumps(normalized, indent=4, ensure_ascii=False)
+            )
+            try:
+                self.txt_glossary.edit_separator()
+                self.txt_glossary.edit_modified(False)
+            except tk.TclError:
+                pass
+        finally:
+            self._glossary_ui_loading = False
+        self._mark_glossary_editor_dirty()
+
+    def _on_glossary_modified(self, _event=None):
+        """Инвалидирует preview, если используемый им JSON был изменён."""
+        try:
+            if not self.txt_glossary.edit_modified():
+                return
+            self.txt_glossary.edit_modified(False)
+        except (AttributeError, tk.TclError):
+            return
+        if getattr(self, "_glossary_ui_loading", False):
+            return
+        self._mark_glossary_editor_dirty()
+
+    def _configured_glossary_path(self):
+        cache_dir = Path(self.config.get("cache_dir", "cache_audio")).expanduser()
+        return cache_dir.absolute() / "glossary.json"
+
+    def _sync_glossary_editor_cache(self, *, prompt_if_dirty=False):
+        """Переключает редактор на glossary.json выбранного cache_dir."""
+        if not hasattr(self, "txt_glossary"):
+            return True
+        target_path = self._configured_glossary_path()
+        loaded_path = getattr(self, "_glossary_loaded_path", None)
+        if loaded_path is None or Path(loaded_path) == target_path:
+            return True
+        if getattr(self, "_glossary_dirty", False):
+            if not prompt_if_dirty or not self._ask_yes_no(
+                "Папка кэша изменена",
+                "В редакторе есть несохранённые изменения старого глоссария. "
+                "Перезагрузить glossary.json из новой папки кэша и отбросить "
+                "эти изменения?",
+                icon="warning",
+            ):
+                logging.warning(
+                    "Редактор глоссария оставлен на %s после смены cache_dir на %s",
+                    loaded_path,
+                    target_path.parent,
+                )
+                if hasattr(self, "lbl_normalizer_preview_status"):
+                    self._set_status_label(
+                        self.lbl_normalizer_preview_status,
+                        "Папка кэша изменена: перезагрузите глоссарий перед preview.",
+                        "warning",
+                    )
+                if hasattr(self, "normalizer_source_text"):
+                    # Инвалидация происходит сразу, до debounce: старый
+                    # результат больше нельзя сохранить как относящийся к
+                    # новой папке кэша.
+                    self._schedule_normalizer_preview(delay_ms=10)
+                return False
+        return bool(self.load_glossary_ui())
+
+    def reload_glossary_ui(self):
+        """Перечитывает файл, не отбрасывая правки без подтверждения."""
+        try:
+            editor_modified = bool(self.txt_glossary.edit_modified())
+        except (AttributeError, tk.TclError):
+            editor_modified = False
+        if (
+            getattr(self, "_glossary_dirty", False) or editor_modified
+        ) and not self._ask_yes_no(
+            "Перезагрузить глоссарий",
+            "Отбросить несохранённые изменения и перечитать glossary.json с диска?",
+            icon="warning",
+        ):
+            return False
+        return bool(self.load_glossary_ui())
+
     def load_glossary_ui(self):
-        cache_dir = Path(self.config.get("cache_dir", "cache_audio"))
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = self._configured_glossary_path().parent
         path = cache_dir / "glossary.json"
         backup_path = path.with_suffix(path.suffix + ".bak")
-        
-        self.txt_glossary.delete(1.0, tk.END)
-        default_glos = {"accents_ignore_case": [], "accents_strict_case": [], "terms_ignore_case": {}, "terms_strict_case": {}, "regex_rules": []}
-        candidates = [candidate for candidate in (path, backup_path) if candidate.exists()]
-        for candidate in candidates:
-            try:
-                with open(candidate, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if not isinstance(data, dict):
-                    raise ValueError("корень glossary.json должен быть JSON-объектом")
-                self.txt_glossary.insert(
-                    tk.END, json.dumps(data, indent=4, ensure_ascii=False)
-                )
-                if candidate == backup_path:
-                    logging.warning(
-                        "Редактор глоссария загрузил резервную копию %s",
-                        backup_path,
-                    )
-                return
-            except Exception as exc:
-                logging.error("Ошибка чтения глоссария %s: %s", candidate, exc)
 
-        self.txt_glossary.insert(
-            tk.END, json.dumps(default_glos, indent=4, ensure_ascii=False)
-        )
-
-    def save_glossary_ui(self):
-        cache_dir = Path(self.config.get("cache_dir", "cache_audio"))
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        path = cache_dir / "glossary.json"
-        content = self.txt_glossary.get(1.0, tk.END).strip()
+        data = None
+        recovered_from_backup = False
+        candidates = []
         try:
-            parsed = json.loads(content)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            candidates = [
+                candidate
+                for candidate in (path, backup_path)
+                if candidate.exists()
+            ]
+            for candidate in candidates:
+                try:
+                    with open(candidate, 'r', encoding='utf-8-sig') as f:
+                        candidate_data = json.load(f)
+                    data = canonicalize_glossary_data(candidate_data)
+                    recovered_from_backup = candidate == backup_path
+                    break
+                except Exception as exc:
+                    logging.error(
+                        "Ошибка чтения глоссария %s: %s", candidate, exc
+                    )
+        except OSError as exc:
+            logging.error("Недоступна папка глоссария %s: %s", cache_dir, exc)
+            self._show_error(
+                "Ошибка папки кэша",
+                f"Не удалось открыть редактор глоссария:\n{cache_dir}\n\n{exc}",
+            )
+            return False
+
+        if data is None and candidates:
+            self._show_error(
+                "Ошибка глоссария",
+                "Не удалось прочитать ни основной glossary.json, ни его "
+                "резервную копию. Текст в редакторе оставлен без изменений; "
+                "подробности записаны в журнал.",
+            )
+            return False
+        if data is None:
+            data = empty_glossary_data()
+
+        self._glossary_ui_loading = True
+        try:
+            self.txt_glossary.delete(1.0, tk.END)
+            self.txt_glossary.insert(
+                tk.END, json.dumps(data, indent=4, ensure_ascii=False)
+            )
+            self.txt_glossary.edit_modified(False)
+        finally:
+            self._glossary_ui_loading = False
+        self._glossary_loaded_path = path
+        self._glossary_dirty = False
+
+        if recovered_from_backup:
+            logging.warning(
+                "Редактор глоссария загрузил резервную копию %s",
+                backup_path,
+            )
+            try:
+                self._write_json_atomic(path, data)
+            except Exception as recovery_exc:
+                logging.error(
+                    "Не удалось восстановить основной глоссарий %s: %s",
+                    path,
+                    recovery_exc,
+                )
+
+        if hasattr(self, "normalizer_source_text"):
+            glossary_switch = getattr(
+                self, "normalizer_preview_glossary_var", None
+            )
+            if glossary_switch is None or glossary_switch.get():
+                self._schedule_normalizer_preview()
+        return True
+
+    def save_glossary_ui(self, show_popup=True):
+        try:
+            path = self._configured_glossary_path()
+            loaded_path = getattr(self, "_glossary_loaded_path", None)
+            if loaded_path is not None and Path(loaded_path) != path:
+                raise ValueError(
+                    "папка кэша изменилась; сначала нажмите «Перезагрузить», "
+                    "чтобы не записать старый глоссарий в новый кэш"
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            content = self.txt_glossary.get(1.0, tk.END).strip()
+            parsed = canonicalize_glossary_data(json.loads(content))
             self._write_json_atomic(path, parsed, backup=True)
-            self._show_info("Успех", "Глоссарий сохранен!")
+            self._glossary_loaded_path = path
+            self._glossary_dirty = False
+            self.txt_glossary.edit_modified(False)
+            if show_popup:
+                shadowed = glossary_shadowed_accent_rules(parsed)
+                if shadowed:
+                    self._show_warning(
+                        "Сохранено с предупреждением",
+                        f"Глоссарий сохранён. Правил ударения, которые не "
+                        f"применяются из-за приоритета совпадающего термина: "
+                        f"{len(shadowed)}.",
+                    )
+                else:
+                    self._show_info("Успех", "Глоссарий сохранён!")
+            return True
         except Exception as e:
             self._show_error("Ошибка JSON", f"Неверный формат JSON:\n{e}")
+            return False
+
+    def open_glossary_delete_dialog(self):
+        """Открывает транзакционный поиск и удаление правил глоссария."""
+        try:
+            content = self.txt_glossary.get(1.0, tk.END).strip()
+            parsed = canonicalize_glossary_data(
+                json.loads(content) if content else empty_glossary_data()
+            )
+            records = glossary_rule_records(parsed)
+        except Exception as exc:
+            self._show_error(
+                "Ошибка JSON",
+                "Исправьте ошибки в редакторе перед удалением:\n"
+                f"{exc}",
+            )
+            return
+
+        if not records:
+            self._show_info("Пусто", "В глоссарии нет правил для удаления.")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("Удаление правил глоссария")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        filter_after_id = None
+
+        def close_dialog():
+            nonlocal filter_after_id
+            if filter_after_id is not None:
+                try:
+                    dialog.after_cancel(filter_after_id)
+                except tk.TclError:
+                    pass
+                filter_after_id = None
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        dialog.bind("<Escape>", lambda _event: close_dialog())
+
+        ttk.Label(
+            dialog,
+            text=(
+                "Отметьте правила в нужных секциях. Изменения сначала попадут "
+                "в JSON-редактор; запись на диск выполняет «Сохранить файл»."
+            ),
+            wraplength=860,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=12, pady=(10, 6))
+
+        search_frame = ttk.Frame(dialog)
+        search_frame.pack(fill=tk.X, padx=12, pady=(0, 6))
+        ttk.Label(search_frame, text="Поиск:").pack(side=tk.LEFT)
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_frame, textvariable=search_var)
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+
+        notebook = ttk.Notebook(dialog)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 6))
+
+        group_titles = {
+            "accents": "Ударения",
+            "terms": "Термины",
+            "regex": "RegEx",
+        }
+        records_by_group = {
+            group: tuple(record for record in records if record["group"] == group)
+            for group in group_titles
+        }
+        record_by_iid = {
+            f"glossary_rule_{index}": record
+            for index, record in enumerate(records)
+        }
+        iid_by_key = {
+            record["key"]: iid for iid, record in record_by_iid.items()
+        }
+        selected_keys = set()
+        group_widgets = {}
+
+        for group, title in group_titles.items():
+            tab = ttk.Frame(notebook, padding=4)
+            tab.rowconfigure(0, weight=1)
+            tab.columnconfigure(0, weight=1)
+            notebook.add(tab, text=title)
+
+            tree = ttk.Treeview(
+                tab,
+                columns=("selected", "kind", "source", "replacement", "flags"),
+                show="headings",
+                selectmode="extended",
+            )
+            tree.heading("selected", text="✓")
+            tree.heading("kind", text="Тип")
+            tree.heading("source", text="Исходное / паттерн")
+            tree.heading("replacement", text="Замена")
+            tree.heading("flags", text="Флаги")
+            tree.column("selected", width=46, minwidth=46, stretch=False, anchor=tk.CENTER)
+            tree.column("kind", width=90, minwidth=70, stretch=False)
+            tree.column("source", width=250, minwidth=130)
+            tree.column("replacement", width=250, minwidth=130)
+            tree.column("flags", width=190, minwidth=120)
+            tree.grid(row=0, column=0, sticky=tk.NSEW)
+
+            y_scroll = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=tree.yview)
+            y_scroll.grid(row=0, column=1, sticky=tk.NS)
+            x_scroll = ttk.Scrollbar(tab, orient=tk.HORIZONTAL, command=tree.xview)
+            x_scroll.grid(row=1, column=0, sticky=tk.EW)
+            tree.configure(
+                yscrollcommand=y_scroll.set,
+                xscrollcommand=x_scroll.set,
+            )
+            group_widgets[group] = {"tab": tab, "tree": tree}
+
+        selection_frame = ttk.Frame(dialog)
+        selection_frame.pack(fill=tk.X, padx=12, pady=(0, 6))
+        status_var = tk.StringVar()
+        status_label = ttk.Label(selection_frame, textvariable=status_var)
+        status_label.pack(side=tk.RIGHT)
+
+        action_frame = ttk.Frame(dialog)
+        action_frame.pack(fill=tk.X, padx=12, pady=(0, 10))
+
+        def current_group():
+            selected_tab = notebook.select()
+            for group, widgets in group_widgets.items():
+                if str(widgets["tab"]) == selected_tab:
+                    return group
+            return "accents"
+
+        def matching_records(group):
+            query = search_var.get().strip().casefold()
+            group_records = records_by_group[group]
+            if not query:
+                return group_records
+            return tuple(
+                record for record in group_records if query in record["search_text"]
+            )
+
+        def update_status():
+            visible_count = len(matching_records(current_group()))
+            status_var.set(
+                f"Выбрано: {len(selected_keys)} из {len(records)}; "
+                f"показано в разделе: {visible_count}"
+            )
+            delete_button.configure(
+                state=tk.NORMAL if selected_keys else tk.DISABLED
+            )
+
+        def render_group(group):
+            widgets = group_widgets[group]
+            tree = widgets["tree"]
+            children = tree.get_children("")
+            if children:
+                tree.delete(*children)
+            for record in matching_records(group):
+                iid = iid_by_key[record["key"]]
+                tree.insert(
+                    "",
+                    tk.END,
+                    iid=iid,
+                    values=(
+                        "☑" if record["key"] in selected_keys else "☐",
+                        record["kind"],
+                        record["source"],
+                        record["replacement"],
+                        record["flags"],
+                    ),
+                )
+            selected_in_group = sum(
+                record["key"] in selected_keys
+                for record in records_by_group[group]
+            )
+            notebook.tab(
+                widgets["tab"],
+                text=f"{group_titles[group]} ({selected_in_group}/{len(records_by_group[group])})",
+            )
+
+        def render_all():
+            nonlocal filter_after_id
+            filter_after_id = None
+            for group in group_titles:
+                render_group(group)
+            update_status()
+
+        def schedule_filter(*_args):
+            nonlocal filter_after_id
+            if filter_after_id is not None:
+                try:
+                    dialog.after_cancel(filter_after_id)
+                except tk.TclError:
+                    pass
+            filter_after_id = dialog.after(120, render_all)
+
+        def toggle_iids(group, iids):
+            keys = [
+                record_by_iid[iid]["key"]
+                for iid in iids
+                if iid in record_by_iid
+            ]
+            if not keys:
+                return
+            if all(key in selected_keys for key in keys):
+                selected_keys.difference_update(keys)
+            else:
+                selected_keys.update(keys)
+            render_group(group)
+            update_status()
+
+        def on_tree_click(event, group):
+            tree = group_widgets[group]["tree"]
+            if tree.identify_region(event.x, event.y) != "cell":
+                return None
+            if tree.identify_column(event.x) != "#1":
+                return None
+            iid = tree.identify_row(event.y)
+            if iid:
+                toggle_iids(group, (iid,))
+            return "break"
+
+        def on_tree_space(_event, group):
+            tree = group_widgets[group]["tree"]
+            iids = tree.selection()
+            if not iids and tree.focus():
+                iids = (tree.focus(),)
+            toggle_iids(group, iids)
+            return "break"
+
+        for group, widgets in group_widgets.items():
+            widgets["tree"].bind(
+                "<Button-1>",
+                lambda event, selected_group=group: on_tree_click(
+                    event, selected_group
+                ),
+            )
+            widgets["tree"].bind(
+                "<space>",
+                lambda event, selected_group=group: on_tree_space(
+                    event, selected_group
+                ),
+            )
+
+        def select_visible():
+            group = current_group()
+            selected_keys.update(record["key"] for record in matching_records(group))
+            render_group(group)
+            update_status()
+
+        def select_section():
+            group = current_group()
+            selected_keys.update(
+                record["key"] for record in records_by_group[group]
+            )
+            render_group(group)
+            update_status()
+
+        def deselect_section():
+            group = current_group()
+            selected_keys.difference_update(
+                record["key"] for record in records_by_group[group]
+            )
+            render_group(group)
+            update_status()
+
+        ttk.Button(
+            selection_frame,
+            text="Выбрать результаты поиска",
+            command=select_visible,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            selection_frame,
+            text="Выбрать все в разделе",
+            command=select_section,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            selection_frame,
+            text="Снять всё в разделе",
+            command=deselect_section,
+        ).pack(side=tk.LEFT)
+
+        def apply_selected_deletion():
+            if not selected_keys:
+                return
+            if not self._ask_yes_no(
+                "Удалить правила",
+                f"Удалить выбранные правила ({len(selected_keys)}) "
+                "из JSON-редактора?\n\n"
+                "Файл на диске изменится только после кнопки «Сохранить файл».",
+                icon="warning",
+                parent=dialog,
+            ):
+                return
+            updated, removed = remove_glossary_rules(parsed, selected_keys)
+            self._replace_glossary_editor_data(updated)
+            close_dialog()
+            self._show_info(
+                "Глоссарий изменён",
+                f"Из редактора удалено правил: {removed}.\n"
+                "Для записи на диск нажмите «Сохранить файл».",
+            )
+
+        def apply_full_clear():
+            if not self._ask_yes_no(
+                "Очистить весь глоссарий",
+                f"Убрать все правила ({len(records)}) из JSON-редактора?\n\n"
+                "Неизвестные служебные поля JSON будут сохранены. "
+                "Файл на диске изменится только после кнопки «Сохранить файл».",
+                icon="warning",
+                parent=dialog,
+            ):
+                return
+            updated, removed = clear_glossary_rules(parsed)
+            self._replace_glossary_editor_data(updated)
+            close_dialog()
+            self._show_info(
+                "Глоссарий очищен",
+                f"Из редактора удалено правил: {removed}.\n"
+                "Для записи на диск нажмите «Сохранить файл».",
+            )
+
+        ttk.Button(
+            action_frame,
+            text="🔥 Очистить весь глоссарий…",
+            command=apply_full_clear,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            action_frame,
+            text="Отмена",
+            command=close_dialog,
+        ).pack(side=tk.RIGHT)
+        delete_button = ttk.Button(
+            action_frame,
+            text="🗑 Удалить выбранные…",
+            command=apply_selected_deletion,
+            state=tk.DISABLED,
+        )
+        delete_button.pack(side=tk.RIGHT, padx=5)
+
+        search_var.trace_add("write", schedule_filter)
+        notebook.bind(
+            "<<NotebookTabChanged>>",
+            lambda _event: update_status(),
+            add="+",
+        )
+        render_all()
+        self._center_popup(dialog, 940, 560, fit_screen=True)
+        search_entry.focus_set()
+
+    # --- Вкладка "Нормализатор" (v1.5) ---
+    def setup_normalizer_tab(self):
+        self._normalizer_preview_after_id = None
+        self._normalizer_preview_generation = 0
+        self._normalizer_last_preview_result = None
+        self._normalizer_ui_loading = True
+        self.normalizer_preview_vars = {}
+
+        frame = ttk.Frame(self.tab_normalizer, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill=tk.X, pady=(0, 8))
+        toolbar.columnconfigure(7, weight=1)
+
+        ttk.Label(toolbar, text="Профиль:").grid(
+            row=0, column=0, sticky=tk.W, padx=(0, 4)
+        )
+        self.normalizer_profile_choice = tk.StringVar(
+            value="TTS (для озвучки)"
+        )
+        self.normalizer_profile_combobox = ttk.Combobox(
+            toolbar,
+            textvariable=self.normalizer_profile_choice,
+            values=(
+                "TTS (для озвучки)",
+                "Safe (бережный)",
+                "Пользовательский",
+            ),
+            state="readonly",
+            width=22,
+        )
+        self.normalizer_profile_combobox.grid(row=0, column=1, sticky=tk.W)
+        self.normalizer_profile_combobox.bind(
+            "<<ComboboxSelected>>", self._on_normalizer_profile_selected
+        )
+
+        self.normalizer_preview_enabled_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            toolbar,
+            text="ru-normalizr",
+            variable=self.normalizer_preview_enabled_var,
+            command=self._normalizer_option_changed,
+        ).grid(row=0, column=2, sticky=tk.W, padx=(12, 4))
+
+        self.normalizer_preview_glossary_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            toolbar,
+            text="Глоссарий",
+            variable=self.normalizer_preview_glossary_var,
+            command=self._normalizer_option_changed,
+        ).grid(row=0, column=3, sticky=tk.W, padx=4)
+
+        self.normalizer_preview_auto_abbr_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            toolbar,
+            text="Автоаббревиатуры Studio",
+            variable=self.normalizer_preview_auto_abbr_var,
+            command=self._normalizer_option_changed,
+        ).grid(row=0, column=4, sticky=tk.W, padx=4)
+
+        self.normalizer_preview_short_words_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            toolbar,
+            text="Короткие сокращения Studio",
+            variable=self.normalizer_preview_short_words_var,
+            command=self._normalizer_option_changed,
+        ).grid(row=0, column=5, sticky=tk.W, padx=4)
+
+        actions = ttk.Frame(toolbar)
+        actions.grid(row=1, column=0, columnspan=8, sticky=tk.EW, pady=(6, 0))
+        ttk.Button(
+            actions,
+            text="↩ Вернуть глобальные",
+            command=self._load_normalizer_preview_from_config,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            actions,
+            text="📂 Импорт профиля",
+            command=self.import_normalizer_profile,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            actions,
+            text="📤 Экспорт профиля",
+            command=self.export_normalizer_profile,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            actions,
+            text="✓ Применить глобально",
+            command=self.apply_normalizer_preview_globally,
+        ).pack(side=tk.RIGHT)
+        self.lbl_normalizer_scope_status = ttk.Label(
+            toolbar,
+            text="",
+            anchor=tk.W,
+            wraplength=900,
+            foreground=self.get_status_color("info"),
+        )
+        self.lbl_normalizer_scope_status.grid(
+            row=2, column=0, columnspan=8, sticky=tk.EW, pady=(5, 0)
+        )
+        self._status_label_kinds[self.lbl_normalizer_scope_status] = "info"
+
+        main_pane = ttk.Panedwindow(frame, orient=tk.HORIZONTAL)
+        main_pane.pack(fill=tk.BOTH, expand=True)
+
+        # Text по умолчанию запрашивает ширину около 80 символов. Для двух
+        # редакторов это незаметно перетягивало sash вправо и обрезало вторую
+        # колонку настроек на небольшом экране. Задаём компактный initial size
+        # и отдаём больше свободной ширины панели параметров; sash по-прежнему
+        # можно перетащить вручную.
+        text_pane = ttk.Frame(main_pane, width=440)
+        settings_pane = ttk.Frame(
+            main_pane, width=560, padding=(8, 0, 0, 0)
+        )
+        main_pane.add(text_pane, weight=2)
+        main_pane.add(settings_pane, weight=3)
+
+        editor_pane = ttk.Panedwindow(text_pane, orient=tk.VERTICAL)
+
+        source_frame = ttk.LabelFrame(
+            editor_pane, text="Исходный текст (можно редактировать)", padding=5
+        )
+        result_frame = ttk.LabelFrame(
+            editor_pane, text="Результат полного pipeline синтеза", padding=5
+        )
+        editor_pane.add(source_frame, weight=1)
+        editor_pane.add(result_frame, weight=1)
+
+        source_scroll = ttk.Scrollbar(source_frame, orient=tk.VERTICAL)
+        source_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.normalizer_source_text = tk.Text(
+            source_frame,
+            wrap=tk.WORD,
+            width=44,
+            undo=True,
+            maxundo=50,
+            font=("Arial", self.font_size_var.get()),
+            yscrollcommand=source_scroll.set,
+        )
+        self.normalizer_source_text.pack(fill=tk.BOTH, expand=True)
+        source_scroll.configure(command=self.normalizer_source_text.yview)
+        self.normalizer_source_text.bind(
+            "<<Modified>>", self._on_normalizer_source_modified
+        )
+        self.normalizer_source_text.bind(
+            "<Control-Return>", lambda _event: self.run_normalizer_preview()
+        )
+        self.normalizer_source_text.bind(
+            "<Command-Return>", lambda _event: self.run_normalizer_preview()
+        )
+
+        result_scroll = ttk.Scrollbar(result_frame, orient=tk.VERTICAL)
+        result_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.normalizer_result_text = tk.Text(
+            result_frame,
+            wrap=tk.WORD,
+            width=44,
+            state=tk.DISABLED,
+            font=("Arial", self.font_size_var.get()),
+            yscrollcommand=result_scroll.set,
+        )
+        self.normalizer_result_text.pack(fill=tk.BOTH, expand=True)
+        result_scroll.configure(command=self.normalizer_result_text.yview)
+
+        # Нижнюю панель резервируем до expand-панели редакторов. Иначе Tk при
+        # небольшой высоте отдаёт Panedwindow всю полость и визуально обрезает
+        # кнопки, хотя они присутствуют в дереве виджетов.
+        preview_controls = ttk.Frame(text_pane)
+        preview_controls.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        preview_actions = ttk.Frame(preview_controls)
+        preview_actions.pack(fill=tk.X)
+        ttk.Button(
+            preview_actions,
+            text="▶ Нормализовать (Ctrl/⌘+Enter)",
+            command=self.run_normalizer_preview,
+        ).pack(side=tk.LEFT)
+        self.btn_save_normalized_text = ttk.Button(
+            preview_actions,
+            text="💾 Сохранить TXT…",
+            command=self.save_normalized_text_to_file,
+            state=tk.DISABLED,
+        )
+        self.btn_save_normalized_text.pack(side=tk.LEFT, padx=(6, 0))
+        preview_status_row = ttk.Frame(preview_controls)
+        preview_status_row.pack(fill=tk.X, pady=(4, 0))
+        self.normalizer_font_combobox = ttk.Combobox(
+            preview_status_row,
+            textvariable=self.font_size_var,
+            values=(10, 12, 14, 16, 18, 20, 24),
+            state="readonly",
+            width=5,
+        )
+        self.normalizer_font_combobox.pack(side=tk.RIGHT)
+        ttk.Label(preview_status_row, text="Шрифт:").pack(
+            side=tk.RIGHT, padx=(12, 5)
+        )
+        self.normalizer_font_combobox.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self.root.after(10, self.update_fonts),
+        )
+        self.lbl_normalizer_preview_status = ttk.Label(
+            preview_status_row,
+            text="Введите несколько предложений для предпросмотра.",
+            anchor=tk.W,
+            wraplength=360,
+            foreground=self.get_status_color("info"),
+        )
+        self.lbl_normalizer_preview_status.pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+        preview_status_row.bind(
+            "<Configure>",
+            lambda event: self.lbl_normalizer_preview_status.configure(
+                wraplength=max(180, event.width - 125)
+            ),
+            add="+",
+        )
+        self._status_label_kinds[self.lbl_normalizer_preview_status] = "info"
+        editor_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        settings_tabs = ttk.Notebook(settings_pane)
+        settings_tabs.pack(fill=tk.BOTH, expand=True)
+        stages_tab = ttk.Frame(settings_tabs, padding=8)
+        advanced_tab = ttk.Frame(settings_tabs, padding=8)
+        settings_tabs.add(stages_tab, text="Этапы")
+        settings_tabs.add(advanced_tab, text="Расширенные")
+
+        stage_labels = (
+            ("enable_caps_normalization", "Нормализация CAPS"),
+            ("enable_first_word_decap", "Регистр первого слова"),
+            ("remove_links", "Удалять цифровые сноски"),
+            ("enable_url_normalization", "Произносить URL"),
+            ("enable_year_normalization", "Годы и десятилетия"),
+            ("enable_roman_normalization", "Римские числа"),
+            ("enable_dates_time_normalization", "Даты и время"),
+            ("enable_numeral_normalization", "Числа и дроби"),
+            ("enable_abbreviation_expansion", "Сокращения"),
+            (
+                "enable_contextual_abbreviation_expansion",
+                "Контекстные сокращения",
+            ),
+            ("enable_years_ago_expansion", "Сокращение «л. н.»"),
+            ("enable_initials_expansion", "Инициалы"),
+            (
+                "enable_letter_abbreviation_expansion",
+                "Буквенные аббревиатуры",
+            ),
+            ("enable_dictionary_normalization", "Словари ru-normalizr"),
+            ("enable_latinization", "Латиница → кириллица"),
+            (
+                "enable_latinization_stress_marks",
+                "Ударения при латинизации",
+            ),
+        )
+        for index, (key, label) in enumerate(stage_labels):
+            variable = tk.BooleanVar()
+            self.normalizer_preview_vars[key] = variable
+            ttk.Checkbutton(
+                stages_tab,
+                text=label,
+                variable=variable,
+                command=self._normalizer_option_changed,
+            ).grid(
+                row=index % 8,
+                column=index // 8,
+                sticky=tk.W,
+                padx=(0, 12),
+                pady=3,
+            )
+        stages_tab.columnconfigure(0, weight=1)
+        stages_tab.columnconfigure(1, weight=1)
+
+        advanced_tab.columnconfigure(1, weight=1)
+
+        def add_preview_combo(row, label, key, values):
+            ttk.Label(advanced_tab, text=label).grid(
+                row=row, column=0, sticky=tk.W, padx=(0, 6), pady=3
+            )
+            variable = tk.StringVar()
+            self.normalizer_preview_vars[key] = variable
+            widget = ttk.Combobox(
+                advanced_tab,
+                textvariable=variable,
+                values=values,
+                state="readonly",
+            )
+            widget.grid(row=row, column=1, sticky=tk.EW, pady=3)
+            widget.bind(
+                "<<ComboboxSelected>>",
+                lambda _event: self._normalizer_option_changed(),
+            )
+
+        add_preview_combo(
+            0, "Гласные в инициалах:", "initials_vowel_mode", ("single", "double")
+        )
+        add_preview_combo(
+            1,
+            "Паузы между инициалами:",
+            "initials_pause_mode",
+            ("preserve", "comma"),
+        )
+        add_preview_combo(
+            2,
+            "Латинизация:",
+            "latinization_backend",
+            ("ipa", "dictionary"),
+        )
+
+        interval_frame = ttk.Frame(advanced_tab)
+        interval_frame.grid(row=3, column=1, sticky=tk.EW, pady=3)
+        self.normalizer_ignore_start_var = tk.StringVar()
+        self.normalizer_ignore_end_var = tk.StringVar()
+        ttk.Entry(
+            interval_frame,
+            textvariable=self.normalizer_ignore_start_var,
+            width=8,
+        ).pack(side=tk.LEFT)
+        ttk.Label(interval_frame, text=" … ").pack(side=tk.LEFT)
+        ttk.Entry(
+            interval_frame,
+            textvariable=self.normalizer_ignore_end_var,
+            width=8,
+        ).pack(side=tk.LEFT)
+        ttk.Label(advanced_tab, text="Не удалять номера сносок:").grid(
+            row=3, column=0, sticky=tk.W, padx=(0, 6), pady=3
+        )
+
+        def add_preview_entry(row, label, key):
+            ttk.Label(advanced_tab, text=label).grid(
+                row=row, column=0, sticky=tk.W, padx=(0, 6), pady=3
+            )
+            variable = tk.StringVar()
+            self.normalizer_preview_vars[key] = variable
+            entry = ttk.Entry(advanced_tab, textvariable=variable)
+            entry.grid(row=row, column=1, sticky=tk.EW, pady=3)
+            entry.bind("<KeyRelease>", lambda _event: self._normalizer_option_changed())
+            return entry
+
+        add_preview_entry(4, "Файл словаря латинизации:", "latin_dictionary_filename")
+        add_preview_entry(5, "Включить только .dic (через запятую):", "dictionary_include_files")
+        add_preview_entry(6, "Исключить .dic (через запятую):", "dictionary_exclude_files")
+
+        ttk.Label(
+            advanced_tab,
+            text="Каталог словарей (локальный путь):",
+        ).grid(row=7, column=0, sticky=tk.W, padx=(0, 6), pady=3)
+        dictionary_path_frame = ttk.Frame(advanced_tab)
+        dictionary_path_frame.grid(row=7, column=1, sticky=tk.EW, pady=3)
+        dictionary_path_frame.columnconfigure(0, weight=1)
+        dictionary_path_var = tk.StringVar()
+        self.normalizer_preview_vars["dictionaries_path"] = dictionary_path_var
+        dictionary_path_entry = ttk.Entry(
+            dictionary_path_frame, textvariable=dictionary_path_var
+        )
+        dictionary_path_entry.grid(row=0, column=0, sticky=tk.EW)
+        dictionary_path_entry.bind(
+            "<KeyRelease>", lambda _event: self._normalizer_option_changed()
+        )
+
+        def choose_dictionary_path():
+            selected = filedialog.askdirectory(
+                initialdir=resolve_dialog_initial_dir(
+                    dictionary_path_var.get(), BASE_DIR
+                )
+            )
+            if selected:
+                dictionary_path_var.set(selected)
+                self._normalizer_option_changed()
+
+        ttk.Button(
+            dictionary_path_frame,
+            text="📁",
+            width=3,
+            command=choose_dictionary_path,
+        ).grid(row=0, column=1, padx=(4, 0))
+        ttk.Label(
+            advanced_tab,
+            text=(
+                "Локальный путь применяется глобально, но не включается в "
+                "экспортируемый профиль."
+            ),
+            wraplength=360,
+            foreground=self.get_status_color("muted"),
+        ).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+
+        for variable in (
+            self.normalizer_ignore_start_var,
+            self.normalizer_ignore_end_var,
+        ):
+            variable.trace_add(
+                "write", lambda *_args: self._normalizer_option_changed()
+            )
+
+        self._load_normalizer_preview_from_config()
+        self._normalizer_ui_loading = False
+
+    def _open_normalizer_tab_from_settings(self):
+        self.notebook.select(self.tab_normalizer)
+        if hasattr(self, "normalizer_source_text"):
+            self.root.after_idle(self.normalizer_source_text.focus_set)
+
+    def _refresh_global_normalizer_settings_summary(self):
+        summary = describe_normalizer_settings(self.config)
+        if hasattr(self, "lbl_settings_normalizer_profile"):
+            self.lbl_settings_normalizer_profile.configure(
+                text=f"Глобальный профиль: {summary['profile']}"
+            )
+        if hasattr(self, "lbl_settings_normalizer_details"):
+            self.lbl_settings_normalizer_details.configure(
+                text=summary["details"]
+            )
+
+    def _refresh_normalizer_scope_status(self):
+        if not hasattr(self, "lbl_normalizer_scope_status"):
+            return
+        summary = describe_normalizer_settings(self.config)
+        try:
+            local = normalizer_settings_snapshot(
+                self._collect_normalizer_preview_config()
+            )
+            saved = normalizer_settings_snapshot(self.config)
+            matches = local == saved
+        except Exception:
+            matches = False
+        if matches:
+            text = (
+                f"Глобально: {summary['profile']} • локальные настройки "
+                "совпадают с сохранёнными"
+            )
+            status = "success"
+        else:
+            text = (
+                f"Глобально: {summary['profile']} • есть неприменённые "
+                "локальные изменения"
+            )
+            status = "warning"
+        self._set_status_label(self.lbl_normalizer_scope_status, text, status)
+
+    def _normalizer_option_changed(self, *_args):
+        if getattr(self, "_normalizer_ui_loading", False):
+            return
+        self.normalizer_profile_choice.set("Пользовательский")
+        self._refresh_normalizer_scope_status()
+        self._schedule_normalizer_preview()
+
+    def _on_normalizer_profile_selected(self, _event=None):
+        if getattr(self, "_normalizer_ui_loading", False):
+            return
+        choice = self.normalizer_profile_choice.get()
+        mode = {
+            "TTS (для озвучки)": "tts",
+            "Safe (бережный)": "safe",
+        }.get(choice)
+        if mode is None:
+            return
+        config = {
+            "normalizer_enabled": True,
+            "normalizer_mode": mode,
+            "normalizer_options": normalizer_mode_defaults(mode),
+            "glossary_enabled": True,
+            "auto_abbreviations": True,
+            "auto_short_words": True,
+        }
+        self._set_normalizer_preview_config(config, selected_choice=choice)
+        self._schedule_normalizer_preview(delay_ms=10)
+
+    def _set_normalizer_preview_config(self, config, selected_choice=None):
+        normalized = normalize_config(config)
+        mode = normalized.get("normalizer_mode", "tts")
+        options = resolved_normalizer_options(normalized)
+        self._normalizer_ui_loading = True
+        try:
+            self._normalizer_preview_mode = mode
+            self.normalizer_preview_enabled_var.set(
+                _config_bool(normalized.get("normalizer_enabled", True), default=True)
+            )
+            self.normalizer_preview_glossary_var.set(
+                _config_bool(normalized.get("glossary_enabled", True), default=True)
+            )
+            self.normalizer_preview_auto_abbr_var.set(
+                _config_bool(normalized.get("auto_abbreviations", True), default=True)
+            )
+            self.normalizer_preview_short_words_var.set(
+                _config_bool(normalized.get("auto_short_words", True), default=True)
+            )
+            for key in NORMALIZER_BOOLEAN_OPTIONS:
+                self.normalizer_preview_vars[key].set(bool(options[key]))
+            for key in NORMALIZER_ENUM_OPTIONS:
+                self.normalizer_preview_vars[key].set(str(options[key]))
+            interval = options["remove_links_ignore_interval"]
+            self.normalizer_ignore_start_var.set(str(interval[0]))
+            self.normalizer_ignore_end_var.set(str(interval[1]))
+            self.normalizer_preview_vars["latin_dictionary_filename"].set(
+                options["latin_dictionary_filename"]
+            )
+            for key in NORMALIZER_SEQUENCE_OPTIONS:
+                self.normalizer_preview_vars[key].set(", ".join(options[key]))
+            self.normalizer_preview_vars["dictionaries_path"].set(
+                options["dictionaries_path"]
+            )
+
+            if selected_choice is None:
+                is_builtin = (
+                    options == normalizer_mode_defaults(mode)
+                    and self.normalizer_preview_enabled_var.get()
+                    and self.normalizer_preview_glossary_var.get()
+                    and self.normalizer_preview_auto_abbr_var.get()
+                    and self.normalizer_preview_short_words_var.get()
+                )
+                selected_choice = (
+                    "TTS (для озвучки)"
+                    if is_builtin and mode == "tts"
+                    else (
+                        "Safe (бережный)"
+                        if is_builtin and mode == "safe"
+                        else "Пользовательский"
+                    )
+                )
+            self.normalizer_profile_choice.set(selected_choice)
+        finally:
+            self._normalizer_ui_loading = False
+        self._refresh_normalizer_scope_status()
+
+    def _load_normalizer_preview_from_config(self):
+        self._set_normalizer_preview_config(self.config)
+        self._schedule_normalizer_preview(delay_ms=10)
+
+    def _collect_normalizer_preview_config(self):
+        raw_options = {}
+        for key in NORMALIZER_BOOLEAN_OPTIONS:
+            raw_options[key] = self.normalizer_preview_vars[key].get()
+        for key in NORMALIZER_ENUM_OPTIONS:
+            raw_options[key] = self.normalizer_preview_vars[key].get()
+        raw_options["remove_links_ignore_interval"] = [
+            self.normalizer_ignore_start_var.get(),
+            self.normalizer_ignore_end_var.get(),
+        ]
+        raw_options["latin_dictionary_filename"] = (
+            self.normalizer_preview_vars["latin_dictionary_filename"].get()
+        )
+        for key in NORMALIZER_SEQUENCE_OPTIONS:
+            raw_options[key] = self.normalizer_preview_vars[key].get()
+        raw_options["dictionaries_path"] = self.normalizer_preview_vars[
+            "dictionaries_path"
+        ].get()
+
+        mode = getattr(self, "_normalizer_preview_mode", "tts")
+        options = normalize_normalizer_options(raw_options, mode, full=True)
+        config = dict(self.config)
+        config.update(
+            {
+                "normalizer_enabled": self.normalizer_preview_enabled_var.get(),
+                "normalizer_mode": mode,
+                "normalizer_options": options,
+                "glossary_enabled": self.normalizer_preview_glossary_var.get(),
+                "auto_abbreviations": self.normalizer_preview_auto_abbr_var.get(),
+                "auto_short_words": self.normalizer_preview_short_words_var.get(),
+            }
+        )
+        return config
+
+    def _on_normalizer_source_modified(self, _event=None):
+        if not self.normalizer_source_text.edit_modified():
+            return
+        self.normalizer_source_text.edit_modified(False)
+        self._schedule_normalizer_preview()
+
+    def _schedule_normalizer_preview(self, *_args, delay_ms=350):
+        if not hasattr(self, "normalizer_source_text"):
+            return
+        # Изменённый источник или параметр немедленно делает предыдущий preview
+        # устаревшим. Инвалидация до debounce также не даёт позднему worker
+        # снова включить Save для результата, рассчитанного по старым данным.
+        self._normalizer_preview_generation += 1
+        self._normalizer_last_preview_result = None
+        if hasattr(self, "btn_save_normalized_text"):
+            self.btn_save_normalized_text.configure(state=tk.DISABLED)
+        pending = getattr(self, "_normalizer_preview_after_id", None)
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except tk.TclError:
+                pass
+        self._normalizer_preview_after_id = self.root.after(
+            delay_ms, self.run_normalizer_preview
+        )
+
+    def _normalizer_glossary_snapshot(self, enabled):
+        if not enabled:
+            return empty_glossary_data()
+        loaded_path = getattr(self, "_glossary_loaded_path", None)
+        configured_path = self._configured_glossary_path()
+        if loaded_path is not None and Path(loaded_path) != configured_path:
+            raise ValueError(
+                "папка кэша изменилась; перезагрузите редактор глоссария"
+            )
+        content = self.txt_glossary.get(1.0, tk.END).strip()
+        data = json.loads(content) if content else empty_glossary_data()
+        return canonicalize_glossary_data(data)
+
+    def run_normalizer_preview(self):
+        pending = getattr(self, "_normalizer_preview_after_id", None)
+        self._normalizer_preview_after_id = None
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except tk.TclError:
+                # При вызове самим after() callback уже снят из очереди Tcl.
+                pass
+        self._normalizer_last_preview_result = None
+        self.btn_save_normalized_text.configure(state=tk.DISABLED)
+        source = self.normalizer_source_text.get(1.0, tk.END).rstrip("\n")
+        self._normalizer_preview_generation += 1
+        generation = self._normalizer_preview_generation
+        if not source:
+            self._finish_normalizer_preview(
+                generation,
+                {
+                    "normalized_text": "",
+                    "normalized_text_for_file": "",
+                    "sentence_count": 0,
+                    "skipped": [],
+                },
+                None,
+            )
+            return "break"
+        try:
+            config = self._collect_normalizer_preview_config()
+            glossary = self._normalizer_glossary_snapshot(
+                config.get("glossary_enabled", True)
+            )
+        except Exception as exc:
+            self._set_status_label(
+                self.lbl_normalizer_preview_status,
+                f"Ошибка настроек/глоссария: {exc}",
+                "error",
+            )
+            return "break"
+
+        self._set_status_label(
+            self.lbl_normalizer_preview_status,
+            "Нормализация...",
+            "warning",
+        )
+
+        def worker():
+            try:
+                context = TTSProcessor.normalization_context(config, glossary)
+                result = context.preview_normalization(source)
+                error = None
+            except Exception as exc:
+                result = None
+                error = exc
+            self._post_to_ui(
+                self._finish_normalizer_preview,
+                generation,
+                result,
+                error,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+        return "break"
+
+    def _finish_normalizer_preview(self, generation, result, error):
+        if generation != self._normalizer_preview_generation:
+            return
+        self.normalizer_result_text.configure(state=tk.NORMAL)
+        self.normalizer_result_text.delete(1.0, tk.END)
+        if error is None and result is not None:
+            self.normalizer_result_text.insert(
+                tk.END, result.get("normalized_text", "")
+            )
+        self.normalizer_result_text.configure(state=tk.DISABLED)
+        if error is not None:
+            logging.error("Ошибка предпросмотра нормализации: %s", error)
+            self._set_status_label(
+                self.lbl_normalizer_preview_status,
+                f"Ошибка: {error}",
+                "error",
+            )
+            return
+        self._normalizer_last_preview_result = copy.deepcopy(result)
+        savable_text = result.get("normalized_text_for_file", "")
+        self.btn_save_normalized_text.configure(
+            state=tk.NORMAL if savable_text.strip() else tk.DISABLED
+        )
+        skipped = len(result.get("skipped", []))
+        status = f"Готово: предложений {result.get('sentence_count', 0)}"
+        if skipped:
+            status += f", пропущено неподдерживаемых фрагментов: {skipped}"
+        self._set_status_label(
+            self.lbl_normalizer_preview_status,
+            status,
+            "warning" if skipped else "success",
+        )
+
+    def save_normalized_text_to_file(self):
+        """Сохраняет завершённый preview как повторно используемый UTF-8 TXT."""
+        result = getattr(self, "_normalizer_last_preview_result", None)
+        text = (
+            result.get("normalized_text_for_file", "")
+            if isinstance(result, dict)
+            else ""
+        )
+        if not text.strip():
+            self._show_warning(
+                "Нет результата",
+                "Сначала нормализуйте непустой текст.",
+            )
+            return
+        skipped = result.get("skipped", []) if isinstance(result, dict) else []
+        if skipped and not self._ask_yes_no(
+            "Есть пропущенные фрагменты",
+            f"При нормализации пропущено фрагментов без поддерживаемого "
+            f"текста: {len(skipped)}. В сохранённом TXT их не будет.\n\n"
+            "Сохранить неполный результат?",
+            icon="warning",
+        ):
+            return
+        filepath = filedialog.asksaveasfilename(
+            initialdir=resolve_dialog_initial_dir(
+                self.config.get("last_normalizer_text_dir"),
+                self.config.get("input_dir"),
+                BASE_DIR,
+            ),
+            defaultextension=".txt",
+            filetypes=[("Текст UTF-8", "*.txt"), ("Все файлы", "*.*")],
+            initialfile="normalized_text.txt",
+        )
+        if not filepath:
+            return
+        try:
+            _write_text_atomic(filepath, text)
+            self.config["last_normalizer_text_dir"] = str(Path(filepath).parent)
+            self.save_settings()
+            self._show_info(
+                "Текст сохранён",
+                f"Нормализованный UTF-8 TXT без BOM сохранён в:\n{filepath}\n\n"
+                "Для повторного синтеза включите «Текст уже подготовлен». "
+                "Строки пауз записаны каноническим разделителем и используют "
+                "текущие настройки пауз.",
+            )
+        except Exception as exc:
+            self._show_error(
+                "Ошибка",
+                f"Не удалось сохранить нормализованный текст:\n{exc}",
+            )
+
+    def apply_normalizer_preview_globally(self):
+        try:
+            local = self._collect_normalizer_preview_config()
+        except Exception as exc:
+            self._show_error("Некорректный профиль", str(exc))
+            return
+        candidate_config = copy.deepcopy(self.config)
+        for key in (
+            "normalizer_enabled",
+            "normalizer_mode",
+            "normalizer_options",
+            "glossary_enabled",
+            "auto_abbreviations",
+            "auto_short_words",
+        ):
+            candidate_config[key] = copy.deepcopy(local[key])
+        try:
+            self._persist_settings_snapshot(candidate_config)
+        except Exception as exc:
+            logging.error("Не удалось применить профиль нормализатора: %s", exc)
+            self._show_error(
+                "Ошибка сохранения",
+                f"Профиль не применён:\n{exc}",
+            )
+            return
+
+        self.config = candidate_config
+        previous_update_state = getattr(self, "_is_updating_ui", False)
+        self._is_updating_ui = True
+        try:
+            for key in ("auto_abbreviations", "auto_short_words"):
+                variable = self.settings_vars.get(key)
+                if variable is not None:
+                    variable.set(self.config[key])
+        finally:
+            self._is_updating_ui = previous_update_state
+        self._refresh_global_normalizer_settings_summary()
+        self._refresh_normalizer_scope_status()
+        self._show_info(
+            "Профиль применён",
+            "Настройки нормализатора сохранены глобально и будут "
+            "использоваться новым синтезом.",
+        )
+
+    def export_normalizer_profile(self):
+        try:
+            config = self._collect_normalizer_preview_config()
+            profile = normalizer_profile_from_config(
+                config,
+                name=self.normalizer_profile_choice.get(),
+            )
+        except Exception as exc:
+            self._show_error("Некорректный профиль", str(exc))
+            return
+        filepath = filedialog.asksaveasfilename(
+            initialdir=self._config_dialog_initial_dir(),
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            initialfile="normalizer_profile.json",
+        )
+        if not filepath:
+            return
+        try:
+            self._write_json_atomic(filepath, profile)
+            self._remember_dialog_directory("last_config_dir", filepath)
+            self._show_info(
+                "Профиль экспортирован",
+                f"Файл сохранён:\n{filepath}\n\n"
+                "Локальный путь к каталогу словарей не переносится.",
+            )
+        except Exception as exc:
+            self._show_error("Ошибка", f"Не удалось экспортировать профиль:\n{exc}")
+
+    def import_normalizer_profile(self):
+        filepath = filedialog.askopenfilename(
+            initialdir=self._config_dialog_initial_dir(),
+            filetypes=[("JSON files", "*.json")],
+        )
+        if not filepath:
+            return
+        try:
+            with open(filepath, "r", encoding="utf-8-sig") as file:
+                profile = normalize_normalizer_profile(json.load(file))
+            local = apply_normalizer_profile(self.config, profile)
+            self._set_normalizer_preview_config(
+                local, selected_choice="Пользовательский"
+            )
+            self._remember_dialog_directory("last_config_dir", filepath)
+            self._schedule_normalizer_preview(delay_ms=10)
+        except Exception as exc:
+            self._show_error("Ошибка", f"Не удалось импортировать профиль:\n{exc}")
+
+    # --- Переносимые аудиопрофили (v1.5) ---
+    def _audio_profile_from_current_ui(self, target, name="Новый профиль"):
+        if target == "export":
+            return make_audio_profile(
+                name,
+                output_format=self.export_fmt_var.get(),
+                bitrate=self.export_bitrate_var.get(),
+                sample_rate=self.export_sample_rate_var.get(),
+                channels=self.export_channels_var.get(),
+                effects_enabled=self.export_apply_fx_var.get(),
+                speed=self.exp_speed_var.get(),
+                pitch=self.exp_pitch_var.get(),
+                echo=self.exp_echo_var.get(),
+                echo_delay=self.exp_delay_var.get(),
+                echo_decay=self.exp_decay_var.get(),
+            )
+        if target != "book":
+            raise ValueError("неизвестная область аудиопрофиля")
+
+        def setting(key, default):
+            variable = self.settings_vars.get(key)
+            return variable.get() if variable is not None else self.config.get(key, default)
+
+        speed = float(setting("fx_speed", 1.0))
+        pitch = float(setting("fx_pitch", 1.0))
+        echo = _config_bool(setting("fx_echo", False))
+        effects_enabled = echo or speed != 1.0 or pitch != 1.0
+        return make_audio_profile(
+            name,
+            output_format=setting("output_format", "mp3"),
+            bitrate=setting("output_bitrate", "128k"),
+            sample_rate=setting("output_sample_rate", "auto"),
+            channels=setting("output_channels", "auto"),
+            effects_enabled=effects_enabled,
+            speed=speed,
+            pitch=pitch,
+            echo=echo,
+            echo_delay=setting("fx_echo_delay", 300),
+            echo_decay=setting("fx_echo_decay", 0.3),
+        )
+
+    def _current_audio_profile_summary(self, target):
+        profile = self._audio_profile_from_current_ui(target, "Текущие параметры")
+        matching_name = matching_audio_profile_name(
+            profile, self.config.get("audio_profiles", [])
+        )
+        prefix = (
+            f"Совпадает с профилем «{matching_name}»"
+            if matching_name
+            else "Пользовательские параметры"
+        )
+        return f"{prefix}: {describe_audio_profile(profile)}"
+
+    def _refresh_audio_profile_summaries(self):
+        for target, label_name in (
+            ("book", "lbl_book_audio_profile_summary"),
+            ("export", "lbl_export_audio_profile_summary"),
+        ):
+            label = getattr(self, label_name, None)
+            if label is None:
+                continue
+            try:
+                label.configure(text=self._current_audio_profile_summary(target))
+            except (AttributeError, KeyError, tk.TclError, TypeError, ValueError):
+                # Во время поэтапного построения/загрузки UI не все Tk-переменные
+                # уже существуют. Финальный set_ui_from_config обновит подпись.
+                label.configure(text="Параметры профиля пока недоступны.")
+
+    def _apply_audio_profile_to_ui(self, profile, target, *, save=True):
+        values = audio_profile_config_values(profile, target)
+        if target == "book":
+            _select_book_audio_profile(
+                values["output_format"],
+                sample_rate=values["output_sample_rate"],
+                channels=values["output_channels"],
+                bitrate=values["output_bitrate"],
+            )
+            self.config.update(copy.deepcopy(values))
+            for key, value in values.items():
+                variable = self.settings_vars.get(key)
+                if variable is not None:
+                    variable.set(value)
+            if hasattr(self, "dir_speed_var"):
+                self.dir_speed_var.set(values["fx_speed"])
+                self.dir_pitch_var.set(values["fx_pitch"])
+                self.dir_echo_var.set(values["fx_echo"])
+                self.dir_echo_delay_var.set(values["fx_echo_delay"])
+                self.dir_echo_decay_var.set(values["fx_echo_decay"])
+                self.lbl_dir_speed.configure(text=f"{values['fx_speed']:.1f}x")
+                self.lbl_dir_pitch.configure(text=f"{values['fx_pitch']:.2f}")
+                self.lbl_dir_delay.configure(text=f"{values['fx_echo_delay']}мс")
+                self.lbl_dir_decay.configure(text=f"{values['fx_echo_decay']:.1f}")
+            if hasattr(self, "lbl_speed_val"):
+                self.lbl_speed_val.configure(text=f"{values['fx_speed']:.1f}x")
+                self.lbl_pitch_val.configure(text=f"{values['fx_pitch']:.2f}")
+                self.lbl_delay_val.configure(text=f"{values['fx_echo_delay']}мс")
+                self.lbl_decay_val.configure(text=f"{values['fx_echo_decay']:.1f}")
+        elif target == "export":
+            self.config.update(copy.deepcopy(values))
+            self.export_fmt_var.set(values["export_format"])
+            self.export_bitrate_var.set(values["export_bitrate"])
+            self.export_sample_rate_var.set(values["export_sample_rate"])
+            self.export_channels_var.set(values["export_channels"])
+            self.export_apply_fx_var.set(values["export_apply_fx"])
+            self.exp_speed_var.set(values["export_fx_speed"])
+            self.exp_pitch_var.set(values["export_fx_pitch"])
+            self.exp_echo_var.set(values["export_fx_echo"])
+            self.exp_delay_var.set(values["export_fx_echo_delay"])
+            self.exp_decay_var.set(values["export_fx_echo_decay"])
+            self.lbl_exp_speed.configure(text=f"{values['export_fx_speed']:.1f}x")
+            self.lbl_exp_pitch.configure(text=f"{values['export_fx_pitch']:.2f}")
+            self.lbl_exp_delay.configure(text=str(values["export_fx_echo_delay"]))
+            self.lbl_exp_decay.configure(text=f"{values['export_fx_echo_decay']:.1f}")
+            self._sync_export_mode_controls()
+        else:
+            raise ValueError("неизвестная область аудиопрофиля")
+        if save:
+            self.save_settings()
+        self._refresh_audio_profile_summaries()
+
+    def _audio_profile_dialog_initial_dir(self):
+        return resolve_dialog_initial_dir(
+            self.config.get("last_audio_profile_dir"),
+            self.config.get("last_config_dir"),
+            BASE_DIR,
+        )
+
+    def _remember_audio_profile_directory(self, path):
+        candidate = Path(path).expanduser()
+        directory = candidate if candidate.is_dir() else candidate.parent
+        self.config["last_audio_profile_dir"] = str(directory)
+
+    def open_audio_profiles_dialog(self, preferred_target="export"):
+        """Открывает отдельный менеджер, не раздувая компактные панели вкладок."""
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("Аудиопрофили")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        staged_profiles = []
+        for stored_profile in self.config.get("audio_profiles", []):
+            try:
+                staged_profiles.append(normalize_audio_profile(stored_profile))
+            except (TypeError, ValueError):
+                continue
+        staged_last_dir = {
+            "value": str(self.config.get("last_audio_profile_dir", ""))
+        }
+        staged_dirty = {"value": False}
+
+        outer = ttk.Frame(dialog, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+        # Footer резервируется первым: на низком экране expand-панель редактора
+        # не может вытеснить подсказку, кнопки целей, сохранение или отмену.
+        footer = ttk.LabelFrame(outer, text="Применение", padding=7)
+        footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+        pane = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
+        pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        list_frame = ttk.LabelFrame(pane, text="Профили", padding=6)
+        editor = ttk.LabelFrame(pane, text="Параметры", padding=8)
+        pane.add(list_frame, weight=2)
+        pane.add(editor, weight=3)
+
+        profile_list = tk.Listbox(list_frame, exportselection=False)
+        profile_scroll = ttk.Scrollbar(
+            list_frame, orient=tk.VERTICAL, command=profile_list.yview
+        )
+        profile_list.configure(yscrollcommand=profile_scroll.set)
+        profile_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        profile_list.pack(fill=tk.BOTH, expand=True)
+
+        name_var = tk.StringVar(value="Новый профиль")
+        format_var = tk.StringVar(value="opus")
+        bitrate_var = tk.StringVar(value="48k")
+        rate_var = tk.StringVar(value="48000")
+        channels_var = tk.StringVar(value="mono")
+        effects_enabled_var = tk.BooleanVar(value=False)
+        speed_var = tk.StringVar(value="1.0")
+        pitch_var = tk.StringVar(value="1.0")
+        echo_var = tk.BooleanVar(value=False)
+        delay_var = tk.StringVar(value="300")
+        decay_var = tk.StringVar(value="0.3")
+
+        editor.columnconfigure(1, weight=1)
+
+        def add_combo(row, label, variable, values):
+            ttk.Label(editor, text=label).grid(
+                row=row, column=0, sticky=tk.W, padx=(0, 8), pady=2
+            )
+            widget = ttk.Combobox(
+                editor,
+                textvariable=variable,
+                values=values,
+                state="readonly",
+            )
+            widget.grid(row=row, column=1, sticky=tk.EW, pady=2)
+            return widget
+
+        ttk.Label(editor, text="Название:").grid(
+            row=0, column=0, sticky=tk.W, padx=(0, 8), pady=2
+        )
+        name_entry = ttk.Entry(editor, textvariable=name_var)
+        name_entry.grid(row=0, column=1, sticky=tk.EW, pady=2)
+        add_combo(1, "Формат:", format_var, AUDIO_PROFILE_FORMATS)
+        bitrate_combo = add_combo(
+            2, "Битрейт:", bitrate_var, AUDIO_PROFILE_BITRATES
+        )
+        add_combo(3, "Частота:", rate_var, AUDIO_PROFILE_SAMPLE_RATES)
+        add_combo(4, "Каналы:", channels_var, AUDIO_PROFILE_CHANNELS)
+        ttk.Separator(editor, orient=tk.HORIZONTAL).grid(
+            row=5, column=0, columnspan=2, sticky=tk.EW, pady=8
+        )
+        ttk.Checkbutton(
+            editor,
+            text="Включить эффекты в профиле",
+            variable=effects_enabled_var,
+        ).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=2)
+
+        def add_entry(row, label, variable):
+            ttk.Label(editor, text=label).grid(
+                row=row, column=0, sticky=tk.W, padx=(0, 8), pady=2
+            )
+            ttk.Entry(editor, textvariable=variable).grid(
+                row=row, column=1, sticky=tk.EW, pady=2
+            )
+
+        add_entry(7, "Скорость (0.5–3.0):", speed_var)
+        add_entry(8, "Тон (0.5–2.0):", pitch_var)
+        ttk.Checkbutton(editor, text="Эхо", variable=echo_var).grid(
+            row=9, column=0, columnspan=2, sticky=tk.W, pady=2
+        )
+        add_entry(10, "Задержка эхо (50–1000 мс):", delay_var)
+        add_entry(11, "Сила эхо (0.1–0.8):", decay_var)
+
+        entries = []
+        selected_custom_index = {"value": None}
+        delete_button_ref = {"widget": None}
+        manager_status_ref = {"widget": None}
+        editor_state = {
+            "loading": False,
+            "dirty": False,
+            "selection_key": None,
+        }
+        selection_guard = {"value": False}
+
+        def set_manager_status(text, status="info"):
+            widget = manager_status_ref["widget"]
+            if widget is not None:
+                self._set_status_label(widget, text, status)
+
+        def update_transaction_status():
+            if editor_state["dirty"]:
+                set_manager_status(
+                    "Есть несохранённые изменения в полях профиля.",
+                    "warning",
+                )
+            elif staged_dirty["value"]:
+                set_manager_status(
+                    "Библиотека профилей изменена и ещё не записана.",
+                    "warning",
+                )
+            else:
+                set_manager_status(
+                    "Изменений нет. Выберите цель либо отредактируйте список профилей.",
+                    "info",
+                )
+
+        def current_editor_profile():
+            return make_audio_profile(
+                name_var.get(),
+                output_format=format_var.get(),
+                bitrate=bitrate_var.get(),
+                sample_rate=rate_var.get(),
+                channels=channels_var.get(),
+                effects_enabled=effects_enabled_var.get(),
+                speed=speed_var.get(),
+                pitch=pitch_var.get(),
+                echo=echo_var.get(),
+                echo_delay=delay_var.get(),
+                echo_decay=decay_var.get(),
+            )
+
+        def load_editor(profile, custom_index=None, selection_key=None):
+            profile = normalize_audio_profile(profile)
+            audio = profile["audio"]
+            effects = audio["effects"]
+            editor_state["loading"] = True
+            try:
+                name_var.set(profile["name"])
+                format_var.set(audio["format"])
+                bitrate_var.set(audio["bitrate"])
+                rate_var.set(audio["sample_rate"])
+                channels_var.set(audio["channels"])
+                effects_enabled_var.set(effects["enabled"])
+                speed_var.set(str(effects["speed"]))
+                pitch_var.set(str(effects["pitch"]))
+                echo_var.set(effects["echo"])
+                delay_var.set(str(effects["echo_delay"]))
+                decay_var.set(str(effects["echo_decay"]))
+            finally:
+                editor_state["loading"] = False
+            editor_state["dirty"] = False
+            editor_state["selection_key"] = selection_key
+            selected_custom_index["value"] = custom_index
+            delete_button = delete_button_ref["widget"]
+            if delete_button is not None:
+                delete_button.configure(
+                    state=tk.NORMAL if custom_index is not None else tk.DISABLED
+                )
+            bitrate_combo.configure(
+                state=tk.DISABLED if audio["format"] == "wav" else "readonly"
+            )
+            update_transaction_status()
+
+        def entry_key(kind, index, profile):
+            return (
+                ("custom", index)
+                if kind == "custom"
+                else ("builtin", profile["name"])
+            )
+
+        def refresh_list(select_custom=None, select_key=None):
+            entries.clear()
+            profile_list.delete(0, tk.END)
+            for profile in builtin_audio_profiles():
+                entries.append(("builtin", None, profile))
+                profile_list.insert(tk.END, f"★ {profile['name']}")
+            for index, profile in enumerate(staged_profiles):
+                try:
+                    profile = normalize_audio_profile(profile)
+                except ValueError:
+                    continue
+                entries.append(("custom", index, profile))
+                profile_list.insert(tk.END, f"● {profile['name']}")
+            target_index = 0
+            if select_key is None and select_custom is not None:
+                select_key = ("custom", select_custom)
+            if select_key is not None:
+                for position, (kind, index, profile) in enumerate(entries):
+                    if entry_key(kind, index, profile) == select_key:
+                        target_index = position
+                        break
+            if entries:
+                selection_guard["value"] = True
+                try:
+                    profile_list.selection_clear(0, tk.END)
+                    profile_list.selection_set(target_index)
+                    profile_list.see(target_index)
+                finally:
+                    selection_guard["value"] = False
+                kind, index, profile = entries[target_index]
+                load_editor(
+                    profile,
+                    index if kind == "custom" else None,
+                    entry_key(kind, index, profile),
+                )
+
+        def restore_editor_selection():
+            selected_key = editor_state["selection_key"]
+            selection_guard["value"] = True
+            try:
+                profile_list.selection_clear(0, tk.END)
+                for position, (kind, index, profile) in enumerate(entries):
+                    if entry_key(kind, index, profile) == selected_key:
+                        profile_list.selection_set(position)
+                        profile_list.see(position)
+                        break
+            finally:
+                selection_guard["value"] = False
+
+        def on_select(_event=None):
+            if selection_guard["value"]:
+                return
+            selection = profile_list.curselection()
+            if not selection:
+                return
+            kind, index, profile = entries[selection[0]]
+            target_key = entry_key(kind, index, profile)
+            if target_key == editor_state["selection_key"]:
+                return
+            if not resolve_editor_before_navigation("переключением профиля"):
+                restore_editor_selection()
+                return
+            refresh_list(select_key=target_key)
+
+        profile_list.bind("<<ListboxSelect>>", on_select)
+
+        def load_current(target):
+            if not resolve_editor_before_navigation(
+                "загрузкой текущих параметров"
+            ):
+                return
+            try:
+                refresh_list(select_key=editor_state["selection_key"])
+                load_editor(
+                    self._audio_profile_from_current_ui(
+                        target,
+                        "Текущий экспорт" if target == "export" else "Текущая книга",
+                    ),
+                    selection_key=None,
+                )
+                selection_guard["value"] = True
+                try:
+                    profile_list.selection_clear(0, tk.END)
+                finally:
+                    selection_guard["value"] = False
+            except Exception as exc:
+                self._show_error("Ошибка профиля", str(exc), parent=dialog)
+
+        manager_status_ref["widget"] = ttk.Label(
+            list_frame,
+            text="",
+            wraplength=285,
+            justify=tk.LEFT,
+            anchor=tk.W,
+            foreground=self.get_status_color("info"),
+        )
+        manager_status_ref["widget"].pack(fill=tk.X, pady=(6, 0))
+        self._status_label_kinds[manager_status_ref["widget"]] = "info"
+
+        list_actions = ttk.Frame(list_frame)
+        list_actions.pack(fill=tk.X, pady=(6, 0))
+        def add_custom():
+            if not resolve_editor_before_navigation("созданием нового профиля"):
+                return
+            draft = make_audio_profile(
+                unique_audio_profile_name("Новый профиль", staged_profiles),
+                output_format="opus",
+                bitrate="48k",
+                sample_rate="48000",
+                channels="mono",
+            )
+            refresh_list(select_key=editor_state["selection_key"])
+            selection_guard["value"] = True
+            try:
+                profile_list.selection_clear(0, tk.END)
+            finally:
+                selection_guard["value"] = False
+            load_editor(draft, selection_key=None)
+            # Новый черновик ещё не входит даже во временный список: Отмена
+            # действительно отбрасывает его, а сохранение/применение сначала
+            # добавят профиль в staged-копию.
+            editor_state["dirty"] = True
+            name_entry.focus_set()
+            name_entry.selection_range(0, tk.END)
+            update_transaction_status()
+
+        ttk.Button(
+            list_actions,
+            text="➕ Добавить",
+            command=add_custom,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        delete_button_ref["widget"] = ttk.Button(
+            list_actions,
+            text="🗑 Удалить",
+            state=tk.DISABLED,
+        )
+        delete_button_ref["widget"].pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0)
+        )
+
+        source_actions = ttk.Frame(list_frame)
+        source_actions.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(
+            source_actions,
+            text="Из экспорта",
+            command=lambda: load_current("export"),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            source_actions,
+            text="Из книги",
+            command=lambda: load_current("book"),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+        def stage_current_editor(*, refresh=True):
+            try:
+                profile = current_editor_profile()
+            except ValueError as exc:
+                self._show_error(
+                    "Некорректный профиль", str(exc), parent=dialog
+                )
+                return None
+            index = selected_custom_index["value"]
+            if index is None:
+                profile["name"] = unique_audio_profile_name(
+                    profile["name"], staged_profiles
+                )
+            elif audio_profile_name_conflict(
+                profile["name"], staged_profiles, exclude_index=index
+            ):
+                self._show_error(
+                    "Совпадающее имя",
+                    "Такое имя уже занято встроенным или пользовательским "
+                    "профилем. Выберите другое название.",
+                    parent=dialog,
+                )
+                return None
+            if index is None or index >= len(staged_profiles):
+                staged_profiles.append(profile)
+                index = len(staged_profiles) - 1
+            else:
+                staged_profiles[index] = profile
+            staged_dirty["value"] = True
+            editor_state["dirty"] = False
+            editor_state["selection_key"] = ("custom", index)
+            selected_custom_index["value"] = index
+            if name_var.get() != profile["name"]:
+                editor_state["loading"] = True
+                try:
+                    name_var.set(profile["name"])
+                finally:
+                    editor_state["loading"] = False
+            if refresh:
+                refresh_list(select_custom=index)
+                update_transaction_status()
+            return index, profile
+
+        def save_custom():
+            stage_current_editor()
+
+        def resolve_editor_before_navigation(action):
+            """Не даёт переключению молча стереть незаписанные поля."""
+            if not editor_state["dirty"]:
+                return True
+            answer = self._run_messagebox(
+                messagebox.askyesnocancel,
+                "Несохранённые поля профиля",
+                "Поля текущего профиля изменены, но ещё не добавлены во "
+                f"временный список перед {action}.\n\n"
+                "Да — сохранить профиль; Нет — отбросить правки; "
+                "Отмена — остаться в редакторе.",
+                parent=dialog,
+                icon="warning",
+            )
+            if answer is None:
+                return False
+            if answer:
+                return stage_current_editor(refresh=False) is not None
+            editor_state["dirty"] = False
+            update_transaction_status()
+            return True
+
+        def delete_custom():
+            index = selected_custom_index["value"]
+            if index is None or index >= len(staged_profiles):
+                return
+            if not self._ask_yes_no(
+                "Удалить профиль",
+                f"Удалить пользовательский профиль «{staged_profiles[index].get('name', '')}»?",
+                icon="warning",
+                parent=dialog,
+            ):
+                return
+            del staged_profiles[index]
+            staged_dirty["value"] = True
+            refresh_list()
+            update_transaction_status()
+
+        delete_button_ref["widget"].configure(command=delete_custom)
+
+        def staged_initial_dir():
+            return resolve_dialog_initial_dir(
+                staged_last_dir["value"],
+                self.config.get("last_config_dir"),
+                BASE_DIR,
+            )
+
+        def export_profile():
+            try:
+                profile = current_editor_profile()
+            except ValueError as exc:
+                self._show_error(
+                    "Некорректный профиль", str(exc), parent=dialog
+                )
+                return
+            filepath = filedialog.asksaveasfilename(
+                parent=dialog,
+                initialdir=staged_initial_dir(),
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json")],
+                initialfile="audio_profile.json",
+            )
+            if not filepath:
+                return
+            try:
+                self._write_json_atomic(filepath, profile)
+                staged_last_dir["value"] = str(Path(filepath).expanduser().parent)
+            except Exception as exc:
+                self._show_error(
+                    "Ошибка",
+                    f"Не удалось экспортировать профиль:\n{exc}",
+                    parent=dialog,
+                )
+
+        def import_profile():
+            if not resolve_editor_before_navigation("импортом профиля"):
+                return
+            # Если открыта несохранённая копия «Из экспорта/Из книги» и
+            # пользователь отменит файловый диалог, не подменяем её первым
+            # встроенным профилем только ради перерисовки списка.
+            if editor_state["selection_key"] is not None:
+                refresh_list(select_key=editor_state["selection_key"])
+            filepath = filedialog.askopenfilename(
+                parent=dialog,
+                initialdir=staged_initial_dir(),
+                filetypes=[("JSON files", "*.json")],
+            )
+            if not filepath:
+                return
+            try:
+                with open(filepath, "r", encoding="utf-8-sig") as profile_file:
+                    profile = normalize_audio_profile(
+                        json.load(profile_file), require_envelope=True
+                    )
+                conflict = next(
+                    (
+                        index
+                        for index, existing in enumerate(staged_profiles)
+                        if str(existing.get("name", "")).casefold()
+                        == profile["name"].casefold()
+                    ),
+                    None,
+                )
+                builtin_conflict = any(
+                    item["name"].casefold() == profile["name"].casefold()
+                    for item in builtin_audio_profiles()
+                )
+                if conflict is not None and self._ask_yes_no(
+                    "Совпадающее имя",
+                    "Пользовательский профиль с таким именем уже есть. Заменить его?",
+                    icon="warning",
+                    parent=dialog,
+                ):
+                    staged_profiles[conflict] = profile
+                    index = conflict
+                else:
+                    if conflict is not None or builtin_conflict:
+                        profile["name"] = unique_audio_profile_name(
+                            profile["name"], staged_profiles
+                        )
+                    staged_profiles.append(profile)
+                    index = len(staged_profiles) - 1
+                staged_last_dir["value"] = str(Path(filepath).expanduser().parent)
+                staged_dirty["value"] = True
+                refresh_list(select_custom=index)
+                update_transaction_status()
+            except Exception as exc:
+                self._show_error(
+                    "Ошибка",
+                    f"Не удалось импортировать профиль:\n{exc}",
+                    parent=dialog,
+                )
+
+        editor_actions = ttk.Frame(editor)
+        editor_actions.grid(
+            row=12, column=0, columnspan=2, sticky=tk.EW, pady=(6, 0)
+        )
+        ttk.Button(
+            editor_actions, text="💾 Сохранить профиль", command=save_custom
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            editor_actions, text="📂 Импорт", command=import_profile
+        ).pack(side=tk.RIGHT)
+        ttk.Button(
+            editor_actions, text="📤 Экспорт", command=export_profile
+        ).pack(side=tk.RIGHT, padx=4)
+
+        def mark_editor_dirty(*_args):
+            if editor_state["loading"]:
+                return
+            editor_state["dirty"] = True
+            update_transaction_status()
+
+        for editor_variable in (
+            name_var,
+            format_var,
+            bitrate_var,
+            rate_var,
+            channels_var,
+            effects_enabled_var,
+            speed_var,
+            pitch_var,
+            echo_var,
+            delay_var,
+            decay_var,
+        ):
+            editor_variable.trace_add("write", mark_editor_dirty)
+
+        footer.columnconfigure(0, weight=1)
+        footer.columnconfigure(1, weight=0)
+        footer_hint = self._register_palette_widget(
+            ttk.Label(
+                footer,
+                text=(
+                    "Профиль — шаблон: применение заменит параметры только "
+                    "выбранной области и сохранит текущие поля со списком.\n"
+                    "«Сохранить и закрыть» записывает библиотеку; «Отмена» "
+                    "отбрасывает добавление, изменение, удаление и импорт."
+                ),
+                foreground=self.get_status_color("muted"),
+                wraplength=700,
+                justify=tk.LEFT,
+                anchor=tk.W,
+            ),
+            "muted",
+        )
+        footer_hint.grid(row=0, column=0, columnspan=2, sticky=tk.EW)
+
+        apply_buttons = ttk.Frame(footer)
+        apply_buttons.grid(
+            row=1, column=0, columnspan=2, sticky=tk.W, pady=(6, 0)
+        )
+        close_buttons = ttk.Frame(footer)
+        close_buttons.grid(
+            row=2, column=0, columnspan=2, sticky=tk.E, pady=(5, 0)
+        )
+
+        def resize_footer_hint(event):
+            try:
+                footer_hint.configure(wraplength=max(300, event.width - 18))
+            except tk.TclError:
+                pass
+
+        footer.bind("<Configure>", resize_footer_hint, add="+")
+
+        def close_dialog():
+            self._status_label_kinds.pop(manager_status_ref["widget"], None)
+            self._palette_widget_kinds.pop(footer_hint, None)
+            try:
+                if dialog.winfo_exists():
+                    dialog.destroy()
+            except tk.TclError:
+                pass
+
+        def commit_dialog(target=None):
+            profile = None
+            if target is not None:
+                if target == "book" and self.is_synthesis_running():
+                    self._show_warning(
+                        "Синтез уже выполняется",
+                        "Профиль книги можно применить после завершения или остановки синтеза.",
+                        parent=dialog,
+                    )
+                    return
+                if target == "export" and (
+                    getattr(self, "_export_running", False)
+                    or getattr(self, "_export_lock", False)
+                ):
+                    self._show_warning(
+                        "Сборка уже выполняется",
+                        "Профиль экспорта можно применить после завершения или остановки сборки.",
+                        parent=dialog,
+                    )
+                    return
+                try:
+                    profile = current_editor_profile()
+                    audio = normalize_audio_profile(profile)["audio"]
+                    if target == "book":
+                        _select_book_audio_profile(
+                            audio["format"],
+                            sample_rate=audio["sample_rate"],
+                            channels=audio["channels"],
+                            bitrate=audio["bitrate"],
+                        )
+                    else:
+                        # Без входных файлов проверяем именно явные требования.
+                        # Для auto-каналов берём stereo, чтобы не отвергать
+                        # допустимый профиль OGG до анализа реальных источников.
+                        _select_merge_audio_profile(
+                            (),
+                            audio["format"],
+                            sample_rate=audio["sample_rate"],
+                            channels=(
+                                "stereo"
+                                if audio["channels"] == "auto"
+                                else audio["channels"]
+                            ),
+                            bitrate=audio["bitrate"],
+                        )
+                except Exception as exc:
+                    self._show_error(
+                        "Профиль несовместим", str(exc), parent=dialog
+                    )
+                    return
+
+            # Сохранение и кнопки применения принимают текущие поля редактора.
+            # Поэтому профиль не может примениться в одной версии, а
+            # сохраниться в библиотеке в другой.
+            staged_editor_index = None
+            if editor_state["dirty"]:
+                staged_result = stage_current_editor(refresh=False)
+                if staged_result is None:
+                    return
+                staged_editor_index, staged_profile = staged_result
+                if target is not None:
+                    profile = staged_profile
+                update_transaction_status()
+
+            candidate_config = copy.deepcopy(self.config)
+            candidate_config["audio_profiles"] = copy.deepcopy(staged_profiles)
+            if staged_last_dir["value"]:
+                candidate_config["last_audio_profile_dir"] = staged_last_dir["value"]
+            if profile is not None:
+                candidate_config.update(
+                    audio_profile_config_values(profile, target)
+                )
+            try:
+                # Пишем подготовленный снимок без update_config_from_ui():
+                # менеджер не должен попутно сохранять недописанные поля из
+                # других вкладок Настроек.
+                self._persist_settings_snapshot(candidate_config)
+            except Exception as exc:
+                self._show_error(
+                    "Ошибка сохранения",
+                    f"Изменения не применены:\n{exc}",
+                    parent=dialog,
+                )
+                if staged_editor_index is not None:
+                    refresh_list(select_custom=staged_editor_index)
+                    update_transaction_status()
+                return
+
+            self.config = candidate_config
+            ui_error = None
+            if profile is not None:
+                previous_update_state = getattr(self, "_is_updating_ui", False)
+                self._is_updating_ui = True
+                try:
+                    self._apply_audio_profile_to_ui(profile, target, save=False)
+                except Exception as exc:
+                    ui_error = exc
+                    logging.exception(
+                        "Настройки аудиопрофиля записаны, но UI не обновлён"
+                    )
+                finally:
+                    self._is_updating_ui = previous_update_state
+            else:
+                self._refresh_audio_profile_summaries()
+
+            close_dialog()
+            if ui_error is not None:
+                self._show_warning(
+                    "Профиль сохранён",
+                    "settings.json обновлён, но интерфейс не удалось полностью "
+                    f"перерисовать: {ui_error}\nПерезапустите приложение.",
+                )
+                return
+            if profile is not None:
+                target_name = (
+                    "вкладке «Экспорт и сборка»"
+                    if target == "export"
+                    else "сборке книги и прямому синтезу"
+                )
+                self._show_info(
+                    "Профиль применён",
+                    f"Параметры профиля «{profile['name']}» скопированы к "
+                    f"{target_name}. Профиль не остаётся связанным с полями.",
+                )
+
+        ttk.Button(
+            apply_buttons,
+            text="К сборке книги",
+            command=lambda: commit_dialog("book"),
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            apply_buttons,
+            text="К экспорту",
+            command=lambda: commit_dialog("export"),
+        ).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(
+            close_buttons,
+            text="Отмена",
+            command=close_dialog,
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(
+            close_buttons,
+            text="Сохранить и закрыть",
+            command=commit_dialog,
+        ).pack(side=tk.LEFT)
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        dialog.bind("<Escape>", lambda _event: close_dialog())
+
+        format_var.trace_add(
+            "write",
+            lambda *_args: bitrate_combo.configure(
+                state=tk.DISABLED if format_var.get() == "wav" else "readonly"
+            ),
+        )
+        refresh_list()
+        if preferred_target in {"book", "export"}:
+            load_current(preferred_target)
+        update_transaction_status()
+        self._center_popup(dialog, 780, 560, fit_screen=True)
 
 # --- Вкладка "Кэш" ---
     def setup_cache_tab(self):
@@ -10266,7 +15669,9 @@ class TTSApp:
                 for f in txt_files:
                     try:
                         with open(f, 'r', encoding='utf-8-sig') as file: raw_text = file.read()
-                        file_hashes = processor.get_all_possible_hashes(raw_text)
+                        file_hashes = processor.get_all_possible_hashes(
+                            raw_text, include_prepared=True
+                        )
                         required_hashes.update(file_hashes)
                     except Exception as e:
                         logging.error(f"Ошибка при сканировании {f.name}: {e}")
@@ -10546,9 +15951,9 @@ class TTSApp:
         scrollbar.config(command=self.help_text_widget.yview)
         # ------------------------------
         
-        help_text = r"""Добро пожаловать в Silero TTS Studio v1.4.1!
+        help_text = r"""Добро пожаловать в Silero TTS Studio v{APP_PUBLIC_VERSION}!
 
-Это профессиональная рабочая среда для генерации аудиокниг, подкастов и озвучки текста с помощью нейросети Silero. Программа разработана с акцентом на бережное отношение к API-лимитам, молниеносное O(1) RAM-кэширование, гибридную постобработку звука и автоматизацию сборки.
+Это профессиональная рабочая среда для генерации аудиокниг, подкастов и озвучки текста с помощью нейросети Silero. Программа разработана с акцентом на бережное отношение к API-лимитам, быстрый RAM-индекс кэша, гибридную постобработку звука и автоматизацию сборки.
 
 ====================================================================
 🚀 1. БЫСТРЫЙ СТАРТ
@@ -10560,6 +15965,20 @@ class TTSApp:
 3. Перейдите во вкладку "Синтез из папки" и нажмите "▶ Старт (Все)".
 4. Готовые аудиофайлы появятся в папке output_audio.
 5. В процессе работы список файлов автоматически прокручивается. Вы всегда можете вернуться к активному файлу кнопкой "📍 К текущему файлу".
+
+====================================================================
+🧰 РАБОТА БЕЗ API-КЛЮЧА
+====================================================================
+API Token нужен только для создания новых речевых фрагментов. Без ключа доступны
+локальные операции: импорт и извлечение EPUB/FB2/DOCX, RegEx-нарезка TXT по
+главам с шаблонами {author} и {num:N}, проверка нормализации в песочнице,
+редактирование глоссария, сохранение подготовленного TXT, а также группировка,
+разгруппировка, склейка, конвертация, эффекты и теги уже существующих MP3/WAV/
+OGG/Opus. Заполненный кэш можно просматривать и обслуживать без новых API-
+запросов. Обычный запуск синтеза из папки сейчас всё равно проверяет наличие
+токена перед стартом, даже если предполагается полный cache-hit; это не приводит
+к запросам, но для полностью офлайн-сценария используйте локальные инструменты
+или сохранённый подготовленный текст.
 
 ====================================================================
 🎙 2. РЕЖИМЫ СИНТЕЗА (SYNTHESIS MODES)
@@ -10597,6 +16016,7 @@ class TTSApp:
   - [x] Игнорировать кэш: Принудительно генерирует речь заново через API.
   - [x] Авто-воспроизведение: Мгновенно проигрывает результат через системный плеер.
   - [ ] Применить теги из настроек: По умолчанию выключено, поэтому тестовый direct_output не получает книжные теги и обложку.
+  - [ ] Текст уже подготовлен: Для заранее нормализованного TXT или текста из внешнего редактора. Флажок не сохраняется, перед запуском требует подтверждения и автоматически снимается после завершения.
 • Умный плеер: Кнопка "🔊 Слушать" мгновенно прерывает старый трек при повторном нажатии (никакой звуковой каши). Кнопка "🔇" принудительно останавливает любой звук.
 • Эффекты: Индивидуальные ползунки скорости, тона и эхо. Нажатие кнопки "💾 Сделать глобальными" мгновенно применяет эти эффекты ко всем настройкам программы.
 
@@ -10625,14 +16045,14 @@ class TTSApp:
 
 0. UTF-8 BOM: Служебный BOM в самом начале TXT бесшумно удаляется до RegEx и вычисления ключа кэша, поэтому шаблоны с ^ работают одинаково для UTF-8 с BOM и без него. Внутренние U+FEFF не удаляются как обычный текст.
 1. Математика и плюсы: Математические плюсы (1 + 1) и одиночные плюсы заменяются на слово "плюс". Плюсы внутри и в начале слов (з+амок, +аура) маскируются для защиты ручных ударений.
-2. RegEx-правила: Применяются шаблоны замены из Глоссария (ДО разбивки на предложения).
+2. Обычные RegEx-правила: Применяются шаблоны замены из Глоссария ДО разбивки на предложения. Verbatim-RegEx выполняются позднее внутри одного предложения.
 3. Сегментация: Текст разбивается на предложения с помощью библиотеки Razdel.
-4. Глоссарий терминов и ударений: Заменяются слова и расставляются плюсы ударений.
-5. Авто-аббревиатуры: Превращает "И.И.", "к.п.д." в "И-И", "к-п-д", чтобы нейросеть произносила их по буквам.
-6. Авто-сокращения: Убирает точки у слов из 1-3 букв ("г.", "ул.", "ур."), чтобы диктор не делал фальшивую паузу посреди фразы.
-7. Нормализация (ru-normalizr): Преобразует числа, даты и числительные в пропись ("10" -> "десять").
-8. Защита пунктуации: Если после обработки у предложения пропала финальная точка, программа насильно возвращает её, гарантируя правильную интонацию.
-9. Очистка: Удаляются только уже предусмотренные лишние кавычки, скобки и спецсимволы, после чего чистая фраза уходит в API. Дополнительная агрессивная очистка всей начальной пунктуации не выполняется: это сохраняет знаки чисел, формулы и ручные ударения.
+4. Авто-аббревиатуры: Превращает "И.И.", "к.п.д." в "И-И", "к-п-д", чтобы нейросеть произносила их по буквам.
+5. Авто-сокращения: Убирает точки у слов из 1-3 букв ("г.", "ул.", "ур."), чтобы диктор не делал фальшивую паузу посреди фразы.
+6. Глоссарий терминов и ударений: Заменяются слова, применяются verbatim-RegEx и расставляются плюсы ударений.
+7. Нормализация (ru-normalizr): Преобразует числа, даты и числительные в пропись ("10" -> "десять"). Точные verbatim-замены восстанавливаются после normalizer и очистки.
+8. Очистка: Удаляются только уже предусмотренные лишние кавычки, скобки и спецсимволы. Дополнительная агрессивная очистка всей начальной пунктуации не выполняется: это сохраняет знаки чисел, формулы и ручные ударения.
+9. Защита пунктуации: Если после обработки у предложения пропала финальная точка, программа возвращает её, гарантируя правильную интонацию, после чего фраза уходит в API.
    После нормализации самостоятельный чанк, в котором нет ни русских, ни
    ASCII-букв, пропускается: EnhancedTTS считает состоящий только из
    неподдерживаемых символов фрагмент пустым и возвращает HTTP 422
@@ -10640,6 +16060,35 @@ class TTSApp:
    Unicode внутри поддерживаемой фразы не очищается, поэтому её payload и ключ
    кэша не меняются. Ожидаемый пропуск пишется в журнал на уровне INFO, а
    предупреждения API содержат короткие source и normalized для диагностики.
+
+====================================================================
+🧪 5.1. ПЕСОЧНИЦА И ПРОФИЛИ НОРМАЛИЗАТОРА
+====================================================================
+Вкладка "Нормализатор" запускает тот же текстовый pipeline без API-запроса:
+
+• Слева вводится редактируемый пример, ниже показывается реальный результат.
+• Справа доступны профили TTS/Safe и публичные стадии ru-normalizr 0.3.x.
+• Текстовая часть изначально компактнее панели параметров; границу можно
+  перетянуть вручную. Размер шрифта исходника и результата выбирается рядом с
+  кнопками preview и сохраняется как общая настройка текстовых вкладок.
+• ru-normalizr, Глоссарий и preprocessing Studio можно временно отключать,
+  чтобы найти ошибочное правило. Эти изменения локальны до кнопки
+  "Применить глобально"; "Вернуть глобальные" отменяет эксперимент.
+• Строка под кнопками всегда показывает сохранённый глобальный профиль и
+  отдельно отмечает неприменённые локальные изменения. Тот же глобальный
+  снимок расшифрован в "Настройки" -> "Нормализация"; оттуда можно открыть
+  песочницу, не дублируя все расширенные поля.
+• Профиль переносится отдельным JSON без API Token, папок проекта и локального
+  абсолютного пути к каталогу словарей. Импорт сохраняет локальный путь
+  получателя; полный снимок публичных опций строго проверяется без тихой
+  подмены опечаток значениями TTS/Safe.
+• Ctrl/⌘+Enter запускает проверку сразу; обычное редактирование обновляет
+  результат с небольшой задержкой и не позволяет старому фоновому результату
+  перезаписать более новый.
+• "Сохранить TXT…" закреплена в постоянно видимой нижней панели. До успешного непустого preview кнопка видна, но отключена; изменение текста, профиля или JSON глоссария инвалидирует старый результат. TXT записывается в UTF-8 без BOM. Видимая строка [ПАУЗА РАЗДЕЛИТЕЛЯ] заменяется первым активным разделителем. Если для абзаца нужна пауза перед репликой, в файле сохраняется структурный префикс "— "; перед API он снимается. При наличии пропущенных неподдерживаемых фрагментов перед сохранением показывается предупреждение: в TXT этих фрагментов не будет.
+• Перед обычным пакетным или прямым синтезом несохранённый глоссарий предлагается записать, чтобы preview и TTSProcessor использовали одни правила. Редактор привязан к glossary.json текущего cache_dir: после смены кэша старый JSON нельзя записать поверх нового, а устаревший preview нельзя сохранить. "Текст уже подготовлен" обходит эту проверку вместе с глоссарием.
+• Для повторного запуска включите флажок "Текст уже подготовлен" в "Синтезе из папки" или "Прямом синтезе". Он не пишется в settings.json, автоматически снимается после завершения и для подтверждённого запуска обходит RegEx, глоссарий, автообработку Studio, ru-normalizr и финальную очистку. Разбиение на чанки, SAFE_LIMIT и расстановка пауз продолжают работать.
+• TXT хранит текст и структурные маркеры, но не профиль нормализатора, synthesis_mode или числовые паузы. Для эквивалентных пауз используйте тот же режим синтеза и те же настройки пауз.
 
 ====================================================================
 📖 6. ИМПОРТ И НАРЕЗКА КНИГ (EPUB, FB2, DOCX, TXT)
@@ -10664,8 +16113,38 @@ class TTSApp:
 • Замена терминов: Позволяет заменить сокращение на полное слово (например: "ОС" -> "операционная система").
 • Режимы регистра: "Чувствительно к регистру" (Strict Case) заменяет только точные совпадения. Без галочки (Ignore Case) программа умна: если исходник "Ос", замена станет "Операционная система".
 • RegEx (Паттерны): Мощные регулярные выражения. Например, замена всех римских цифр или очистка сносок [1], (прим. ред.).
+• Verbatim: Галочка "Не нормализовать замену" вставляет результат после
+  ru-normalizr и очистки, поэтому убого -> уб+о'го сохраняет плюс и апостроф
+  точно. По умолчанию термин совпадает как целое слово; поиск внутри слова
+  включается отдельной галочкой. Флаг доступен и RegEx, но такой RegEx работает
+  внутри одного уже выделенного предложения, а не через несколько строк.
+  Несколько последовательных совпадений в одном защищённом слове заменяются все.
+• Контекст: Пока исходный термин сам переживает normalizer, он остаётся видим
+  библиотеке (Глава IV -> Гл+ава четвёртая). Если normalizer изменил сам
+  исходник, используется резервная непрозрачная защита и в лог пишется WARNING:
+  рядом с таким правилом грамматическое согласование может отличаться.
 • Управление шрифтом: В правом верхнем углу расположен выпадающий список размера шрифта (10–24) для комфортного чтения редактора.
-• Выборочный импорт/экспорт: При сохранении или загрузке Настроек и Глоссария появляются удобные окна с галочками — вы сами решаете, какие именно группы параметров (папки, эффекты, API) перенести в другой проект.
+• Объединение глоссариев: Импорт добавляет выбранные ударения, термины и RegEx.
+  При конфликте личное правило сохраняется по умолчанию; замену импортируемым
+  нужно выбрать явно. После merge показывается статистика, порядок не теряется.
+• Удаление правил: Кнопка "Удалить правила…" открывает менеджер с поиском и
+  вкладками ударений, терминов и RegEx. "Выбрать результаты поиска" отмечает
+  только показанные фильтром строки текущего раздела, а "Выбрать все в разделе" —
+  включая скрытые поиском. "Снять всё в разделе" снимает выбор и со
+  скрытых строк текущего раздела; "Очистить весь глоссарий…" очищает известные
+  секции правил. Правки сначала попадают в JSON-редактор
+  и записываются только кнопкой "Сохранить файл"; служебные поля будущих версий
+  не стираются.
+• Перекрывающиеся правила: Если одному слову соответствуют ударение и термин
+  в том же режиме регистра, совместимый приоритет остаётся у термина. Оба
+  правила хранятся, а неактивное ударение отмечается в менеджере и журнале.
+• Выборочный импорт/экспорт: При сохранении или загрузке Настроек и Глоссария появляются удобные окна с галочками — вы сами решаете, какие именно группы параметров (папки, нормализатор, эффекты, API) перенести в другой проект.
+• Смена папки кэша: Чистый редактор автоматически загружает glossary.json из
+  новой папки. Несохранённые изменения требуют явного решения; ошибка доступа
+  показывается штатно и не очищает текущий текст редактора.
+• Безопасная перезагрузка: Ручное перечитывание файла требует подтверждения,
+  если JSON менялся. Повреждённый primary не скрывает исправный .bak; если обе
+  копии невалидны, текущий текст редактора остаётся без изменений.
 
 ====================================================================
 🎛 8. АУДИОЭФФЕКТЫ И ПОСТОБРАБОТКА (FFMPEG)
@@ -10679,6 +16158,39 @@ class TTSApp:
 
 Эффекты можно настраивать во вкладках "Прямой синтез", "Кэш", "Экспорт и Сборка", а также глобально в "Настройках".
 
+• Аудиопрофили: Кнопка во вкладке экспорта и в "Настройки" -> "Вывод и
+  Теги" открывает отдельный менеджер формата, битрейта, частоты, каналов и
+  эффектов. Встроенные профили можно использовать как основу; пользовательские
+  сохраняются по имени и импортируются/экспортируются отдельным JSON.
+• Безопасное редактирование: "Добавить", "Сохранить профиль", "Удалить" и
+  импорт сначала меняют временную копию списка. "Сохранить и закрыть" записывает
+  её, а "Отмена", Escape или закрытие окна отбрасывают изменения. Текущие поля
+  автоматически сохраняются в ту же временную копию при commit или применении;
+  перед сменой профиля можно сохранить их, отбросить либо остаться в редакторе.
+  Кнопки применения и закрытия находятся в отдельных рядах и не вытесняют друг
+  друга. "К сборке книги" и "К экспорту" применяют сохранённую версию и
+  закрывают окно.
+  Уже записанный внешний JSON-файл кнопкой "Отмена" не удаляется.
+• Профиль — копируемый шаблон, а не скрытый постоянно активный слой. Применение
+  заменяет текущие параметры выбранной области; последующая ручная правка не
+  меняет сохранённый профиль. Интерфейс показывает имя лишь при точном
+  совпадении и всегда расшифровывает текущие формат, битрейт, частоту, каналы и
+  эффекты.
+• Раздельное применение: "К сборке книги" меняет также Прямой синтез, потому
+  что они используют общий финальный вывод, и заменяет значения в
+  "Настройки" -> "Эффекты (Постобработка)". "К экспорту" меняет только
+  универсальный сборщик и его локальные эффекты. Последняя явная ручная правка
+  побеждает; форматы этих двух областей больше не связаны.
+• Auto книги: Для частоты и каналов это канонические 48 кГц mono внутреннего
+  кэша. Auto-битрейт означает 128 кбит/с для MP3, 48 кбит/с для Opus,
+  quality/VBR кодировщика для OGG/Vorbis и не применяется к WAV.
+• Флажок эффектов: Если "Включить эффекты в профиле" выключено, книга и Прямой
+  синтез получают чистые speed/pitch 1.0 без эха, а у универсального экспорта
+  отключается флажок "Наложить эффекты".
+• Локальные ползунки Прямого синтеза применяются к его текущему запуску. Они
+  заменяют глобальные значения только после отдельной кнопки "Сделать
+  глобальными".
+
 ====================================================================
 🎵 9. ЭКСПОРТ И СБОРКА (АУДИОКНИГИ, ТЕГИ, ОБЛОЖКИ)
 ====================================================================
@@ -10689,16 +16201,33 @@ class TTSApp:
 • Авто-заполнение папки: При добавлении файлов программа сама подставляет папку их расположения в поле экспорта. Единая память путей сохраняется между выбором файлов и папок.
 • Натуральная сортировка: Клик по заголовку "Имя ↕" сортирует файлы по-человечески (Глава 2 встает перед Глава 10).
 • Фоновый импорт метаданных: Чтение тегов и извлечение встроенных обложек через ffprobe происходит в фоновом потоке пачками по 10 файлов — интерфейс остается живым.
-• Перепаковка и Разгруппировка: Выделите файлы и используйте кнопки "📦 В новую группу" или "📤 Разгруппировать" (кнопка перенесена на верхнюю панель для удобства).
+• Перегруппировка: Кнопка "🔗 Объединить" собирает выбранные группы и/или файлы в одну группу: первая группа по порядку дерева сохраняет имя, теги и параметры, итоговая группа занимает место первого выбранного источника, а дорожки получают текущий визуальный порядок дерева. Остальные выбранные группы удаляются только из списка проекта. Если выбраны только файлы, создаётся новая группа. Не выбранная целиком группа сохраняется даже после переноса всех отмеченных файлов, чтобы её настройки не исчезли молча. "📤 Разгруппировать" переносит файлы выбранных групп в родительский уровень.
+• Очистка проекта: Кнопка "🧹 Очистить всё" после подтверждения удаляет только элементы текущего списка (группы и ссылки на файлы), не удаляя исходные аудиофайлы с диска.
 • Массовое применение настроек: Кнопка "⚙️ Применить ко всем группам..." открывает диалог, позволяющий в 1 клик применить параметры склейки, подпапок, пауз ко всем томам и сохранить их по умолчанию.
+• Компактные настройки группы: Основные параметры размещены нативной ttk-сеткой
+  без отдельного Canvas и внутренней полосы прокрутки, поэтому на светлой теме
+  не появляется пустая белая область или боковая линия. Флажки склейки и подпапки стоят рядом,
+  а массовое применение остаётся на своей отдельной строке.
+• Адаптивный статус: Подпись сборки использует короткие стадии "Склейка",
+  "Экспорт" и "Теги". Не помещающееся при текущих ширине окна и шрифте имя
+  получает многоточие в середине с сохранением начала и окончания. Сокращается
+  только временная подпись: полное имя сохраняется в дереве без изменения,
+  а индикатор прогресса занимает остаток строки.
+• Параметры аудиопрофиля: Краткая расшифровка, включая состояние
+  "Пользовательские параметры", находится в собственной строке под эффектами и
+  не отнимает место у флажка тегов и кнопок запуска.
 • Склеивание в один трек: Склеивает все файлы группы в один большой аудиофайл с настройкой паузы между ними (в мс).
 • Потоковая склейка длинных групп: MP3/WAV/OGG/Opus декодируются и объединяются самим FFmpeg без общего PCM-буфера Pydub и промежуточного RIFF. Поэтому книга не упирается в 4-ГиБ заголовок WAV; для очень большого результата WAV FFmpeg автоматически использует RF64.
 • Профиль результата: Поля «Битрейт», «Частота» и «Каналы» относятся только к этой вкладке, сохраняются в настройках и одинаково применяются к одиночному файлу, несклеенной группе и общей дорожке. Режим «Авто» (в настройках — auto) предсказуемо сохраняет исходные параметры одиночного файла или однородной группы, включая известный общий битрейт: MP3 128 кбит/с при выводе в Opus останется 128 кбит/с, поэтому результат не обязан быть меньше простой MP3-склейки. Для сжатия речевой книги явно выберите Opus 48 кбит/с или 32 кбит/с (меньше размер, но выше потеря качества). Для смешанной группы «Авто» выбирает максимальную частоту и stereo при наличии многоканального входа, а при неизвестном профиле использует безопасные 48 кГц stereo. Явные частота и каналы поддерживаются MP3, OGG, Opus и WAV в пределах возможностей кодека. Битрейт применяется только к MP3/OGG/Opus; для WAV PCM он отключён и не применяется. OGG остаётся совместимым Ogg/Vorbis (.ogg), а отдельный Ogg/Opus (.opus) создаёт тот же Ogg-контейнер с рекомендованным для Opus расширением. При необходимости файл .opus можно вручную переименовать в .ogg без перекодирования, но приложение не предлагает этот менее совместимый вариант. В «Авто» MP3 получает ближайшую поддерживаемую libmp3lame частоту (не выше 48 кГц); явная неподдерживаемая частота не подменяется. OGG/Vorbis сохраняет 88,2/96 кГц только при битрейте «Авто» в quality/VBR-режиме; Opus поддерживает 8/12/16/24/48 кГц. Несовместимые явные сочетания низкой частоты, mono и высокого битрейта блокируются с объяснением; в «Авто» сохраняются частота и каналы, но несовместимый битрейт не наследуется. Пауза вставляется до общего эффекта скорости и изменяется вместе со всей дорожкой только один раз.
+• Независимый формат: Выбор формата этой вкладки не меняет формат будущей
+  синтезируемой книги. Старый settings.json и выборочный импорт старого профиля
+  копируют прежнее общее значение в обе области, после чего они сохраняются
+  раздельно.
 • Наследование тегов при склейке: Если поля ID3 группы не заполнены, исполнитель, альбом, исполнитель альбома, жанр, композитор, год и обложка берутся из первого файла группы. Явно заданные значения группы имеют приоритет, а имя итогового файла и тег Title формируются из имени группы.
-• Авто-разбивка по времени: Работает как с уже созданными группами, так и только с файлами в корне. Нумерация адаптируется к последнему отображаемому номеру.
-• Безопасность сборки: Пока экспорт активен, дерево, перегруппировка и настройки блокируются. Перед стартом проверяются исчезнувшие исходники и совпадающие выходные имена.
-• [x] Только обновить теги (In-place tagging): Метаданные меняются без перекодирования аудио. Новая JPEG/PNG-обложка встраивается для MP3 как ID3v2.3/APIC, для Opus — как METADATA_BLOCK_PICTURE; для OGG-Vorbis и WAV она пропускается с записью в журнал вместо ошибки FFmpeg.
-• Редактор тегов и Обложек: Название, исполнитель, альбом, исполнитель альбома, жанр, композитор и год сохраняются в MP3, OGG и Opus. Обложка Opus записывается штатным комментарием без отдельного opusenc. «Сохранять в подпапку» доступно только если группа не склеивается.
+• Авто-разбивка по времени: Работает как с уже созданными группами, так и только с файлами в корне. Нумерация адаптируется к последнему отображаемому номеру. При ручном добавлении новой группы `01` и `1` считаются одним номером, а уже видимая разрядность сохраняется.
+• Безопасность сборки: Пока экспорт активен, дерево, перегруппировка и настройки блокируются, включая macOS-обходы выделения. После разблокировки выбранная группа или файл полностью перечитываются в редактор. Перед стартом проверяются исчезнувшие исходники и совпадающие выходные имена.
+• [x] Только обновить теги (In-place tagging): Метаданные меняются без перекодирования аудио; формат, битрейт, частота, каналы и все элементы эффектов на это время блокируются. Новая JPEG/PNG-обложка встраивается для MP3 как ID3v2.3/APIC, для Opus — как METADATA_BLOCK_PICTURE; для OGG-Vorbis и WAV она пропускается с записью в журнал вместо ошибки FFmpeg.
+• Редактор тегов и Обложек: Название, исполнитель, альбом, исполнитель альбома, жанр, композитор и год сохраняются в MP3, OGG и Opus. Обложка Opus записывается штатным комментарием без отдельного opusenc; её отображение зависит от поддержки METADATA_BLOCK_PICTURE конкретным проигрывателем (часть проигрывателей Windows её не показывает). «Сохранять в подпапку» доступно только если группа не склеивается.
 • Умная сетка применения тегов (2х2):
   - [⬇ К файлам группы]: Копирует теги текущей группы на все входящие в нее файлы.
   - [⬆ В род. группу]: Копирует теги с выделенного файла на его родительскую группу.
@@ -10708,7 +16237,10 @@ class TTSApp:
 ====================================================================
 💾 10. УПРАВЛЕНИЕ КЭШЕМ И БЕЗОПАСНОСТЬ
 ====================================================================
-• O(1) RAM-Архитектура: Чтение из кэша происходит исключительно в оперативной памяти без блокировки жесткого диска. Сборка готовой книги на сотни часов занимает считанные минуты, полностью загружая процессор для параллельного рендера!
+• RAM-индекс кэша: Индекс доступных фрагментов загружается в оперативную память,
+  поэтому совпавшие фразы находятся быстро и не требуют повторного API-запроса.
+  Финальная сборка может выполняться параллельно; её скорость зависит от CPU,
+  диска, числа процессов FFmpeg и выбранного профиля вывода.
 • Steps и ключ кэша: Сам Steps по умолчанию выключен и не отправляется. Если его включить, флажок учёта Steps в ключе кэша по умолчанию активен, поэтому один текст/голос с разными Steps хранится отдельно. Если снять этот флажок, используется общий старый ключ: legacy-записи доступны, но при известном несовпадении Steps общий файл заменяется последним вариантом и смена значения может потребовать нового запроса.
 • Компактный Ogg/Opus-кэш: Новые ответы API и локальные паузы сохраняются как Ogg/Opus 48 кГц mono (целевой битрейт 48 кбит/с). Если автообрезка выключена и API уже вернул совместимый Opus, байты публикуются без повторного lossy-кодирования.
 • Обрезка без Vorbis: При включённой автообрезке цепочка имеет вид Opus → PCM в памяти → Opus. Промежуточные WAV и Vorbis в кэше не создаются; PCM — несжатое рабочее представление Pydub для точной обрезки тишины.
@@ -10729,9 +16261,19 @@ class TTSApp:
 🔐 10.1. ИМПОРТ И ЭКСПОРТ КОНФИГУРАЦИИ
 ====================================================================
 • Настройки переносятся независимыми группами. Если снять «Пути к папкам», чужие input/output/cache/export/import/direct пути не применяются.
+• Группа «Нормализатор и применение глоссария» переносит глобальный профиль
+  текста без API Token и папок. Отдельный JSON вкладки «Нормализатор» удобнее
+  для обмена только этим профилем.
+• Пользовательские аудиопрофили входят в группу «Вывод, аудиопрофили и Теги»;
+  импорт всей группы заменяет список профилей, а отдельный JSON менеджера
+  добавляет ровно один профиль с проверкой совпадающего имени.
 • Значения вкладок прямого синтеза и импорта книг находятся в отдельной группе «Параметры вкладок».
 • История файловых диалогов и размер шрифта остаются локальными и не попадают в переносимый профиль.
 • API Token считается секретом и импортируется/экспортируется только по отдельной выключенной по умолчанию галочке.
+• Импорт, сброс, глобальный профиль нормализатора и аудиопрофили сначала
+  атомарно записываются и только затем меняют интерфейс. Ошибка диска не
+  выдаётся за успех. При восстановлении из settings.json.bak основной файл
+  лечится, а повреждённый primary не затирает исправную резервную копию.
 
 ====================================================================
 ⚡ 11. ЛИМИТЫ, КНОПКИ ОСТАНОВКИ И БЕЗОПАСНОСТЬ
@@ -10750,10 +16292,16 @@ class TTSApp:
   - 16: Базовый ориентир EnhancedTTS по качеству; медленнее 8.
   - «Другое»: Целое от 1 до 72. Выше 16 приложение предупреждает о сомнительном приросте, при 32+ — о возможной нестабильности; больше 72 не отправляется, чтобы не получать HTTP 422.
   Сравнивайте пресеты на одном и том же коротком фрагменте и голосе.
-• Сетевые лимиты API: Настройка частоты запросов защищает ваш токен от блокировки. Лимитер является Глобальным — он синхронизирует запросы между вкладкой папок и Прямым синтезом, гарантируя отсутствие банов.
+• Сетевые лимиты API: Настройка частоты запросов ограничивает нагрузку на API.
+  Один лимитер синхронизирует пакетный и Прямой синтез внутри текущего экземпляра
+  Studio. Отдельные запущенные экземпляры не координируются между собой, поэтому
+  их суммарная нагрузка и соответствие тарифному ограничению остаются
+  ответственностью пользователя.
 • Параллельных сборок FFmpeg (Аппаратный лимит CPU):
-  - Значение [ 0 ]: Режим максимальной скорости (без ограничений). Задействует 100% ресурсов процессора для мгновенной сборки из кэша.
-  - Значение [ 1 ]: "Тихий / Фоновый режим" — [РЕКОМЕНДУЕТСЯ ДЛЯ НОУТБУКОВ]. Файлы собираются строго по очереди один за другим. Процессор и кулеры остаются абсолютно тихими и холодными, а система не лагает.
+  - Значение [ 0 ]: Режим максимальной скорости без заданного программного
+    ограничения; фактическая загрузка зависит от числа и размера файлов.
+  - Значение [ 1 ]: Последовательная фоновая обработка — обычно удобнее на
+    ноутбуках, когда важно снизить конкуренцию за CPU и диск.
   - Значения [ 2...N ]: Ручной лимит параллельных потоков кодирования.
 
 • Кнопка "⏹ Стоп": Мягкая остановка. Дожидается завершения текущего запроса, сохраняет кэш и останавливает очередь.
@@ -10765,9 +16313,16 @@ class TTSApp:
 • macOS (.app): Из-за системных ограничений Apple (Gatekeeper) скомпилированное приложение автоматически работает через папку Документы (`~/Documents/SileroTTS_Studio/`).
   Проверенная и рекомендуемая связка для исходника — Python 3.13.x + Tcl/Tk 9.0.x (локально проверены Python 3.13.15 и Tk 9.0.4). Это не жёсткое требование для синтеза: Python 3.12/Tk 8.6 поддерживается, но после смены системной светлой/тёмной темы может потребоваться перезапуск. Официальная macOS `.app` собирается на актуальном Homebrew Python 3.13.x и проверяется с Tk 9; Windows/Linux поддерживают штатный Tk 8.6.
   Дочерние FFmpeg/FFprobe и системные утилиты запускаются через безопасный для Tk/CoreFoundation механизм `posix_spawn`, без предупреждений `The process has forked ... You MUST exec()`.
-  После восстановления свёрнутого окна события Map/Activate повторно применяют системное оформление, переустанавливают текущую ttk-тему и инвалидируют системные виджеты; прогрессбары и ползунки не должны оставаться серыми до переключения на другое приложение.
+  Старт, восстановление и повторная активация окна переустанавливают текущую
+  ttk-тему и инвалидируют системные виджеты. Клик по любой области главного окна
+  подтверждает его локальный фокус; Activate/Deactivate не дают прогрессбарам и
+  ползункам оставаться серыми. Уже активное окно не перерисовывает тему при
+  каждом клике.
   Системные сообщения привязаны к главному окну и после закрытия возвращают локальный фокус прежнему полю через idle, не перехватывая фокус у другого приложения.
 • Умный буфер обмена (Кроссплатформенный):
+  - Физическая клавиша вставки и виртуальное событие Tk <<Paste>> используют
+    один обработчик с защитой от повтора: один жест вставляет текст один раз,
+    в том числе в редактор glossary.json.
   - На macOS обрабатывает ⌘C, ⌘V, ⌘X, ⌘A, ⌘Z при русской и английской раскладках и декодирует явные пути Finder (`file://`, `%20`, NFC), не изменяя обычный текст.
   - На Windows и Linux обрабатывает Ctrl+C/V/X/A/Z при русской и английской раскладках, снимает внешние кавычки у явных путей Windows 11 и декодирует `file://`-пути.
 • Защита NullWriter: Глобальный перехватчик `sys.stdout/stderr` защищает Portable-версии на Windows, macOS и Linux от экстренных вылетов из-за вызовов `print()` в сторонних библиотеках.
@@ -10776,6 +16331,9 @@ class TTSApp:
 • Умные пути (Smart Paths): Программа запоминает последние открытые папки для каждого поля индивидуально. Если поле пустое, диалог вежливо откроет папку текущего проекта. Вам больше не нужно каждый раз прокликивать путь от корня диска!
 """
 
+        help_text = help_text.replace(
+            "{APP_PUBLIC_VERSION}", APP_PUBLIC_VERSION, 1
+        )
         self.help_text_widget.insert(tk.END, help_text)
         self.help_text_widget.config(state=tk.DISABLED)
 
@@ -10867,6 +16425,64 @@ class TTSApp:
                 self.tree.yview_moveto(target_idx / total)
             except ValueError:
                 self.tree.see(self.current_processing_file)
+
+    def _validate_book_output_profile(self):
+        try:
+            _select_book_audio_profile(
+                self.config.get("output_format", "mp3"),
+                sample_rate=self.config.get("output_sample_rate", "auto"),
+                channels=self.config.get("output_channels", "auto"),
+                bitrate=self.config.get("output_bitrate", "128k"),
+            )
+            return True
+        except (TypeError, ValueError) as exc:
+            self._show_error("Некорректный аудиопрофиль", str(exc))
+            return False
+
+    def _confirm_prepared_text_run(self):
+        return self._ask_yes_no(
+            "Текст уже подготовлен",
+            "Для этого запуска Studio пропустит пользовательские RegEx, "
+            "глоссарий, автообработку, ru-normalizr и финальную очистку.\n\n"
+            "Используйте режим только для уже нормализованного текста после "
+            "внешней расстановки ударений. Строки-разделители и текущие "
+            "настройки пауз продолжат действовать. Продолжить?",
+            icon="warning",
+        )
+
+    def _prepare_glossary_for_synthesis(self, *, prepared_text=False):
+        """Гарантирует, что preview и новый TTSProcessor видят один JSON."""
+        if (
+            prepared_text
+            or not _config_bool(
+                self.config.get("glossary_enabled", True), default=True
+            )
+            or not hasattr(self, "txt_glossary")
+        ):
+            return True
+        if not self._sync_glossary_editor_cache(prompt_if_dirty=True):
+            self._show_warning(
+                "Синтез не запущен",
+                "Сначала сохраните либо перезагрузите глоссарий для текущей "
+                "папки кэша.",
+            )
+            return False
+
+        dirty = bool(getattr(self, "_glossary_dirty", False))
+        try:
+            dirty = dirty or bool(self.txt_glossary.edit_modified())
+        except tk.TclError:
+            pass
+        if not dirty:
+            return True
+        if not self._ask_yes_no(
+            "Глоссарий изменён",
+            "Предпросмотр уже использует изменения из редактора, а синтез "
+            "читает glossary.json с диска. Сохранить глоссарий перед запуском?",
+            icon="warning",
+        ):
+            return False
+        return self.save_glossary_ui(show_popup=False)
     
     def start_processing(self, only_selected=False):
         if self.batch_processor is not None:
@@ -10877,6 +16493,8 @@ class TTSApp:
         if not self._validate_api_steps_ui():
             return
         self.save_settings()
+        if not self._validate_book_output_profile():
+            return
         if not self.config.get("api_token"):
             self._show_error("Ошибка", "Введите API Token во вкладке Настройки!")
             return
@@ -10887,12 +16505,20 @@ class TTSApp:
         if not items_to_process:
             self._show_info("Пусто", "Нет файлов для обработки. Выделите файлы или обновите список.")
             return
+        prepared_text = bool(self.batch_prepared_text_var.get())
+        if prepared_text and not self._confirm_prepared_text_run():
+            return
+        if not self._prepare_glossary_for_synthesis(
+            prepared_text=prepared_text
+        ):
+            return
 
         # Блокируем/разблокируем кнопки
         self.btn_start_all.config(state=tk.DISABLED)
         self.btn_start_sel.config(state=tk.DISABLED)
         self.btn_refresh.config(state=tk.DISABLED)
         self.btn_remove_sel.config(state=tk.DISABLED)
+        self.chk_batch_prepared_text.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.btn_hard_stop.config(state=tk.NORMAL)
         
@@ -10905,6 +16531,7 @@ class TTSApp:
         self._batch_hard_stop_requested = False
         
         processing_config = self.config.copy()
+        processing_config["text_is_prepared"] = prepared_text
         skip_existing = bool(self.settings_vars["skip_existing"].get())
         try:
             processor = self._create_synthesis_processor(processing_config)
@@ -10914,6 +16541,7 @@ class TTSApp:
             self.btn_start_sel.config(state=tk.NORMAL)
             self.btn_refresh.config(state=tk.NORMAL)
             self.btn_remove_sel.config(state=tk.NORMAL)
+            self.chk_batch_prepared_text.config(state=tk.NORMAL)
             self.btn_stop.config(state=tk.DISABLED)
             self.btn_hard_stop.config(state=tk.DISABLED)
             self._set_status_label(self.lbl_current_text, "Ошибка подготовки.", "error")
@@ -10938,6 +16566,7 @@ class TTSApp:
             self.btn_start_sel.config(state=tk.NORMAL)
             self.btn_refresh.config(state=tk.NORMAL)
             self.btn_remove_sel.config(state=tk.NORMAL)
+            self.chk_batch_prepared_text.config(state=tk.NORMAL)
             self.btn_stop.config(state=tk.DISABLED)
             self.btn_hard_stop.config(state=tk.DISABLED)
             self._set_status_label(self.lbl_current_text, "Ошибка запуска.", "error")
@@ -10992,6 +16621,8 @@ class TTSApp:
         self.btn_start_sel.config(state=tk.NORMAL)
         self.btn_refresh.config(state=tk.NORMAL)
         self.btn_remove_sel.config(state=tk.NORMAL)
+        self.batch_prepared_text_var.set(False)
+        self.chk_batch_prepared_text.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.DISABLED)
         self.btn_hard_stop.config(state=tk.DISABLED)
         
@@ -11109,22 +16740,36 @@ class TTSApp:
                     
             self._post_to_ui(self.finish_processing, processor, queue_failed)
 
+    def _direct_processing_config(
+        self, *, prepared_text, apply_direct_tags, output_dir
+    ):
+        """Снимок запуска direct с локальными, а не глобальными эффектами."""
+        direct_config = self.config.copy()
+        direct_config.update(
+            {
+                "text_is_prepared": bool(prepared_text),
+                "apply_output_tags": bool(apply_direct_tags),
+                "output_dir": str(output_dir),
+                "fx_speed": self.dir_speed_var.get(),
+                "fx_pitch": self.dir_pitch_var.get(),
+                "fx_echo": self.dir_echo_var.get(),
+                "fx_echo_delay": self.dir_echo_delay_var.get(),
+                "fx_echo_decay": self.dir_echo_decay_var.get(),
+            }
+        )
+        return direct_config
+
     def start_direct_processing(self):
         if self.direct_processor is not None:
             return
         if self._warn_if_cache_busy_for_synthesis():
             return
 
-        # Явно копируем все локальные настройки прямого синтеза в config.
-        self.config["fx_speed"] = self.dir_speed_var.get()
-        self.config["fx_pitch"] = self.dir_pitch_var.get()
-        self.config["fx_echo"] = self.dir_echo_var.get()
-        self.config["fx_echo_delay"] = self.dir_echo_delay_var.get()
-        self.config["fx_echo_decay"] = self.dir_echo_decay_var.get()
-
         if not self._validate_api_steps_ui():
             return
         self.save_settings()
+        if not self._validate_book_output_profile():
+            return
         if not self.config.get("api_token"):
             self._show_error("Ошибка", "Введите API Token во вкладке Настройки!")
             return
@@ -11137,6 +16782,13 @@ class TTSApp:
                 "Введите текст для синтеза.",
                 "warning",
             )
+            return
+        prepared_text = bool(self.direct_prepared_text_var.get())
+        if prepared_text and not self._confirm_prepared_text_run():
+            return
+        if not self._prepare_glossary_for_synthesis(
+            prepared_text=prepared_text
+        ):
             return
 
         filename = normalize_output_filename(
@@ -11178,16 +16830,16 @@ class TTSApp:
         self.btn_direct_start.config(state=tk.DISABLED)
         self.btn_direct_stop.config(state=tk.NORMAL)
         self.btn_direct_hard_stop.config(state=tk.NORMAL)
+        self.chk_direct_prepared_text.config(state=tk.DISABLED)
         self._set_status_label(self.lbl_direct_status, "Обработка...", "text")
 
-        direct_config = self.config.copy()
-        # Пакетный синтез сохраняет прежнее поведение с книжными тегами.
-        # Только прямой синтез получает собственный opt-in переключатель.
-        direct_config["apply_output_tags"] = apply_direct_tags
-        # Прямой синтез больше не смешивает тестовые файлы с главами книги.
-        # Внутри TTSProcessor остаётся единый output_dir, поэтому подменяем его
-        # только в копии конфига данного запуска.
-        direct_config["output_dir"] = direct_output_dir
+        # Пакетный синтез сохраняет глобальные эффекты и книжные теги. Прямой
+        # синтез получает отдельный снимок локальной панели и opt-in тегов.
+        direct_config = self._direct_processing_config(
+            prepared_text=prepared_text,
+            apply_direct_tags=apply_direct_tags,
+            output_dir=direct_output_dir,
+        )
         try:
             processor = self._create_synthesis_processor(direct_config)
         except Exception as exc:
@@ -11195,6 +16847,7 @@ class TTSApp:
             self.btn_direct_start.config(state=tk.NORMAL)
             self.btn_direct_stop.config(state=tk.DISABLED)
             self.btn_direct_hard_stop.config(state=tk.DISABLED)
+            self.chk_direct_prepared_text.config(state=tk.NORMAL)
             self._set_status_label(self.lbl_direct_status, "Ошибка подготовки.", "error")
             self._show_error("Ошибка", f"Не удалось подготовить прямой синтез:\n{exc}")
             return
@@ -11263,6 +16916,7 @@ class TTSApp:
             self.btn_direct_start.config(state=tk.NORMAL)
             self.btn_direct_stop.config(state=tk.DISABLED)
             self.btn_direct_hard_stop.config(state=tk.DISABLED)
+            self.chk_direct_prepared_text.config(state=tk.NORMAL)
             self._set_status_label(self.lbl_direct_status, "Ошибка запуска.", "error")
             logging.exception("Не удалось запустить поток прямого синтеза")
             self._show_error(
@@ -11306,6 +16960,8 @@ class TTSApp:
         self.btn_direct_start.config(state=tk.NORMAL)
         self.btn_direct_stop.config(state=tk.DISABLED)
         self.btn_direct_hard_stop.config(state=tk.DISABLED)
+        self.direct_prepared_text_var.set(False)
+        self.chk_direct_prepared_text.config(state=tk.NORMAL)
 
         status = result.get("status")
         audio = result.get("audio")
@@ -11397,8 +17053,15 @@ class TTSApp:
             "folders": (tk.BooleanVar(value=True), "Пути к папкам (включая прямой синтез)"),
             "pauses": (tk.BooleanVar(value=True), "Паузы и Разделители"),
             "cache": (tk.BooleanVar(value=True), "Настройки Кэша и Очистки"),
+            "normalizer": (
+                tk.BooleanVar(value=True),
+                "Нормализатор и применение глоссария",
+            ),
             "effects": (tk.BooleanVar(value=True), "Эффекты (Скорость, Тон, Эхо)"),
-            "tags": (tk.BooleanVar(value=True), "Вывод и Теги ID3"),
+            "tags": (
+                tk.BooleanVar(value=True),
+                "Вывод, аудиопрофили и Теги ID3",
+            ),
             "workspace": (
                 tk.BooleanVar(value=True),
                 "Параметры вкладок (прямой синтез и импорт книг)",
@@ -11447,12 +17110,12 @@ class TTSApp:
                     self._show_error("Ошибка", f"Не удалось экспортировать конфиг:\n{e}")
                     
         ttk.Button(dialog, text="Экспортировать", command=do_export).pack(pady=15)
-        self._center_popup(dialog, 460, 315, fit_screen=True)
+        self._center_popup(dialog, 490, 350, fit_screen=True)
 
     def export_glossary(self):
         content = self.txt_glossary.get(1.0, tk.END).strip()
         try:
-            parsed = json.loads(content)
+            parsed = canonicalize_glossary_data(json.loads(content))
         except Exception as e:
             self._show_error("Ошибка JSON", f"Исправьте ошибки в редакторе перед экспортом:\n{e}")
             return
@@ -11516,9 +17179,8 @@ class TTSApp:
         self._remember_dialog_directory("last_glossary_dir", filepath)
         
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                imported_data = json.load(f)
-            if not isinstance(imported_data, dict): raise ValueError()
+            with open(filepath, 'r', encoding='utf-8-sig') as f:
+                imported_data = canonicalize_glossary_data(json.load(f))
         except Exception as e:
             self._show_error("Ошибка", f"Не удалось прочитать файл:\n{e}")
             return
@@ -11529,7 +17191,13 @@ class TTSApp:
         dialog.transient(self.root)
         dialog.grab_set()
         
-        ttk.Label(dialog, text="Что импортировать?\n(Данные будут добавлены к текущим)").pack(pady=10, padx=20)
+        ttk.Label(
+            dialog,
+            text=(
+                "Что импортировать?\n"
+                "Правила объединяются с текущим глоссарием."
+            ),
+        ).pack(pady=10, padx=20)
         
         var_acc = tk.BooleanVar(value=True)
         var_trm = tk.BooleanVar(value=True)
@@ -11538,37 +17206,73 @@ class TTSApp:
         ttk.Checkbutton(dialog, text="Ударения (+)", variable=var_acc).pack(anchor=tk.W, padx=30, pady=2)
         ttk.Checkbutton(dialog, text="Замена терминов", variable=var_trm).pack(anchor=tk.W, padx=30, pady=2)
         ttk.Checkbutton(dialog, text="RegEx правила", variable=var_reg).pack(anchor=tk.W, padx=30, pady=2)
+
+        ttk.Separator(dialog, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=20, pady=8)
+        ttk.Label(dialog, text="Если исходное правило уже существует:").pack(
+            anchor=tk.W, padx=30
+        )
+        conflict_policy = tk.StringVar(value="keep")
+        ttk.Radiobutton(
+            dialog,
+            text="Сохранить моё текущее правило (рекомендуется)",
+            variable=conflict_policy,
+            value="keep",
+        ).pack(anchor=tk.W, padx=40, pady=2)
+        ttk.Radiobutton(
+            dialog,
+            text="Заменить правилом из импортируемого файла",
+            variable=conflict_policy,
+            value="replace",
+        ).pack(anchor=tk.W, padx=40, pady=2)
         
         def do_import():
-            content = self.txt_glossary.get(1.0, tk.END).strip()
-            current = json.loads(content) if content else {}
-            
-            if var_acc.get():
-                current.setdefault("accents_ignore_case", []).extend(imported_data.get("accents_ignore_case", []))
-                current.setdefault("accents_strict_case", []).extend(imported_data.get("accents_strict_case", []))
-                current["accents_ignore_case"] = list(set(current["accents_ignore_case"]))
-                current["accents_strict_case"] = list(set(current["accents_strict_case"]))
-                
-            if var_trm.get():
-                current.setdefault("terms_ignore_case", {}).update(imported_data.get("terms_ignore_case", {}))
-                current.setdefault("terms_strict_case", {}).update(imported_data.get("terms_strict_case", {}))
-                
-            if var_reg.get():
-                # Простая защита от дубликатов RegEx (по паттерну)
-                existing_patterns = {r.get("pattern") for r in current.get("regex_rules", [])}
-                for r in imported_data.get("regex_rules", []):
-                    if r.get("pattern") not in existing_patterns:
-                        current.setdefault("regex_rules", []).append(r)
-                        existing_patterns.add(r.get("pattern"))
+            try:
+                content = self.txt_glossary.get(1.0, tk.END).strip()
+                current = canonicalize_glossary_data(
+                    json.loads(content) if content else empty_glossary_data()
+                )
+                selected = []
+                if var_acc.get(): selected.append("accents")
+                if var_trm.get(): selected.append("terms")
+                if var_reg.get(): selected.append("regex")
+                if not selected:
+                    self._show_warning("Пусто", "Не выбрана ни одна группа правил.")
+                    return
+                current, stats = merge_glossary_data(
+                    current,
+                    imported_data,
+                    selected,
+                    replace_existing=conflict_policy.get() == "replace",
+                )
+                shadowed_count = len(glossary_shadowed_accent_rules(current))
+            except Exception as exc:
+                self._show_error(
+                    "Ошибка JSON", f"Не удалось объединить глоссарии:\n{exc}"
+                )
+                return
                         
             dialog.destroy()
-            self.txt_glossary.delete(1.0, tk.END)
-            self.txt_glossary.insert(tk.END, json.dumps(current, indent=4, ensure_ascii=False))
-            self.save_glossary_ui()
-            self._show_info("Успех", "Правила успешно добавлены в глоссарий!")
+            self._replace_glossary_editor_data(current)
+            if not self.save_glossary_ui(show_popup=False):
+                return
+            summary = [f"Добавлено: {stats['added']}"]
+            if stats["replaced"]:
+                summary.append(f"заменено: {stats['replaced']}")
+            if stats["kept"]:
+                summary.append(f"сохранено текущих: {stats['kept']}")
+            if stats["duplicates"]:
+                summary.append(f"дубликатов пропущено: {stats['duplicates']}")
+            if shadowed_count:
+                summary.append(
+                    f"ударений перекрыто совпадающими терминами: {shadowed_count}"
+                )
+            self._show_info(
+                "Глоссарии объединены",
+                "; ".join(summary) + ".",
+            )
             
         ttk.Button(dialog, text="Импортировать (Добавить)", command=do_import).pack(pady=15)
-        self._center_popup(dialog, 320, 220)
+        self._center_popup(dialog, 440, 360, fit_screen=True)
 
 if __name__ == "__main__":
     root = tk.Tk()
