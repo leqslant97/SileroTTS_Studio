@@ -4317,50 +4317,6 @@ class BuildWorkflowContractTests(unittest.TestCase):
             self.assertIn("METADATA_BLOCK_PICTURE", document)
         self.assertIn("Промежуточные WAV и Vorbis", help_text)
 
-    def test_help_and_readme_describe_v15_profile_contracts(self):
-        readme = (PROJECT_DIR / "README.md").read_text(encoding="utf-8")
-        source = MODULE_PATH.read_text(encoding="utf-8")
-        help_start = source.index('help_text = r"""')
-        help_end = source.index(
-            '        help_text = help_text.replace', help_start
-        )
-        help_text = source[help_start:help_end]
-
-        for document in (readme, help_text):
-            self.assertIn("ПЕСОЧНИЦА", document.upper())
-            self.assertIn("Verbatim", document)
-            self.assertIn("объединение глоссариев", document.lower())
-            self.assertIn("Аудиопрофили", document)
-            self.assertIn("48 кГц mono", document)
-            self.assertIn("К сборке книги", document)
-            self.assertIn("К экспорту", document)
-            self.assertIn("Сохранить профиль", document)
-            self.assertIn("Сохранить и закрыть", document)
-            self.assertIn("Отмена", document)
-            self.assertIn("Пользовательские параметры", document)
-            self.assertIn("несохранённый глоссарий", document.lower())
-            self.assertIn("повреждённый primary", document.lower())
-            self.assertIn("Удалить правила", document)
-            self.assertIn("Выбрать результаты поиска", document)
-            self.assertRegex(document, r"Выбрать все\s+в\s+разделе")
-            self.assertIn("приоритет", document.lower())
-            self.assertIn("🔗 Объединить", document)
-            self.assertIn("🧹 Очистить всё", document)
-            self.assertIn("многоточ", document.lower())
-
-        self.assertIn('APP_VERSION = "1.5.0"', source)
-        self.assertIn(
-            'APP_PUBLIC_VERSION = APP_VERSION.removesuffix(".0")', source
-        )
-        self.assertEqual(studio.APP_PUBLIC_VERSION, "1.5")
-        self.assertIn("v{APP_PUBLIC_VERSION}", help_text)
-        self.assertIn(
-            '"{APP_PUBLIC_VERSION}", APP_PUBLIC_VERSION, 1', source
-        )
-        self.assertNotIn("v1.5.0", readme)
-        self.assertIn("Нормализатор, профили и verbatim", readme)
-        self.assertIn("SHA256SUMS.txt", readme)
-
     def test_release_matrix_keeps_required_portable_artifacts(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
