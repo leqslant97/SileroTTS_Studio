@@ -22,8 +22,6 @@ env:
   # currently embeds Tk 8.6. The Aqua build needs Tk 9 for reliable live
   # switching between the system light and dark appearances.
   MACOS_TK_SERIES: "9.0"
-  # Branch/workflow_dispatch builds have no release tag to derive a version from.
-  APP_VERSION_FALLBACK: "1.4.1"
 
 jobs:
   build:
@@ -35,6 +33,7 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
+            target_arch: x86_64
             app_name: SileroTTS_Studio_Windows
             portable_name: SileroTTS_Studio_Windows_Portable
             artifact_name: SileroTTS_Studio_Windows.zip
@@ -42,6 +41,7 @@ jobs:
             pyinstaller: .venv/Scripts/pyinstaller.exe
           - name: Linux x86_64
             os: ubuntu-latest
+            target_arch: x86_64
             app_name: SileroTTS_Studio_Linux_x86_64
             portable_name: SileroTTS_Studio_Linux_x86_64_Portable
             artifact_name: SileroTTS_Studio_Linux_x86_64.zip
@@ -49,6 +49,7 @@ jobs:
             pyinstaller: .venv/bin/pyinstaller
           - name: Linux ARM64
             os: ubuntu-24.04-arm
+            target_arch: arm64
             app_name: SileroTTS_Studio_Linux_arm64
             portable_name: SileroTTS_Studio_Linux_arm64_Portable
             artifact_name: SileroTTS_Studio_Linux_arm64.zip
@@ -71,28 +72,34 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Resolve application version
+      - name: Resolve and verify application version
         shell: bash
         run: |
-          version="$APP_VERSION_FALLBACK"
-
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            version="${GITHUB_REF_NAME#v}"
-            version="${version%%-*}"
-            version="${version%%+*}"
+          # APP_VERSION is the technical three-component binary version.
+          # A zero patch is omitted only from the public release tag: internal
+          # 1.5.0 therefore maps to the exact public tag v1.5.
+          source_version="$(sed -nE 's/^APP_VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' SileroTTS_Studio.py)"
+          if [[ ! "$source_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Не удалось однозначно прочитать APP_VERSION из SileroTTS_Studio.py"
+            exit 1
           fi
-
-          if [[ "$version" =~ ^[0-9]+\.[0-9]+$ ]]; then
-            version="${version}.0"
+          IFS=. read -r version_major version_minor version_patch <<< "$source_version"
+          if [[ "$version_patch" == "0" ]]; then
+            public_version="$version_major.$version_minor"
+          else
+            public_version="$source_version"
           fi
+          expected_tag="v$public_version"
+          version="$source_version"
 
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Некорректная версия приложения: $version"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "::error::Ожидался точный тег $expected_tag, получен $GITHUB_REF_NAME"
             exit 1
           fi
 
           echo "APP_VERSION=$version" >> "$GITHUB_ENV"
-          echo "Application version: $version"
+          echo "PUBLIC_VERSION=$public_version" >> "$GITHUB_ENV"
+          echo "Application version: $version; public release: $expected_tag"
 
       - name: Set up Python on Windows and Linux
         if: runner.os != 'macOS'
@@ -146,7 +153,7 @@ jobs:
       - name: Verify Python and Tk build environment
         shell: bash
         env:
-          EXPECTED_MACOS_ARCH: ${{ matrix.target_arch }}
+          EXPECTED_TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             py="$MACOS_PYTHON"
@@ -168,6 +175,20 @@ jobs:
           print("Tcl/Tk:", tk_patchlevel)
           print("_tkinter:", tkinter._tkinter.__file__)
 
+          architecture_aliases = {
+              "amd64": "x86_64",
+              "x86_64": "x86_64",
+              "arm64": "arm64",
+              "aarch64": "arm64",
+          }
+          actual_arch = architecture_aliases.get(platform.machine().lower())
+          expected_arch = os.environ["EXPECTED_TARGET_ARCH"]
+          if actual_arch != expected_arch:
+              raise SystemExit(
+                  f"Runner architecture {platform.machine()!r}; "
+                  f"expected {expected_arch!r}"
+              )
+
           if sys.platform == "darwin":
               expected_series = tuple(
                   map(int, os.environ["MACOS_PYTHON_SERIES"].split("."))
@@ -176,12 +197,6 @@ jobs:
                   raise SystemExit(
                       f"macOS Python {actual_python!r} is outside required "
                       f"series {expected_series!r}"
-                  )
-              expected_arch = os.environ["EXPECTED_MACOS_ARCH"]
-              if platform.machine() != expected_arch:
-                  raise SystemExit(
-                      f"macOS Python architecture {platform.machine()!r}; "
-                      f"expected {expected_arch!r}"
                   )
               expected_tk = os.environ["MACOS_TK_SERIES"]
               if tkinter.TclVersion != 9.0 or tkinter.TkVersion != 9.0:
@@ -524,15 +539,36 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            test -f "dist/${{ matrix.artifact_name }}"
-            test -f "dist/${{ matrix.portable_artifact_name }}"
-          elif [[ "$RUNNER_OS" == "Linux" ]]; then
-            test -f "dist/${{ matrix.artifact_name }}"
-            test -f "dist/${{ matrix.portable_artifact_name }}"
+            py=.venv/Scripts/python.exe
           else
-            test -f "dist/${{ matrix.artifact_name }}"
+            py=.venv/bin/python
+          fi
+          artifacts=("dist/${{ matrix.artifact_name }}")
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            artifacts+=("dist/${{ matrix.portable_artifact_name }}")
+          elif [[ "$RUNNER_OS" == "Linux" ]]; then
+            artifacts+=("dist/${{ matrix.portable_artifact_name }}")
+          else
             test ! -e "dist/${{ matrix.app_name }}_Portable.app"
           fi
+
+          for artifact in "${artifacts[@]}"; do
+            test -s "$artifact"
+            if [[ "$artifact" == *.zip ]]; then
+              "$py" - "$artifact" <<'PY'
+          import sys
+          import zipfile
+
+          archive = sys.argv[1]
+          with zipfile.ZipFile(archive) as zipped:
+              if not zipped.namelist():
+                  raise SystemExit(f"empty ZIP archive: {archive}")
+              broken_member = zipped.testzip()
+              if broken_member is not None:
+                  raise SystemExit(f"CRC error in {archive}: {broken_member}")
+          PY
+            fi
+          done
 
       - name: Verify portable onefile builds
         if: runner.os == 'Windows' || runner.os == 'Linux'
@@ -612,8 +648,8 @@ jobs:
       - name: Upload full build artifact
         uses: actions/upload-artifact@v4
         with:
-          # Artifact names must not include the filename extension: the
-          # downloaded file itself retains the exact release name.
+          # A distinct CI-artifact wrapper keeps matrix downloads unambiguous;
+          # the file inside retains the exact release-asset name.
           name: ${{ matrix.artifact_name }}-artifact
           path: dist/${{ matrix.artifact_name }}
           if-no-files-found: error
@@ -626,14 +662,58 @@ jobs:
           path: dist/${{ matrix.portable_artifact_name }}
           if-no-files-found: error
 
-      - name: Upload full release asset
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+  release:
+    name: Verify and publish complete release
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all verified build artifacts
+        uses: actions/download-artifact@v4
         with:
-          files: dist/${{ matrix.artifact_name }}
+          path: release-assets
+          pattern: "*-artifact"
+          merge-multiple: true
 
-      - name: Upload portable release asset
-        if: startsWith(github.ref, 'refs/tags/') && (runner.os == 'Windows' || runner.os == 'Linux')
+      - name: Verify complete release set and write SHA256SUMS
+        shell: bash
+        run: |
+          expected=(
+            SileroTTS_Studio_Windows.zip
+            SileroTTS_Studio_Windows_Portable.exe
+            SileroTTS_Studio_Linux_x86_64.zip
+            SileroTTS_Studio_Linux_x86_64_Portable.zip
+            SileroTTS_Studio_Linux_arm64.zip
+            SileroTTS_Studio_Linux_arm64_Portable.zip
+            SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip
+            SileroTTS_Studio_macOS_Intel_x86_64.zip
+          )
+
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
+          for filename in "${expected[@]}"; do
+            test -s "release-assets/$filename"
+            if [[ "$filename" == *.zip ]]; then
+              unzip -tqq "release-assets/$filename"
+            fi
+          done
+
+          (
+            cd release-assets
+            sha256sum "${expected[@]}" > SHA256SUMS.txt
+          )
+          test -s release-assets/SHA256SUMS.txt
+
+      - name: Publish release only after every platform passed
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.portable_artifact_name }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/SileroTTS_Studio_Windows.zip
+            release-assets/SileroTTS_Studio_Windows_Portable.exe
+            release-assets/SileroTTS_Studio_Linux_x86_64.zip
+            release-assets/SileroTTS_Studio_Linux_x86_64_Portable.zip
+            release-assets/SileroTTS_Studio_Linux_arm64.zip
+            release-assets/SileroTTS_Studio_Linux_arm64_Portable.zip
+            release-assets/SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip
+            release-assets/SileroTTS_Studio_macOS_Intel_x86_64.zip
+            release-assets/SHA256SUMS.txt
