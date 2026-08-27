@@ -2,8 +2,10 @@ import hashlib
 import importlib.util
 import json
 import logging
+import re
 import subprocess
 import base64
+import copy
 import struct
 import sys
 import tempfile
@@ -385,6 +387,8 @@ class ConfigurationProfileTests(unittest.TestCase):
         self.assertNotIn("last_browse_dir", exported_keys)
         self.assertNotIn("last_config_dir", exported_keys)
         self.assertNotIn("last_glossary_dir", exported_keys)
+        self.assertNotIn("last_audio_profile_dir", exported_keys)
+        self.assertNotIn("last_normalizer_text_dir", exported_keys)
         self.assertNotIn("ui_font_size", exported_keys)
 
     def test_direct_output_path_stays_in_folder_group_despite_single_ui_field(self):
@@ -456,6 +460,26 @@ class ConfigurationProfileTests(unittest.TestCase):
 
         self.assertEqual(merged["api_token"], "local")
         self.assertEqual(merged["speaker"], "new")
+
+    def test_old_shared_format_is_migrated_during_selective_import(self):
+        merged = studio.merge_config_values(
+            {"output_format": "mp3", "export_format": "wav"},
+            {"output_format": "opus"},
+            ["tags"],
+        )
+
+        self.assertEqual(merged["output_format"], "opus")
+        self.assertEqual(merged["export_format"], "opus")
+
+    def test_new_separate_format_survives_selective_import(self):
+        merged = studio.merge_config_values(
+            {"output_format": "wav", "export_format": "wav"},
+            {"output_format": "mp3", "export_format": "ogg"},
+            ["tags"],
+        )
+
+        self.assertEqual(merged["output_format"], "mp3")
+        self.assertEqual(merged["export_format"], "ogg")
 
 
 class ConfigurationValidationTests(unittest.TestCase):
@@ -711,6 +735,57 @@ class ClipboardNormalizationTests(unittest.TestCase):
             "/tmp/My Book.txt",
         )
 
+    def test_physical_and_virtual_paste_callbacks_insert_only_once(self):
+        class FakeText:
+            def __init__(self):
+                self.insert = mock.Mock()
+                self.delete = mock.Mock()
+
+            @staticmethod
+            def tag_ranges(_tag):
+                return ()
+
+        app = object.__new__(studio.TTSApp)
+        app.root = mock.Mock()
+        app.root.clipboard_get.return_value = "термин"
+        idle_callbacks = []
+        app.root.after_idle.side_effect = idle_callbacks.append
+        widget = FakeText()
+        event = mock.Mock(widget=widget)
+
+        with mock.patch.object(studio.tk, "Text", FakeText):
+            self.assertEqual(app._paste_clipboard_once(event), "break")
+            self.assertEqual(app._paste_clipboard_once(event), "break")
+
+        widget.insert.assert_called_once_with(studio.tk.INSERT, "термин")
+        self.assertEqual(len(idle_callbacks), 1)
+
+        idle_callbacks[0]()
+        with mock.patch.object(studio.tk, "Text", FakeText):
+            app._paste_clipboard_once(event)
+        self.assertEqual(widget.insert.call_count, 2)
+
+    def test_clipboard_setup_replaces_tk_virtual_paste_binding(self):
+        app = object.__new__(studio.TTSApp)
+        app.root = mock.Mock()
+
+        app._fix_cyrillic_clipboard()
+        for widget_class in ("Text", "Entry", "TEntry"):
+            self.assertIn(
+                mock.call(widget_class, "<<Paste>>", mock.ANY),
+                app.root.bind_class.call_args_list,
+            )
+
+        app.root.reset_mock()
+        app._setup_mac_hotkeys()
+        for widget_class in ("Text", "Entry", "TEntry"):
+            self.assertIn(
+                mock.call(
+                    widget_class, "<<Paste>>", app._paste_clipboard_once
+                ),
+                app.root.bind_class.call_args_list,
+            )
+
 
 class ExportGroupingTests(unittest.TestCase):
     def test_xiph_cover_uses_signature_and_flac_picture_block(self):
@@ -927,6 +1002,22 @@ class ExportGroupingTests(unittest.TestCase):
                     channels="mono",
                     bitrate="128k",
                 )
+            with self.assertRaisesRegex(ValueError, "не выше 32 кбит/с"):
+                studio._select_merge_audio_profile(
+                    [Path("speech.wav")],
+                    "ogg",
+                    sample_rate="8000",
+                    channels="mono",
+                    bitrate="48k",
+                )
+            with self.assertRaisesRegex(ValueError, "не выше 96 кбит/с"):
+                studio._select_merge_audio_profile(
+                    [Path("speech.wav")],
+                    "ogg",
+                    sample_rate="12000",
+                    channels="stereo",
+                    bitrate="128k",
+                )
 
     def test_explicit_merge_bitrate_overrides_uniform_source_metadata(self):
         with mock.patch.object(
@@ -1069,6 +1160,16 @@ class ExportGroupingTests(unittest.TestCase):
             self.assertEqual(command[command.index("-b:a") + 1], "192k")
             self.assertNotIn("copy", command)
             self.assertEqual(destination.read_bytes(), b"mp3")
+
+    def test_windows_command_limit_fails_before_createprocess(self):
+        with self.assertRaisesRegex(ValueError, "Разделите группу"):
+            studio._validate_windows_command_length(
+                ["ffmpeg", "x" * 30000], system_name="Windows"
+            )
+
+        studio._validate_windows_command_length(
+            ["ffmpeg", "x" * 30000], system_name="Linux"
+        )
 
     def test_mp3_cover_is_written_as_windows_compatible_jpeg_apic(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1314,6 +1415,7 @@ class ExportGroupingTests(unittest.TestCase):
             "cb_export_sample_rate",
             "cb_export_channels",
             "chk_export_fx",
+            "btn_audio_profiles_export",
             "btn_export_start",
             "btn_export_stop",
             "chk_export_tags_only",
@@ -1349,7 +1451,8 @@ class ExportGroupingTests(unittest.TestCase):
 
         app.update_config_from_ui()
 
-        self.assertEqual(app.config["output_format"], "ogg")
+        self.assertEqual(app.config["export_format"], "ogg")
+        self.assertNotIn("output_format", app.config)
         self.assertEqual(app.config["export_bitrate"], "96k")
         self.assertEqual(app.config["export_sample_rate"], "32000")
         self.assertEqual(app.config["export_channels"], "mono")
@@ -1367,12 +1470,15 @@ class ExportGroupingTests(unittest.TestCase):
             "cb_export_sample_rate",
             "cb_export_channels",
             "chk_export_fx",
+            "btn_audio_profiles_export",
             "btn_export_start",
             "btn_export_stop",
             "chk_export_tags_only",
         )
         for name in widget_names:
             setattr(app, name, mock.Mock())
+        effect_controls = tuple(mock.Mock() for _ in range(6))
+        app.export_fx_value_controls = effect_controls
 
         app._sync_export_mode_controls()
 
@@ -1380,6 +1486,9 @@ class ExportGroupingTests(unittest.TestCase):
             app.cb_export_bitrate,
             app.cb_export_sample_rate,
             app.cb_export_channels,
+            app.chk_export_fx,
+            app.btn_audio_profiles_export,
+            *effect_controls,
         ):
             control.configure.assert_called_with(state=studio.tk.DISABLED)
 
@@ -1440,6 +1549,277 @@ class ExportGroupingTests(unittest.TestCase):
             ordered, ["root-a", "child-a", "child-b", "root-b"]
         )
 
+    def test_export_merge_plan_flattens_groups_in_visual_tree_order(self):
+        plan = studio.plan_export_merge(
+            ("root-before", "group-1", "root-after", "group-2"),
+            {
+                "group-1": ("child-a", "child-b"),
+                "group-2": ("child-c", "child-d"),
+            },
+            ("group-2", "child-b", "root-before", "group-1"),
+            ("group-1", "group-2"),
+            (
+                "root-before",
+                "root-after",
+                "child-a",
+                "child-b",
+                "child-c",
+                "child-d",
+            ),
+        )
+
+        self.assertEqual(plan["target_group"], "group-1")
+        self.assertEqual(plan["source_groups"], ("group-2",))
+        self.assertEqual(
+            plan["file_ids"],
+            ("root-before", "child-a", "child-b", "child-c", "child-d"),
+        )
+
+    def test_export_merge_plan_creates_new_group_for_files_only(self):
+        plan = studio.plan_export_merge(
+            ("group-1", "root-file", "group-2"),
+            {
+                "group-1": ("child-a", "child-b"),
+                "group-2": ("child-c",),
+            },
+            ("child-c", "root-file", "child-b"),
+            ("group-1", "group-2"),
+            ("child-a", "child-b", "root-file", "child-c"),
+        )
+
+        self.assertIsNone(plan["target_group"])
+        self.assertEqual(plan["source_groups"], ())
+        self.assertEqual(
+            plan["file_ids"], ("child-b", "root-file", "child-c")
+        )
+
+    def test_export_merge_controller_preserves_target_settings_and_moves_files(self):
+        class FakeTree:
+            def __init__(self):
+                self.roots = ["root-file", "unselected", "group-1", "group-2"]
+                self.children = {
+                    "group-1": ["child-a", "child-b"],
+                    "group-2": ["child-c"],
+                }
+                self.selected = ("group-2", "root-file", "group-1")
+                self.deleted = []
+                self.focused = None
+
+            def selection(self):
+                return self.selected
+
+            def get_children(self, parent=""):
+                if parent == "":
+                    return tuple(self.roots)
+                return tuple(self.children.get(parent, ()))
+
+            def exists(self, item):
+                return item in self.roots or any(
+                    item in children for children in self.children.values()
+                )
+
+            def parent(self, item):
+                for group, children in self.children.items():
+                    if item in children:
+                        return group
+                return ""
+
+            def move(self, item, parent, index):
+                if item in self.roots:
+                    self.roots.remove(item)
+                for children in self.children.values():
+                    if item in children:
+                        children.remove(item)
+                if parent == "":
+                    self.roots.insert(int(index), item)
+                else:
+                    self.children.setdefault(parent, []).append(item)
+
+            def delete(self, item):
+                self.deleted.append(item)
+                if item in self.roots:
+                    self.roots.remove(item)
+                self.children.pop(item, None)
+
+            def selection_set(self, item):
+                self.selected = (item,)
+
+            def focus(self, item):
+                self.focused = item
+
+        app = object.__new__(studio.TTSApp)
+        app._export_running = False
+        app._export_lock = False
+        target_settings = {"name": "Том 1", "merge": True}
+        app.export_groups = {
+            "group-1": target_settings,
+            "group-2": {"name": "Том 2", "merge": False},
+        }
+        app.export_files = {
+            file_id: {"title": file_id}
+            for file_id in (
+                "root-file",
+                "unselected",
+                "child-a",
+                "child-b",
+                "child-c",
+            )
+        }
+        app.export_tree = FakeTree()
+        app._ask_yes_no = mock.Mock(return_value=True)
+        app._show_info = mock.Mock()
+        app._show_warning = mock.Mock()
+        app.update_group_duration = mock.Mock()
+        app.on_export_tree_select = mock.Mock()
+        app.current_selected_export_item = "group-2"
+
+        app.merge_selected_export_items()
+
+        self.assertIs(app.export_groups["group-1"], target_settings)
+        self.assertNotIn("group-2", app.export_groups)
+        self.assertEqual(
+            app.export_tree.get_children("group-1"),
+            ("root-file", "child-a", "child-b", "child-c"),
+        )
+        self.assertEqual(app.export_tree.deleted, ["group-2"])
+        self.assertEqual(app.export_tree.roots, ["group-1", "unselected"])
+        self.assertEqual(app.export_tree.selected, ("group-1",))
+        self.assertEqual(app.export_tree.focused, "group-1")
+        app.update_group_duration.assert_called_with("group-1")
+        app.on_export_tree_select.assert_called_once_with(None)
+
+    def test_file_only_merge_is_inserted_at_first_source_and_keeps_parents(self):
+        class FakeTree:
+            def __init__(self):
+                self.roots = ["group-a", "root-b", "group-c"]
+                self.children = {
+                    "group-a": ["child-a"],
+                    "group-c": ["child-c"],
+                }
+                self.selected = ("child-c", "root-b", "child-a")
+
+            def selection(self):
+                return self.selected
+
+            def get_children(self, parent=""):
+                return tuple(
+                    self.roots if parent == "" else self.children.get(parent, ())
+                )
+
+            def exists(self, item):
+                return item in self.roots or any(
+                    item in children for children in self.children.values()
+                )
+
+            def parent(self, item):
+                for group, children in self.children.items():
+                    if item in children:
+                        return group
+                return ""
+
+            def move(self, item, parent, index):
+                if item in self.roots:
+                    self.roots.remove(item)
+                for children in self.children.values():
+                    if item in children:
+                        children.remove(item)
+                if parent == "":
+                    self.roots.insert(int(index), item)
+                else:
+                    self.children.setdefault(parent, []).append(item)
+
+            def selection_set(self, item):
+                self.selected = (item,)
+
+            def focus(self, _item):
+                return None
+
+        app = object.__new__(studio.TTSApp)
+        app._export_running = False
+        app._export_lock = False
+        app.export_groups = {
+            "group-a": {"name": "A"},
+            "group-c": {"name": "C"},
+        }
+        app.export_files = {
+            file_id: {"title": file_id}
+            for file_id in ("child-a", "root-b", "child-c")
+        }
+        app.export_tree = FakeTree()
+        app._show_info = mock.Mock()
+        app._show_warning = mock.Mock()
+        app.update_group_duration = mock.Mock()
+        app.on_export_tree_select = mock.Mock()
+        app.current_selected_export_item = None
+
+        def add_group():
+            app.export_groups["merged"] = {"name": "Новая группа"}
+            app.export_tree.roots.append("merged")
+            app.export_tree.children["merged"] = []
+            return "merged"
+
+        app.add_export_group = add_group
+
+        app.merge_selected_export_items()
+
+        self.assertEqual(
+            app.export_tree.roots, ["merged", "group-a", "group-c"]
+        )
+        self.assertEqual(
+            app.export_tree.children["merged"],
+            ["child-a", "root-b", "child-c"],
+        )
+        self.assertIn("group-a", app.export_groups)
+        self.assertIn("group-c", app.export_groups)
+
+    def test_empty_groups_are_not_reserved_as_export_outputs(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("        if not tags_only:\n            planned_outputs")
+        end = source.index("            duplicates = duplicate_paths", start)
+        preflight = source[start:end]
+
+        empty_guard = preflight.index("if not children:\n                        continue")
+        merged_output = preflight.index(
+            'planned_outputs.append(out_dir / f"{group_name}.{fmt}")'
+        )
+        self.assertLess(empty_guard, merged_output)
+
+    def test_clear_export_project_only_resets_the_in_memory_project(self):
+        app = object.__new__(studio.TTSApp)
+        app._export_running = False
+        app._export_lock = False
+        app.export_groups = {"group-1": {"name": "Том 1"}}
+        app.export_files = {
+            "file-1": {"path": "/audio/one.mp3"},
+            "file-2": {"path": "/audio/two.mp3"},
+        }
+        app.group_counter = 3
+        app.current_selected_export_item = "file-1"
+        app.export_tree = mock.Mock()
+        app.export_tree.get_children.return_value = ("group-1", "file-2")
+        app.export_tree.exists.return_value = True
+        app.export_progress = {}
+        app.lbl_export_status = mock.Mock()
+        app._ask_yes_no = mock.Mock(return_value=True)
+        app._disable_export_settings = mock.Mock()
+        app.update_total_export_duration = mock.Mock()
+        app._set_status_label = mock.Mock()
+
+        app.clear_export_project()
+
+        self.assertEqual(app.export_groups, {})
+        self.assertEqual(app.export_files, {})
+        self.assertEqual(app.group_counter, 0)
+        self.assertIsNone(app.current_selected_export_item)
+        self.assertEqual(app.export_progress["value"], 0)
+        self.assertEqual(
+            app.export_tree.delete.call_args_list,
+            [mock.call("group-1"), mock.call("file-2")],
+        )
+        app._set_status_label.assert_called_once_with(
+            app.lbl_export_status, "Ожидание...", "info"
+        )
+
     def test_split_works_without_preexisting_groups(self):
         groups = studio.split_export_file_ids(
             ["a", "b", "c"], {"a": 40, "b": 30, "c": 20}, 60
@@ -1457,6 +1837,32 @@ class ExportGroupingTests(unittest.TestCase):
         self.assertEqual(studio.format_sequence_number(10, 10), "10")
         self.assertEqual(
             studio.format_sequence_number(8, 3, start_index=8), "08"
+        )
+
+    def test_next_group_name_preserves_existing_sequence_width(self):
+        self.assertEqual(
+            studio.next_sequence_name(
+                "Том {num}", [f"Том {number:02d}" for number in range(1, 11)]
+            ),
+            "Том 11",
+        )
+        self.assertEqual(
+            studio.next_sequence_name("Том {num}", ["Том 01", "Том 03"]),
+            "Том 02",
+        )
+        self.assertEqual(
+            studio.next_sequence_name(
+                "Том {num}", [f"Том {number}" for number in range(1, 10)]
+            ),
+            "Том 10",
+        )
+        self.assertEqual(
+            studio.next_sequence_name("Часть {num:0}", ["Часть 00", "Часть 02"]),
+            "Часть 01",
+        )
+        self.assertEqual(
+            studio.next_sequence_name("Том", ["Том", "Том 2"]),
+            "Том 3",
         )
 
     def test_subfolder_is_effective_only_for_unmerged_groups(self):
@@ -1729,6 +2135,1215 @@ class TextNormalizationTests(unittest.TestCase):
         )
 
 
+class NormalizerProfileAndGlossaryV15Tests(unittest.TestCase):
+    def make_context(self, glossary=None, config=None):
+        merged = studio.DEFAULT_CONFIG.copy()
+        if config:
+            merged.update(config)
+        return studio.TTSProcessor.normalization_context(
+            merged,
+            glossary or studio.empty_glossary_data(),
+        )
+
+    def test_legacy_default_is_tts_and_keeps_options_compact(self):
+        config = studio.normalize_config({})
+
+        self.assertEqual(config["normalizer_mode"], "tts")
+        self.assertTrue(config["normalizer_enabled"])
+        self.assertTrue(config["glossary_enabled"])
+        self.assertEqual(config["normalizer_options"], {})
+        self.assertTrue(
+            studio.resolved_normalizer_options(config)["enable_latinization"]
+        )
+
+    def test_global_normalizer_summary_distinguishes_saved_custom_state(self):
+        builtin = studio.describe_normalizer_settings({})
+        custom = studio.describe_normalizer_settings(
+            {"normalizer_mode": "safe", "glossary_enabled": False}
+        )
+
+        self.assertEqual(builtin["profile"], "TTS (для озвучки)")
+        self.assertEqual(
+            custom["profile"], "Пользовательский (база Safe)"
+        )
+        self.assertIn("глоссарий: выкл.", custom["details"])
+
+    def test_normalizer_snapshot_treats_compact_and_full_defaults_as_equal(self):
+        compact = {"normalizer_mode": "tts", "normalizer_options": {}}
+        full = {
+            "normalizer_mode": "tts",
+            "normalizer_options": studio.normalizer_mode_defaults("tts"),
+        }
+
+        self.assertEqual(
+            studio.normalizer_settings_snapshot(compact),
+            studio.normalizer_settings_snapshot(full),
+        )
+
+    def test_profile_roundtrip_is_complete_and_does_not_touch_api(self):
+        current = {
+            "api_token": "secret",
+            "normalizer_mode": "safe",
+            "normalizer_enabled": True,
+            "normalizer_options": {"enable_latinization": True},
+            "auto_abbreviations": False,
+            "auto_short_words": True,
+            "glossary_enabled": False,
+        }
+
+        profile = studio.normalizer_profile_from_config(current, name="Книга")
+        applied = studio.apply_normalizer_profile(
+            {"api_token": "keep-me", "speaker": "voice"}, profile
+        )
+
+        self.assertEqual(profile["schema"], studio.NORMALIZER_PROFILE_SCHEMA)
+        self.assertEqual(profile["normalizer"]["mode"], "safe")
+        self.assertTrue(profile["normalizer"]["options"]["enable_latinization"])
+        self.assertEqual(applied["api_token"], "keep-me")
+        self.assertEqual(applied["speaker"], "voice")
+        self.assertFalse(applied["glossary_enabled"])
+
+    def test_exported_normalizer_profile_omits_local_dictionary_path(self):
+        profile = studio.normalizer_profile_from_config(
+            {
+                "normalizer_mode": "tts",
+                "normalizer_options": {
+                    "dictionaries_path": "/private/local/dictionaries"
+                },
+            }
+        )
+
+        self.assertEqual(
+            profile["normalizer"]["options"]["dictionaries_path"], ""
+        )
+
+    def test_imported_normalizer_profile_rejects_invalid_option_values(self):
+        profile = studio.normalizer_profile_from_config({}, name="Проверка")
+        profile["normalizer"]["options"]["latinization_backend"] = "unknown"
+
+        with self.assertRaisesRegex(ValueError, "latinization_backend"):
+            studio.normalize_normalizer_profile(profile)
+
+        profile = studio.normalizer_profile_from_config({}, name="Проверка")
+        profile["normalizer"]["options"]["remove_links_ignore_interval"] = [
+            2200,
+            1000,
+        ]
+        with self.assertRaisesRegex(ValueError, "remove_links_ignore_interval"):
+            studio.normalize_normalizer_profile(profile)
+
+    def test_imported_normalizer_profile_rejects_wrong_types_and_typos(self):
+        profile = studio.normalizer_profile_from_config({}, name="Проверка")
+        profile["normalizer"]["enabled"] = "yes"
+        with self.assertRaisesRegex(ValueError, "normalizer.enabled"):
+            studio.normalize_normalizer_profile(profile)
+
+        profile = studio.normalizer_profile_from_config({}, name="Проверка")
+        profile["normalizer"]["options"]["enable_latinisation"] = True
+        with self.assertRaisesRegex(ValueError, "enable_latinisation"):
+            studio.normalize_normalizer_profile(profile)
+
+    def test_imported_normalizer_profile_requires_complete_versioned_schema(self):
+        with self.assertRaisesRegex(ValueError, "обязательные поля"):
+            studio.normalize_normalizer_profile({})
+
+        profile = studio.normalizer_profile_from_config({}, name="Проверка")
+        profile["version"] = True
+        with self.assertRaisesRegex(ValueError, "целым числом"):
+            studio.normalize_normalizer_profile(profile)
+
+        profile = studio.normalizer_profile_from_config({}, name="Проверка")
+        profile["normalizer"]["enable"] = False
+        with self.assertRaisesRegex(ValueError, "неизвестные поля normalizer"):
+            studio.normalize_normalizer_profile(profile)
+
+    def test_portable_normalizer_profile_rejects_paths_and_preserves_local_path(self):
+        current = {
+            "normalizer_mode": "tts",
+            "normalizer_options": {"dictionaries_path": "/local/dictionaries"},
+        }
+        profile = studio.normalizer_profile_from_config({}, name="Переносимый")
+        applied = studio.apply_normalizer_profile(current, profile)
+
+        self.assertEqual(
+            applied["normalizer_options"]["dictionaries_path"],
+            "/local/dictionaries",
+        )
+
+        profile["normalizer"]["options"]["dictionaries_path"] = "/foreign"
+        with self.assertRaisesRegex(ValueError, "локальный путь"):
+            studio.normalize_normalizer_profile(profile)
+
+        profile = studio.normalizer_profile_from_config({}, name="Переносимый")
+        profile["normalizer"]["options"]["latin_dictionary_filename"] = (
+            "../secret.dic"
+        )
+        with self.assertRaisesRegex(ValueError, "latin_dictionary_filename"):
+            studio.normalize_normalizer_profile(profile)
+
+    def test_verbatim_term_survives_normalizer_and_cleanup_exactly(self):
+        processor = self.make_context(
+            {
+                "terms_ignore_case": {
+                    "убого": {
+                        "replacement": "уб+о'го",
+                        "verbatim": True,
+                    }
+                }
+            }
+        )
+
+        normalized = processor.process_sentence_text("Это убого 10 раз.")
+
+        self.assertEqual(normalized, "Это уб+о'го десять раз.")
+        self.assertNotIn("\U000f0000", normalized)
+
+    def test_verbatim_keeps_context_for_neighboring_roman_number(self):
+        processor = self.make_context(
+            {
+                "terms_strict_case": {
+                    "Глава": {
+                        "replacement": "Гл+ава",
+                        "verbatim": True,
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(
+            processor.process_sentence_text("Глава IV."),
+            "Гл+ава четвёртая.",
+        )
+
+    def test_verbatim_is_case_aware_and_whole_word_by_default(self):
+        glossary = {
+            "terms_ignore_case": {
+                "убого": {
+                    "replacement": "уб+о'го",
+                    "verbatim": True,
+                }
+            }
+        }
+        processor = self.make_context(glossary)
+
+        self.assertEqual(processor.process_sentence_text("УБОГО!"), "УБ+О'ГО!")
+        self.assertIn(
+            "Преубогословие",
+            processor.process_sentence_text("Преубогословие 10 раз."),
+        )
+
+    def test_verbatim_substring_protects_the_containing_word(self):
+        processor = self.make_context(
+            {
+                "terms_ignore_case": {
+                    "убого": {
+                        "replacement": "уб+о'го",
+                        "verbatim": True,
+                        "whole_word": False,
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(
+            processor.process_sentence_text("преубогословие 10 раз."),
+            "преуб+о'гословие десять раз.",
+        )
+
+    def test_verbatim_regex_preserves_expanded_replacement(self):
+        processor = self.make_context(
+            {
+                "regex_rules": [
+                    {
+                        "pattern": r"API-(\d+)",
+                        "repl": r"эйп+и'ай-\1",
+                        "verbatim": True,
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(
+            processor.process_sentence_text("API-42 и 10 раз."),
+            "эйп+и'ай-42 и десять раз.",
+        )
+
+    def test_verbatim_substring_replaces_repeated_matches_in_one_word(self):
+        processor = self.make_context(
+            {
+                "terms_ignore_case": {
+                    "убого": {
+                        "replacement": "X",
+                        "verbatim": True,
+                        "whole_word": False,
+                    }
+                }
+            }
+        )
+
+        self.assertEqual(processor.process_sentence_text("убогоубого"), "XX.")
+
+    def test_verbatim_regex_inside_word_does_not_add_boundaries(self):
+        processor = self.make_context(
+            {
+                "regex_rules": [
+                    {"pattern": "убого", "repl": "X", "verbatim": True}
+                ]
+            }
+        )
+
+        self.assertEqual(
+            processor.process_sentence_text("преубогословие"),
+            "преXсловие.",
+        )
+
+    def test_verbatim_regex_replaces_every_match_inside_one_word(self):
+        processor = self.make_context(
+            {
+                "regex_rules": [
+                    {"pattern": "убого", "repl": "X", "verbatim": True}
+                ]
+            }
+        )
+
+        self.assertEqual(
+            processor.process_sentence_text("убогоубого"),
+            "XX.",
+        )
+
+    def test_marker_damage_uses_segment_fallback_without_leaking_marker(self):
+        class MarkerRemovingNormalizer:
+            def normalize(self, text):
+                return "".join(char for char in text if ord(char) < 0xF0000)
+
+        processor = self.make_context(
+            {
+                "terms_ignore_case": {
+                    "точно": {"replacement": "т+о'чно", "verbatim": True}
+                }
+            }
+        )
+        processor._normalizer = MarkerRemovingNormalizer()
+
+        normalized = processor.process_sentence_text("Это точно.")
+
+        self.assertEqual(normalized, "Это т+о'чно.")
+
+    def test_changed_verbatim_source_uses_logged_opaque_fallback(self):
+        class NumberChangingNormalizer:
+            def normalize(self, text):
+                return text.replace("42", "сорок два")
+
+        processor = self.make_context(
+            {
+                "regex_rules": [
+                    {"pattern": "42", "repl": "XLII", "verbatim": True}
+                ]
+            }
+        )
+        processor._normalizer = NumberChangingNormalizer()
+
+        with self.assertLogs(level="WARNING") as captured:
+            normalized = processor.process_sentence_text("Код 42.")
+
+        self.assertEqual(normalized, "Код XLII.")
+        self.assertIn("грамматический контекст", "\n".join(captured.output))
+
+    def test_preview_uses_chunk_pipeline_and_reports_unsupported_text(self):
+        processor = self.make_context()
+
+        result = processor.preview_normalization("Глава 10.\n\n(王)")
+
+        self.assertIn("десятая", result["normalized_text"].lower())
+        self.assertEqual(result["sentence_count"], 1)
+        self.assertEqual(result["skipped"][0]["source"], "(王)")
+
+    def test_preview_file_text_restores_a_real_separator(self):
+        processor = self.make_context()
+
+        result = processor.preview_normalization(
+            "Глава 10.\n***\nПродолжение 20."
+        )
+
+        self.assertIn("[ПАУЗА РАЗДЕЛИТЕЛЯ]", result["normalized_text"])
+        self.assertNotIn(
+            "[ПАУЗА РАЗДЕЛИТЕЛЯ]", result["normalized_text_for_file"]
+        )
+        self.assertIn("☆☆☆", result["normalized_text_for_file"])
+
+    def test_prepared_text_is_literal_and_bypasses_semantic_pipeline(self):
+        processor = self.make_context(
+            glossary={
+                "terms_ignore_case": {"убого": "ИЗМЕНЕНО"},
+                "regex_rules": [{"pattern": "10", "repl": "десять"}],
+            },
+            config={
+                "text_is_prepared": True,
+                "auto_abbreviations": True,
+                "auto_short_words": True,
+            },
+        )
+        processor.apply_regex_rules = mock.Mock(
+            side_effect=AssertionError("RegEx must not run for prepared text")
+        )
+        processor.apply_glossary_segments = mock.Mock(
+            side_effect=AssertionError("glossary must not run for prepared text")
+        )
+        processor._normalizer = mock.Mock()
+        processor._normalizer.normalize.side_effect = AssertionError(
+            "ru-normalizr must not run for prepared text"
+        )
+
+        prepared = processor._prepare_raw_text(
+            "уб+о'го 10", "___SEPARATOR_TOKEN___"
+        )
+        normalized = processor.process_sentence_text(prepared)
+
+        self.assertEqual(normalized, "уб+о'го 10")
+        processor.apply_regex_rules.assert_not_called()
+        processor.apply_glossary_segments.assert_not_called()
+        processor._normalizer.normalize.assert_not_called()
+
+    def test_prepared_text_removes_only_structural_dialogue_prefix(self):
+        processor = self.make_context(config={"text_is_prepared": True})
+
+        self.assertEqual(
+            processor.process_sentence_text("— уб+о'го 10"),
+            "уб+о'го 10",
+        )
+
+    def test_prepared_text_rejects_control_and_private_use_markers(self):
+        processor = self.make_context(config={"text_is_prepared": True})
+
+        for unsafe_text in ("текст\x00", "текст\U000f0000"):
+            with self.subTest(unsafe_text=repr(unsafe_text)):
+                with self.assertRaisesRegex(
+                    ValueError, "служебный или управляющий символ"
+                ):
+                    processor.process_sentence_text(unsafe_text)
+
+    def test_normal_pipeline_still_normalizes_when_text_is_not_prepared(self):
+        processor = self.make_context(config={"text_is_prepared": False})
+
+        self.assertEqual(processor.process_sentence_text("10"), "десять.")
+
+    def test_preview_file_roundtrip_keeps_separator_and_dialogue_pause(self):
+        processor = self.make_context()
+
+        first_pass = processor.preview_normalization(
+            "— Глава 10.\n***\nПродолжение 20."
+        )
+        saved_text = first_pass["normalized_text_for_file"]
+        saved_paragraphs = saved_text.split("\n\n")
+
+        self.assertTrue(saved_paragraphs[0].startswith("— "))
+        self.assertEqual(saved_paragraphs[1], processor.separators[0])
+        self.assertNotIn("[ПАУЗА РАЗДЕЛИТЕЛЯ]", saved_text)
+
+        prepared_processor = self.make_context(
+            config={"text_is_prepared": True}
+        )
+        second_pass = prepared_processor.preview_normalization(saved_text)
+
+        self.assertEqual(second_pass["normalized_text_for_file"], saved_text)
+
+    def test_hash_scan_can_include_exact_prepared_payloads(self):
+        processor = self.make_context(config={"text_is_prepared": False})
+        raw_text = "уб+о'го 10"
+
+        ordinary_hashes = processor.get_all_possible_hashes(raw_text)
+        hashes_with_prepared = processor.get_all_possible_hashes(
+            raw_text, include_prepared=True
+        )
+        exact_hash = studio.cache_content_hash(
+            raw_text, processor.cfg["speaker"]
+        )
+
+        self.assertNotIn(exact_hash, ordinary_hashes)
+        self.assertTrue(ordinary_hashes.issubset(hashes_with_prepared))
+        self.assertIn(exact_hash, hashes_with_prepared)
+
+    def test_scheduling_preview_immediately_invalidates_stale_result(self):
+        app = object.__new__(studio.TTSApp)
+        app.normalizer_source_text = mock.Mock()
+        app.btn_save_normalized_text = mock.Mock()
+        app.root = mock.Mock()
+        app.root.after.return_value = "scheduled-preview"
+        app._normalizer_preview_after_id = None
+        app._normalizer_preview_generation = 7
+        app._normalizer_last_preview_result = {
+            "normalized_text_for_file": "устаревший текст"
+        }
+
+        app._schedule_normalizer_preview(delay_ms=125)
+
+        self.assertIsNone(app._normalizer_last_preview_result)
+        app.btn_save_normalized_text.configure.assert_called_once_with(
+            state=studio.tk.DISABLED
+        )
+        self.assertGreater(app._normalizer_preview_generation, 7)
+        app.root.after.assert_called_once_with(125, app.run_normalizer_preview)
+
+    def test_skipped_preview_requires_confirmation_before_saving(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            destination = Path(tempdir) / "incomplete.txt"
+            app = object.__new__(studio.TTSApp)
+            app.config = {
+                "input_dir": tempdir,
+                "last_normalizer_text_dir": "",
+            }
+            app._normalizer_last_preview_result = {
+                "normalized_text_for_file": "Глава десятая.",
+                "skipped": [{"source": "(王)", "normalized": ""}],
+            }
+            app._ask_yes_no = mock.Mock(return_value=False)
+            app.save_settings = mock.Mock(return_value=True)
+            app._show_info = mock.Mock()
+            app._show_warning = mock.Mock()
+            app._show_error = mock.Mock()
+
+            with mock.patch.object(
+                studio.filedialog,
+                "asksaveasfilename",
+                return_value=str(destination),
+            ) as save_dialog:
+                app.save_normalized_text_to_file()
+
+            app._ask_yes_no.assert_called_once()
+            save_dialog.assert_not_called()
+            self.assertFalse(destination.exists())
+
+    def test_normalized_text_is_saved_atomically_as_utf8(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            destination = Path(tempdir) / "prepared.txt"
+            app = object.__new__(studio.TTSApp)
+            app.config = {
+                "input_dir": tempdir,
+                "last_normalizer_text_dir": "",
+            }
+            app._normalizer_last_preview_result = {
+                "normalized_text_for_file": "Гл+ава десятая.\n\n☆☆☆"
+            }
+            app.save_settings = mock.Mock(return_value=True)
+            app._show_info = mock.Mock()
+            app._show_warning = mock.Mock()
+            app._show_error = mock.Mock()
+
+            with mock.patch.object(
+                studio.filedialog,
+                "asksaveasfilename",
+                return_value=str(destination),
+            ):
+                app.save_normalized_text_to_file()
+
+            self.assertEqual(
+                destination.read_text(encoding="utf-8"),
+                "Гл+ава десятая.\n\n☆☆☆",
+            )
+            self.assertEqual(
+                app.config["last_normalizer_text_dir"], tempdir
+            )
+            app.save_settings.assert_called_once_with()
+            app._show_info.assert_called_once()
+
+    def test_failed_global_profile_write_does_not_change_live_config(self):
+        app = object.__new__(studio.TTSApp)
+        original = {
+            "normalizer_enabled": True,
+            "normalizer_mode": "tts",
+            "normalizer_options": {},
+            "glossary_enabled": True,
+            "auto_abbreviations": True,
+            "auto_short_words": True,
+        }
+        app.config = copy.deepcopy(original)
+        app.settings_vars = {
+            "auto_abbreviations": mock.Mock(),
+            "auto_short_words": mock.Mock(),
+        }
+        app._collect_normalizer_preview_config = mock.Mock(
+            return_value={
+                "normalizer_enabled": False,
+                "normalizer_mode": "safe",
+                "normalizer_options": {},
+                "glossary_enabled": False,
+                "auto_abbreviations": False,
+                "auto_short_words": False,
+            }
+        )
+        app._persist_settings_snapshot = mock.Mock(
+            side_effect=OSError("disk full")
+        )
+        app._show_error = mock.Mock()
+        app._show_info = mock.Mock()
+
+        app.apply_normalizer_preview_globally()
+
+        self.assertEqual(app.config, original)
+        app.settings_vars["auto_abbreviations"].set.assert_not_called()
+        app._show_error.assert_called_once()
+        app._show_info.assert_not_called()
+
+    def test_glossary_edit_invalidates_preview_and_marks_editor_dirty(self):
+        app = object.__new__(studio.TTSApp)
+        app.txt_glossary = mock.Mock()
+        app.txt_glossary.edit_modified.return_value = True
+        app._glossary_ui_loading = False
+        app._glossary_dirty = False
+        app.normalizer_source_text = mock.Mock()
+        app.normalizer_preview_glossary_var = mock.Mock()
+        app.normalizer_preview_glossary_var.get.return_value = True
+        app._schedule_normalizer_preview = mock.Mock()
+
+        app._on_glossary_modified()
+
+        self.assertTrue(app._glossary_dirty)
+        app.txt_glossary.edit_modified.assert_called_with(False)
+        app._schedule_normalizer_preview.assert_called_once_with()
+
+    def test_stale_glossary_editor_cannot_feed_or_overwrite_new_cache(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            app = object.__new__(studio.TTSApp)
+            app.config = {"cache_dir": str(root / "new-cache")}
+            app._glossary_loaded_path = root / "old-cache" / "glossary.json"
+            app.txt_glossary = mock.Mock()
+            app._write_json_atomic = mock.Mock()
+            app._show_error = mock.Mock()
+
+            with self.assertRaisesRegex(ValueError, "папка кэша изменилась"):
+                app._normalizer_glossary_snapshot(True)
+            self.assertFalse(app.save_glossary_ui())
+            app._write_json_atomic.assert_not_called()
+
+    def test_declined_glossary_reload_immediately_invalidates_old_preview(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            app = object.__new__(studio.TTSApp)
+            app.config = {"cache_dir": str(root / "new-cache")}
+            app._glossary_loaded_path = root / "old-cache" / "glossary.json"
+            app._glossary_dirty = True
+            app.txt_glossary = mock.Mock()
+            app.normalizer_source_text = mock.Mock()
+            app.lbl_normalizer_preview_status = mock.Mock()
+            app._ask_yes_no = mock.Mock(return_value=False)
+            app._set_status_label = mock.Mock()
+            app._schedule_normalizer_preview = mock.Mock()
+
+            synced = app._sync_glossary_editor_cache(prompt_if_dirty=True)
+
+            self.assertFalse(synced)
+            app._schedule_normalizer_preview.assert_called_once_with(delay_ms=10)
+
+    def test_synthesis_preflight_saves_dirty_glossary_used_by_preview(self):
+        app = object.__new__(studio.TTSApp)
+        app.config = {"glossary_enabled": True}
+        app.txt_glossary = mock.Mock()
+        app.txt_glossary.edit_modified.return_value = True
+        app._glossary_dirty = True
+        app._sync_glossary_editor_cache = mock.Mock(return_value=True)
+        app._ask_yes_no = mock.Mock(return_value=True)
+        app.save_glossary_ui = mock.Mock(return_value=True)
+
+        self.assertTrue(app._prepare_glossary_for_synthesis())
+
+        app._ask_yes_no.assert_called_once()
+        app.save_glossary_ui.assert_called_once_with(show_popup=False)
+
+    def test_prepared_text_does_not_require_glossary_save(self):
+        app = object.__new__(studio.TTSApp)
+        app.config = {"glossary_enabled": True}
+        app.txt_glossary = mock.Mock()
+        app._sync_glossary_editor_cache = mock.Mock()
+
+        self.assertTrue(
+            app._prepare_glossary_for_synthesis(prepared_text=True)
+        )
+        app._sync_glossary_editor_cache.assert_not_called()
+
+    def test_glossary_reload_path_error_keeps_current_editor_text(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            blocked_cache = Path(tempdir) / "cache-is-a-file"
+            blocked_cache.write_text("not a directory", encoding="utf-8")
+            app = object.__new__(studio.TTSApp)
+            app.config = {"cache_dir": str(blocked_cache)}
+            app.txt_glossary = mock.Mock()
+            app._show_error = mock.Mock()
+
+            self.assertFalse(app.load_glossary_ui())
+
+            app.txt_glossary.delete.assert_not_called()
+            app.txt_glossary.insert.assert_not_called()
+            app._show_error.assert_called_once()
+
+    def test_glossary_ui_recovers_from_structurally_invalid_primary(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            cache_dir = Path(tempdir)
+            primary = cache_dir / "glossary.json"
+            backup = cache_dir / "glossary.json.bak"
+            primary.write_text(
+                json.dumps({"terms_ignore_case": []}), encoding="utf-8"
+            )
+            backup.write_text(
+                json.dumps({"terms_ignore_case": {"API": "эй-пи-ай"}}),
+                encoding="utf-8",
+            )
+            app = object.__new__(studio.TTSApp)
+            app.config = {"cache_dir": str(cache_dir)}
+            app.txt_glossary = mock.Mock()
+            app._write_json_atomic = mock.Mock()
+            app._show_error = mock.Mock()
+
+            self.assertTrue(app.load_glossary_ui())
+
+            loaded = json.loads(app.txt_glossary.insert.call_args.args[1])
+            self.assertEqual(
+                loaded["terms_ignore_case"], {"API": "эй-пи-ай"}
+            )
+            app._write_json_atomic.assert_called_once()
+            app._show_error.assert_not_called()
+
+    def test_all_invalid_glossary_candidates_preserve_editor(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            cache_dir = Path(tempdir)
+            (cache_dir / "glossary.json").write_text("{", encoding="utf-8")
+            (cache_dir / "glossary.json.bak").write_text(
+                json.dumps({"regex_rules": "not-a-list"}), encoding="utf-8"
+            )
+            app = object.__new__(studio.TTSApp)
+            app.config = {"cache_dir": str(cache_dir)}
+            app.txt_glossary = mock.Mock()
+            app._show_error = mock.Mock()
+
+            self.assertFalse(app.load_glossary_ui())
+
+            app.txt_glossary.delete.assert_not_called()
+            app.txt_glossary.insert.assert_not_called()
+            app._show_error.assert_called_once()
+
+    def test_manual_glossary_reload_can_keep_unsaved_editor(self):
+        app = object.__new__(studio.TTSApp)
+        app._glossary_dirty = True
+        app.txt_glossary = mock.Mock()
+        app.txt_glossary.edit_modified.return_value = False
+        app._ask_yes_no = mock.Mock(return_value=False)
+        app.load_glossary_ui = mock.Mock(return_value=True)
+
+        self.assertFalse(app.reload_glossary_ui())
+
+        app.load_glossary_ui.assert_not_called()
+
+    def test_glossary_rule_records_cover_all_sections_and_flags(self):
+        data = {
+            "accents_ignore_case": ["молок+о"],
+            "accents_strict_case": ["Зам+ок"],
+            "terms_ignore_case": {
+                "убого": {
+                    "replacement": "уб+о'го",
+                    "verbatim": True,
+                    "whole_word": True,
+                }
+            },
+            "terms_strict_case": {"API": "эй-пи-ай"},
+            "regex_rules": [
+                {"pattern": r"\bX\b", "repl": "икс", "verbatim": True}
+            ],
+        }
+
+        records = studio.glossary_rule_records(data)
+
+        self.assertEqual(len(records), 5)
+        self.assertEqual(
+            {record["group"] for record in records},
+            {"accents", "terms", "regex"},
+        )
+        verbatim_term = next(
+            record for record in records if record["source"] == "убого"
+        )
+        self.assertEqual(verbatim_term["replacement"], "уб+о'го")
+        self.assertIn("verbatim", verbatim_term["flags"])
+        self.assertIn("убого", verbatim_term["search_text"])
+
+    def test_term_priority_over_shadowed_accent_is_visible_and_logged(self):
+        data = {
+            "accents_ignore_case": ["Sil+ero"],
+            "accents_strict_case": ["уб+ого"],
+            "terms_ignore_case": {"silero": "силеро"},
+            "terms_strict_case": {"убого": "уб+о'го"},
+        }
+
+        conflicts = studio.glossary_shadowed_accent_rules(data)
+        self.assertEqual(len(conflicts), 2)
+        records = studio.glossary_rule_records(data)
+        accent_flags = [
+            record["flags"]
+            for record in records
+            if record["group"] == "accents"
+        ]
+        self.assertTrue(
+            all("приоритет термина" in flags for flags in accent_flags)
+        )
+
+        processor = object.__new__(studio.TTSProcessor)
+        with self.assertLogs(level="WARNING") as captured:
+            processor.load_glossary_data(data)
+        self.assertEqual(processor.glossary_strict_case["убого"], "уб+о'го")
+        self.assertIn("2 правил ударения", "\n".join(captured.output))
+
+    def test_glossary_deletion_is_exact_and_preserves_future_fields(self):
+        data = {
+            "accents_ignore_case": ["дубль", "дубль"],
+            "terms_ignore_case": {"one": "один", "two": "два"},
+            "regex_rules": [
+                {"pattern": "x", "repl": "first"},
+                {"pattern": "x", "repl": "second"},
+            ],
+            "future_metadata": {"owner": "user"},
+        }
+
+        updated, removed = studio.remove_glossary_rules(
+            data,
+            {
+                ("accents_ignore_case", 1),
+                ("terms_ignore_case", "two"),
+                ("regex_rules", 0),
+            },
+        )
+
+        self.assertEqual(removed, 3)
+        self.assertEqual(updated["accents_ignore_case"], ["дубль"])
+        self.assertEqual(updated["terms_ignore_case"], {"one": "один"})
+        self.assertEqual(
+            updated["regex_rules"], [{"pattern": "x", "repl": "second"}]
+        )
+        self.assertEqual(updated["future_metadata"], {"owner": "user"})
+
+        cleared, cleared_count = studio.clear_glossary_rules(data)
+        self.assertEqual(cleared_count, 6)
+        for section, default in studio.GLOSSARY_SECTION_DEFAULTS.items():
+            self.assertEqual(cleared[section], default)
+        self.assertEqual(cleared["future_metadata"], {"owner": "user"})
+
+    def test_programmatic_glossary_replacement_marks_preview_dirty(self):
+        app = object.__new__(studio.TTSApp)
+        app.txt_glossary = mock.Mock()
+        app._glossary_ui_loading = False
+        app._mark_glossary_editor_dirty = mock.Mock()
+
+        app._replace_glossary_editor_data(
+            {"terms_ignore_case": {"test": "т+ест"}}
+        )
+
+        self.assertFalse(app._glossary_ui_loading)
+        app._mark_glossary_editor_dirty.assert_called_once_with()
+        inserted_json = app.txt_glossary.insert.call_args.args[1]
+        self.assertEqual(
+            json.loads(inserted_json)["terms_ignore_case"],
+            {"test": "т+ест"},
+        )
+
+    def test_glossary_merge_keeps_personal_conflicts_by_default(self):
+        current = {
+            "terms_ignore_case": {"Silero": "моё"},
+            "regex_rules": [{"pattern": "x", "repl": "mine"}],
+        }
+        imported = {
+            "terms_ignore_case": {
+                "silero": {"replacement": "общее", "verbatim": True},
+                "убого": {"replacement": "уб+о'го", "verbatim": True},
+            },
+            "regex_rules": [
+                {"pattern": "x", "repl": "central"},
+                {"pattern": "y", "repl": "new"},
+            ],
+        }
+
+        merged, stats = studio.merge_glossary_data(current, imported)
+
+        self.assertEqual(merged["terms_ignore_case"]["Silero"], "моё")
+        self.assertTrue(
+            merged["terms_ignore_case"]["убого"]["verbatim"]
+        )
+        self.assertEqual(merged["regex_rules"][0]["repl"], "mine")
+        self.assertEqual(merged["regex_rules"][1]["pattern"], "y")
+        self.assertEqual(stats["added"], 2)
+        self.assertEqual(stats["kept"], 2)
+
+    def test_glossary_merge_can_explicitly_replace_conflicts(self):
+        merged, stats = studio.merge_glossary_data(
+            {"terms_strict_case": {"API": "старое"}},
+            {"terms_strict_case": {"API": "новое"}},
+            replace_existing=True,
+        )
+
+        self.assertEqual(merged["terms_strict_case"]["API"], "новое")
+        self.assertEqual(stats["replaced"], 1)
+
+    def test_malformed_accent_sections_are_not_split_into_characters(self):
+        merged, _stats = studio.merge_glossary_data(
+            {"accents_ignore_case": "аб"},
+            {"accents_ignore_case": "вг"},
+        )
+
+        self.assertEqual(merged["accents_ignore_case"], [])
+
+    def test_glossary_validation_rejects_wrong_section_type(self):
+        with self.assertRaisesRegex(ValueError, "accents_ignore_case"):
+            studio.canonicalize_glossary_data(
+                {"accents_ignore_case": "не массив"}
+            )
+
+    def test_glossary_validation_rejects_invalid_regex(self):
+        with self.assertRaisesRegex(ValueError, "regex_rules\\[0\\]"):
+            studio.canonicalize_glossary_data(
+                {"regex_rules": [{"pattern": "(", "repl": "x"}]}
+            )
+
+    def test_glossary_validation_preserves_future_root_fields(self):
+        result = studio.canonicalize_glossary_data(
+            {"future_metadata": {"version": 2}}
+        )
+
+        self.assertEqual(result["future_metadata"], {"version": 2})
+        self.assertEqual(result["terms_ignore_case"], {})
+
+
+class AudioProfileV15Tests(unittest.TestCase):
+    def test_profile_roundtrip_contains_format_layout_and_effects(self):
+        profile = studio.make_audio_profile(
+            "Моя речь",
+            output_format="opus",
+            bitrate="32k",
+            sample_rate="48000",
+            channels="mono",
+            effects_enabled=True,
+            speed=1.15,
+            pitch=0.95,
+        )
+
+        self.assertEqual(profile["schema"], studio.AUDIO_PROFILE_SCHEMA)
+        self.assertEqual(profile["audio"]["format"], "opus")
+        self.assertEqual(profile["audio"]["bitrate"], "32k")
+        self.assertTrue(profile["audio"]["effects"]["enabled"])
+        self.assertEqual(
+            studio.normalize_audio_profile(profile),
+            profile,
+        )
+
+    def test_profile_summary_reports_exact_match_and_decodes_parameters(self):
+        profile = studio.make_audio_profile(
+            "Мой Opus",
+            output_format="opus",
+            bitrate="48k",
+            sample_rate="48000",
+            channels="mono",
+        )
+
+        self.assertEqual(
+            studio.matching_audio_profile_name(profile),
+            "Opus · речь 48 кбит/с",
+        )
+        duplicate = dict(profile)
+        duplicate["name"] = "Такие же параметры"
+        self.assertIsNone(
+            studio.matching_audio_profile_name(profile, [duplicate])
+        )
+        description = studio.describe_audio_profile(profile)
+        self.assertIn("Opus (Ogg)", description)
+        self.assertIn("48 кбит/с", description)
+        self.assertIn("48 кГц", description)
+        self.assertIn("эффекты: выкл.", description)
+
+    def test_disabled_effect_values_do_not_break_profile_equivalence(self):
+        saved = studio.make_audio_profile(
+            "Шаблон",
+            bitrate="96k",
+            effects_enabled=False,
+            speed=1.7,
+            pitch=1.2,
+            echo=True,
+        )
+        current = studio.make_audio_profile(
+            "Текущий",
+            bitrate="96k",
+            effects_enabled=False,
+        )
+
+        self.assertEqual(
+            studio.matching_audio_profile_name(current, [saved]),
+            "Шаблон",
+        )
+
+    def test_direct_run_snapshot_keeps_local_effects_out_of_global_config(self):
+        app = object.__new__(studio.TTSApp)
+        app.config = {
+            "fx_speed": 1.0,
+            "fx_pitch": 1.0,
+            "fx_echo": False,
+        }
+        app.dir_speed_var = mock.Mock(get=mock.Mock(return_value=1.25))
+        app.dir_pitch_var = mock.Mock(get=mock.Mock(return_value=0.9))
+        app.dir_echo_var = mock.Mock(get=mock.Mock(return_value=True))
+        app.dir_echo_delay_var = mock.Mock(get=mock.Mock(return_value=250))
+        app.dir_echo_decay_var = mock.Mock(get=mock.Mock(return_value=0.4))
+
+        direct = app._direct_processing_config(
+            prepared_text=True,
+            apply_direct_tags=False,
+            output_dir="direct",
+        )
+
+        self.assertEqual(direct["fx_speed"], 1.25)
+        self.assertEqual(direct["fx_pitch"], 0.9)
+        self.assertTrue(direct["fx_echo"])
+        self.assertEqual(app.config["fx_speed"], 1.0)
+        self.assertFalse(app.config["fx_echo"])
+
+    def test_audio_profile_can_update_target_without_implicit_save(self):
+        app = object.__new__(studio.TTSApp)
+        app.config = {}
+        app.settings_vars = {}
+        for name in (
+            "export_fmt_var",
+            "export_bitrate_var",
+            "export_sample_rate_var",
+            "export_channels_var",
+            "export_apply_fx_var",
+            "exp_speed_var",
+            "exp_pitch_var",
+            "exp_echo_var",
+            "exp_delay_var",
+            "exp_decay_var",
+        ):
+            setattr(app, name, mock.Mock())
+        for name in (
+            "lbl_exp_speed",
+            "lbl_exp_pitch",
+            "lbl_exp_delay",
+            "lbl_exp_decay",
+        ):
+            setattr(app, name, mock.Mock())
+        app._sync_export_mode_controls = mock.Mock()
+        app._refresh_audio_profile_summaries = mock.Mock()
+        app.save_settings = mock.Mock(return_value=True)
+        profile = studio.make_audio_profile(
+            "Тест", output_format="opus", bitrate="48k"
+        )
+
+        app._apply_audio_profile_to_ui(profile, "export", save=False)
+
+        app.save_settings.assert_not_called()
+        app.export_fmt_var.set.assert_called_once_with("opus")
+        app._refresh_audio_profile_summaries.assert_called_once_with()
+
+    def test_audio_profile_manager_stages_list_changes_until_commit(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("    def open_audio_profiles_dialog(")
+        end = source.index("# --- Вкладка \"Кэш\" ---", start)
+        dialog_source = source[start:end]
+        save_start = dialog_source.index("        def stage_current_editor(")
+        delete_start = dialog_source.index("        def delete_custom():")
+        export_start = dialog_source.index("        def staged_initial_dir():")
+        staged_actions = dialog_source[save_start:export_start]
+        add_start = dialog_source.index("        def add_custom():")
+        add_end = dialog_source.index("        ttk.Button(\n            list_actions", add_start)
+        add_block = dialog_source[add_start:add_end]
+
+        self.assertIn("staged_profiles = []", dialog_source)
+        self.assertIn("staged_profiles.append(profile)", staged_actions)
+        self.assertIn("del staged_profiles[index]", staged_actions)
+        self.assertNotIn("staged_profiles.append(draft)", add_block)
+        self.assertNotIn('self.config["audio_profiles"]', staged_actions)
+        self.assertNotIn("self.save_settings()", staged_actions)
+        self.assertLess(save_start, delete_start)
+
+    def test_audio_profile_manager_cancel_and_close_discard_staged_state(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("    def open_audio_profiles_dialog(")
+        end = source.index("# --- Вкладка \"Кэш\" ---", start)
+        dialog_source = source[start:end]
+
+        self.assertIn('text="Отмена"', dialog_source)
+        self.assertIn("command=close_dialog", dialog_source)
+        self.assertIn('dialog.protocol("WM_DELETE_WINDOW", close_dialog)', dialog_source)
+        self.assertIn('dialog.bind("<Escape>"', dialog_source)
+        self.assertIn('parent=dialog', dialog_source)
+
+    def test_audio_profile_manager_keeps_commit_actions_visible_and_transactional(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("    def open_audio_profiles_dialog(")
+        end = source.index("# --- Вкладка \"Кэш\" ---", start)
+        dialog_source = source[start:end]
+        commit_start = dialog_source.index("        def commit_dialog(")
+        commit_end = dialog_source.index("        ttk.Button(\n            apply_buttons", commit_start)
+        commit_block = dialog_source[commit_start:commit_end]
+
+        self.assertIn("footer_hint.grid(row=0", dialog_source)
+        self.assertIn("apply_buttons.grid(\n            row=1", dialog_source)
+        self.assertIn("close_buttons.grid(\n            row=2", dialog_source)
+        self.assertIn('footer.bind("<Configure>"', dialog_source)
+        self.assertIn('text="➕ Добавить"', dialog_source)
+        self.assertIn('text="🗑 Удалить"', dialog_source)
+        self.assertIn('text="Сохранить и закрыть"', dialog_source)
+        self.assertNotIn('text="ОК"', dialog_source)
+        self.assertNotIn("нажмите ОК", dialog_source)
+        self.assertIn('candidate_config["audio_profiles"] = copy.deepcopy(staged_profiles)', commit_block)
+        self.assertIn("stage_current_editor(refresh=False)", commit_block)
+        self.assertIn("self._persist_settings_snapshot(candidate_config)", commit_block)
+        self.assertNotIn("self.save_settings()", commit_block)
+        self.assertNotIn("self.set_ui_from_config()", commit_block)
+
+    def test_profile_targets_are_independent(self):
+        profile = studio.make_audio_profile(
+            "Opus",
+            output_format="opus",
+            bitrate="48k",
+            sample_rate="24000",
+            channels="stereo",
+        )
+
+        book = studio.audio_profile_config_values(profile, "book")
+        export = studio.audio_profile_config_values(profile, "export")
+
+        self.assertEqual(book["output_format"], "opus")
+        self.assertNotIn("export_format", book)
+        self.assertEqual(export["export_format"], "opus")
+        self.assertNotIn("output_format", export)
+
+    def test_disabled_profile_effects_produce_clean_book_and_export(self):
+        profile = studio.make_audio_profile(
+            "Без эффектов",
+            effects_enabled=False,
+            speed=1.3,
+            pitch=1.2,
+            echo=True,
+        )
+
+        book = studio.audio_profile_config_values(profile, "book")
+        export = studio.audio_profile_config_values(profile, "export")
+
+        self.assertEqual(book["fx_speed"], 1.0)
+        self.assertEqual(book["fx_pitch"], 1.0)
+        self.assertFalse(book["fx_echo"])
+        self.assertFalse(export["export_apply_fx"])
+
+    def test_old_config_migrates_shared_format_once(self):
+        migrated = studio.normalize_config({"output_format": "opus"})
+        separated = studio.normalize_config(
+            {"output_format": "mp3", "export_format": "ogg"}
+        )
+
+        self.assertEqual(migrated["export_format"], "opus")
+        self.assertEqual(separated["output_format"], "mp3")
+        self.assertEqual(separated["export_format"], "ogg")
+
+    def test_invalid_custom_profile_is_skipped_during_config_recovery(self):
+        config = studio.normalize_config(
+            {
+                "audio_profiles": [
+                    {"name": "broken", "audio": {"sample_rate": "12345"}},
+                    studio.make_audio_profile("valid"),
+                ]
+            }
+        )
+
+        self.assertEqual([item["name"] for item in config["audio_profiles"]], ["valid"])
+
+    def test_book_auto_profile_resolves_to_canonical_cache_layout(self):
+        profile = studio._select_book_audio_profile(
+            "opus",
+            sample_rate="auto",
+            channels="auto",
+            bitrate="48k",
+        )
+
+        self.assertEqual(profile["sample_rate"], 48000)
+        self.assertEqual(profile["channels"], 1)
+
+    def test_book_profile_rejects_unsupported_explicit_mp3_rate(self):
+        with self.assertRaisesRegex(ValueError, "MP3"):
+            studio._select_book_audio_profile(
+                "mp3",
+                sample_rate="96000",
+                channels="stereo",
+                bitrate="128k",
+            )
+
+    def test_profile_rejects_empty_name_and_non_finite_effect(self):
+        with self.assertRaisesRegex(ValueError, "имя"):
+            studio.normalize_audio_profile({"name": "", "audio": {}})
+        with self.assertRaisesRegex(ValueError, "скорость"):
+            studio.make_audio_profile("NaN", speed=float("nan"))
+        with self.assertRaisesRegex(ValueError, "schema"):
+            studio.normalize_audio_profile(
+                {"name": "Нет конверта", "audio": {}},
+                require_envelope=True,
+            )
+        envelope_without_audio = {
+            "schema": studio.AUDIO_PROFILE_SCHEMA,
+            "version": studio.AUDIO_PROFILE_VERSION,
+            "name": "Нет audio",
+        }
+        with self.assertRaisesRegex(ValueError, "audio"):
+            studio.normalize_audio_profile(
+                envelope_without_audio, require_envelope=True
+            )
+        invalid_version = studio.make_audio_profile("Версия")
+        invalid_version["version"] = True
+        with self.assertRaisesRegex(ValueError, "версия"):
+            studio.normalize_audio_profile(
+                invalid_version, require_envelope=True
+            )
+        with self.assertRaisesRegex(ValueError, "8–320"):
+            studio.make_audio_profile(
+                "Слишком большой MP3",
+                output_format="mp3",
+                bitrate="999999k",
+            )
+
+    def test_wav_and_ogg_auto_keep_codec_specific_book_policy(self):
+        wav = studio.audio_profile_config_values(
+            studio.make_audio_profile("WAV", output_format="wav"),
+            "book",
+        )
+        ogg = studio._select_book_audio_profile(
+            "ogg",
+            sample_rate="auto",
+            channels="auto",
+            bitrate="auto",
+        )
+
+        self.assertEqual(wav["output_bitrate"], "auto")
+        self.assertIsNone(ogg["bitrate"])
+
+    def test_profile_names_are_unique_across_builtin_and_custom(self):
+        custom = [studio.make_audio_profile("Личный")]
+
+        self.assertTrue(
+            studio.audio_profile_name_conflict("личный", custom)
+        )
+        self.assertTrue(
+            studio.audio_profile_name_conflict("WAV · без потерь", custom)
+        )
+        self.assertEqual(
+            studio.unique_audio_profile_name("Личный", custom),
+            "Личный (2)",
+        )
+
+    def test_book_profile_preflight_reports_error_before_processing(self):
+        app = object.__new__(studio.TTSApp)
+        app.config = {
+            "output_format": "mp3",
+            "output_bitrate": "128k",
+            "output_sample_rate": "96000",
+            "output_channels": "stereo",
+        }
+        app._show_error = mock.Mock()
+
+        self.assertFalse(app._validate_book_output_profile())
+        app._show_error.assert_called_once()
+
+
 class AtomicWriteTests(unittest.TestCase):
     def test_json_backup_is_previous_complete_document(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1743,6 +3358,19 @@ class AtomicWriteTests(unittest.TestCase):
                 json.loads(path.with_suffix(".json.bak").read_text(encoding="utf-8")),
                 {"version": 1},
             )
+
+    def test_corrupt_primary_never_replaces_valid_json_backup(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "settings.json"
+            backup = path.with_suffix(".json.bak")
+            path.write_text("{broken", encoding="utf-8")
+            backup.write_text('{"version": 1}', encoding="utf-8")
+            app = object.__new__(studio.TTSApp)
+
+            app._write_json_atomic(path, {"version": 2}, backup=True)
+
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"version": 2})
+            self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), {"version": 1})
 
     def test_dry_run_returns_hashes_without_mutating_cache_setting(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1779,6 +3407,26 @@ class AtomicWriteTests(unittest.TestCase):
         app.batch_processor._save_processing_statuses.assert_called_once_with()
         app.save_settings.assert_called_once_with()
         app.root.destroy.assert_called_once_with()
+
+    def test_closing_can_be_cancelled_for_unsaved_glossary(self):
+        app = object.__new__(studio.TTSApp)
+        app._is_closing = False
+        app.is_cache_operation_running = mock.Mock(return_value=False)
+        app._import_running = False
+        app._export_lock = False
+        app._export_running = False
+        app._glossary_dirty = True
+        app.txt_glossary = mock.Mock()
+        app.txt_glossary.edit_modified.return_value = True
+        app._ask_yes_no_cancel = mock.Mock(return_value=None)
+        app.save_glossary_ui = mock.Mock(return_value=True)
+        app.root = mock.Mock()
+
+        app.on_closing()
+
+        self.assertFalse(app._is_closing)
+        app.save_glossary_ui.assert_not_called()
+        app.root.destroy.assert_not_called()
 
     def test_resume_statuses_are_saved_and_empty_state_removes_file(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -1936,6 +3584,8 @@ class AppClickFocusTests(unittest.TestCase):
         app = object.__new__(studio.TTSApp)
         app.root = mock.Mock()
         app.root.focus_get.return_value = current_focus
+        app.root.winfo_exists.return_value = True
+        app.root.state.return_value = "normal"
         app._is_closing = False
         return app
 
@@ -1943,21 +3593,60 @@ class AppClickFocusTests(unittest.TestCase):
         app = self.make_app()
         widget = mock.Mock()
         widget.winfo_toplevel.return_value = app.root
+        widget.winfo_exists.return_value = True
 
         app._restore_focus_on_app_click(mock.Mock(widget=widget))
+        restore_focus = app.root.after_idle.call_args.args[0]
+        restore_focus()
 
         widget.focus_set.assert_called_once_with()
         app.root.focus_force.assert_not_called()
 
-    def test_click_preserves_existing_widget_focus(self):
+    def test_click_reasserts_existing_widget_focus_without_redirecting_it(self):
         focused = mock.Mock()
         app = self.make_app(focused)
+        focused.winfo_toplevel.return_value = app.root
+        focused.winfo_exists.return_value = True
         widget = mock.Mock()
         widget.winfo_toplevel.return_value = app.root
 
         app._restore_focus_on_app_click(mock.Mock(widget=widget))
+        restore_focus = app.root.after_idle.call_args.args[0]
+        restore_focus()
 
+        focused.focus_set.assert_called_once_with()
         widget.focus_set.assert_not_called()
+        app.root.focus_force.assert_not_called()
+
+    def test_macos_click_refreshes_inactive_native_controls(self):
+        app = self.make_app()
+        app._schedule_mac_restore_refresh = mock.Mock()
+        widget = mock.Mock()
+        widget.winfo_toplevel.return_value = app.root
+        widget.winfo_exists.return_value = True
+
+        with mock.patch.object(studio.sys, "platform", "darwin"):
+            app._restore_focus_on_app_click(mock.Mock(widget=widget))
+            app.root.after_idle.call_args.args[0]()
+
+        widget.focus_set.assert_called_once_with()
+        app._schedule_mac_restore_refresh.assert_called_once_with()
+        app.root.focus_force.assert_not_called()
+
+    def test_macos_active_click_does_not_reload_theme_again(self):
+        app = self.make_app()
+        app._mac_window_active = True
+        app._schedule_mac_restore_refresh = mock.Mock()
+        widget = mock.Mock()
+        widget.winfo_toplevel.return_value = app.root
+        widget.winfo_exists.return_value = True
+
+        with mock.patch.object(studio.sys, "platform", "darwin"):
+            app._restore_focus_on_app_click(mock.Mock(widget=widget))
+            app.root.after_idle.call_args.args[0]()
+
+        widget.focus_set.assert_called_once_with()
+        app._schedule_mac_restore_refresh.assert_not_called()
 
     def test_click_in_child_toplevel_is_not_redirected_to_root(self):
         app = self.make_app()
@@ -1967,6 +3656,7 @@ class AppClickFocusTests(unittest.TestCase):
         app._restore_focus_on_app_click(mock.Mock(widget=widget))
 
         widget.focus_set.assert_not_called()
+        app.root.after_idle.assert_not_called()
 
 
 class MessageboxFocusTests(unittest.TestCase):
@@ -2036,14 +3726,44 @@ class MacAquaRestoreTests(unittest.TestCase):
 
     def test_setup_observes_map_and_aqua_activation(self):
         app = self.make_app()
-        app.root.bind.side_effect = ("initial-map", "restore-map", "activate")
+        app.root.bind.side_effect = (
+            "initial-map",
+            "restore-map",
+            "activate",
+            "deactivate",
+        )
 
         with mock.patch.object(studio.sys, "platform", "darwin"):
             app._setup_mac_startup_focus()
 
         sequences = [call.args[0] for call in app.root.bind.call_args_list]
-        self.assertEqual(sequences, ["<Map>", "<Map>", "<Activate>"])
+        self.assertEqual(
+            sequences, ["<Map>", "<Map>", "<Activate>", "<Deactivate>"]
+        )
         self.assertEqual(app._mac_restore_activate_bind_id, "activate")
+        self.assertEqual(app._mac_restore_deactivate_bind_id, "deactivate")
+
+    def test_deactivate_marks_native_window_inactive_without_forcing_focus(self):
+        app = self.make_app()
+        app._mac_window_active = True
+
+        app._on_mac_restore_deactivate(mock.Mock(widget=app.root))
+
+        self.assertFalse(app._mac_window_active)
+        app.root.focus_force.assert_not_called()
+
+    def test_startup_activation_also_refreshes_native_progressbars(self):
+        app = self.make_app()
+        app._mac_startup_focus_done = False
+        app._mac_startup_focus_after_id = "startup-after"
+        app._mac_startup_map_bind_id = None
+        app._force_mac_focus = mock.Mock()
+        app._schedule_mac_restore_refresh = mock.Mock()
+
+        app._run_mac_startup_focus()
+
+        app._force_mac_focus.assert_called_once_with()
+        app._schedule_mac_restore_refresh.assert_called_once_with()
 
     def test_map_and_activate_share_one_debounced_refresh(self):
         app = self.make_app()
@@ -2103,90 +3823,92 @@ class MacAquaRestoreTests(unittest.TestCase):
         )
 
 
-class CanvasThemeTests(unittest.TestCase):
-    @mock.patch.object(studio.ttk, "Style")
-    def test_export_canvas_uses_current_ttk_frame_background(self, style_class):
-        app = studio.TTSApp.__new__(studio.TTSApp)
-        app.root = mock.Mock()
-        app.grp_basic_canvas = mock.Mock()
-        style_class.return_value.lookup.return_value = "system-background"
-
-        app._sync_export_basic_canvas_theme()
-
-        style_class.assert_called_once_with(app.root)
-        style_class.return_value.lookup.assert_called_once_with(
-            "TFrame", "background"
-        )
-        app.grp_basic_canvas.configure.assert_called_once_with(
-            background="system-background"
-        )
-
-
 class ExportLayoutContractTests(unittest.TestCase):
-    def test_basic_settings_wheel_binding_reaches_nested_controls(self):
-        app = studio.TTSApp.__new__(studio.TTSApp)
-        app._scroll_export_basic_settings = mock.Mock()
-        child = mock.Mock()
-        child.winfo_children.return_value = []
-        parent = mock.Mock()
-        parent.winfo_children.return_value = [child]
+    def test_export_selection_is_reloaded_after_import_or_build_unlocks(self):
+        for method_name in ("_set_export_ui_state", "_set_export_running_state"):
+            with self.subTest(method=method_name):
+                app = object.__new__(studio.TTSApp)
+                app._export_lock = False
+                app._export_running = method_name == "_set_export_running_state"
+                app.export_mid_frame = mock.Mock()
+                app.export_frame = mock.Mock()
+                app.group_settings_frame = mock.Mock()
+                app.export_tree = mock.Mock()
+                app.export_tree.selection.return_value = ("group-1",)
+                app.btn_export_start = mock.Mock()
+                app.btn_export_stop = mock.Mock()
+                app._set_descendant_state = mock.Mock()
+                app._sync_export_mode_controls = mock.Mock()
+                app.on_export_tree_select = mock.Mock()
+                app._disable_export_settings = mock.Mock()
 
-        studio.TTSApp._bind_export_basic_scroll_events(app, parent)
+                if method_name == "_set_export_ui_state":
+                    app._set_export_ui_state(studio.tk.NORMAL)
+                else:
+                    app._set_export_running_state(False)
 
-        self.assertEqual(parent.bind.call_count, 3)
-        self.assertEqual(child.bind.call_count, 3)
-        parent.bind.assert_any_call(
-            "<MouseWheel>", app._scroll_export_basic_settings, add="+"
+                app.on_export_tree_select.assert_called_once_with(None)
+                app._disable_export_settings.assert_not_called()
+
+    def test_locked_export_tree_ignores_macos_selection_fallbacks(self):
+        app = object.__new__(studio.TTSApp)
+        app._export_lock = True
+        app._export_running = False
+        app.export_tree = mock.Mock()
+        event = mock.Mock(widget=app.export_tree, x=10, y=10)
+
+        self.assertEqual(
+            app._mac_multiselect(event, app.export_tree),
+            "break",
         )
-
-    def test_basic_settings_mouse_wheel_scrolls_in_both_directions(self):
-        app = studio.TTSApp.__new__(studio.TTSApp)
-        app.grp_basic_canvas = mock.Mock()
-        app._grp_basic_scrollbar_visible = True
-        scroll = studio.TTSApp._scroll_export_basic_settings.__get__(
-            app, studio.TTSApp
+        self.assertEqual(
+            app._mac_tree_button_press(event, app.export_tree),
+            "break",
         )
+        self.assertEqual(app._tree_select_all(event), "break")
+        app._mac_ensure_tree_plain_click(app.export_tree, "file-1")
 
-        self.assertEqual(scroll(mock.Mock(num=None, delta=120)), "break")
-        app.grp_basic_canvas.yview_scroll.assert_called_once_with(-1, "units")
+        app.export_tree.focus_set.assert_not_called()
+        app.export_tree.selection_set.assert_not_called()
+        app.export_tree.after_idle.assert_not_called()
 
-        app.grp_basic_canvas.yview_scroll.reset_mock()
-        self.assertEqual(scroll(mock.Mock(num=5, delta=0)), "break")
-        app.grp_basic_canvas.yview_scroll.assert_called_once_with(1, "units")
+    def test_export_selection_update_flag_is_released_on_widget_error(self):
+        app = object.__new__(studio.TTSApp)
+        app._export_lock = False
+        app._export_running = False
+        app.export_tree = mock.Mock()
+        app.export_tree.selection.return_value = ("file-1",)
+        app.export_groups = {}
+        app.export_files = {"file-1": {"title": "Глава"}}
+        app.grp_name_var = mock.Mock()
+        app.grp_name_var.set.side_effect = RuntimeError("widget destroyed")
+        app._enable_export_settings = mock.Mock()
+        app._disable_export_settings = mock.Mock()
 
-    def test_basic_settings_wheel_is_left_for_parent_without_overflow(self):
-        app = studio.TTSApp.__new__(studio.TTSApp)
-        app.grp_basic_canvas = mock.Mock()
-        app._grp_basic_scrollbar_visible = False
+        with self.assertRaisesRegex(RuntimeError, "widget destroyed"):
+            app.on_export_tree_select(None)
 
-        result = app._scroll_export_basic_settings(
-            mock.Mock(num=None, delta=120)
+        self.assertFalse(app._is_updating_ui)
+
+    def test_basic_settings_use_compact_ttk_grid_without_plain_canvas(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("    def setup_utils_tab(self):")
+        end = source.index("    def _sync_export_mode_controls(self):", start)
+        setup_source = source[start:end]
+        basic_start = setup_source.index("self.grp_tab_basic = ttk.Frame(")
+        tags_start = setup_source.index("# -- Вкладка: Теги --")
+        basic_block = setup_source[basic_start:tags_start]
+
+        self.assertNotIn("tk.Canvas", basic_block)
+        self.assertNotIn("Scrollbar", basic_block)
+        self.assertIn("self.grp_basic_content.columnconfigure(1, weight=1)", basic_block)
+        self.assertIn("self.lbl_grp_name.grid(row=0", basic_block)
+        self.assertIn("flags_row = ttk.Frame(self.grp_basic_content)", basic_block)
+        self.assertIn("self.chk_merge.pack(side=tk.LEFT)", basic_block)
+        self.assertIn(
+            "self.chk_subfolder.pack(side=tk.LEFT, padx=(6, 0))", basic_block
         )
-
-        self.assertIsNone(result)
-        app.grp_basic_canvas.yview_scroll.assert_not_called()
-
-    def test_basic_settings_scrollbar_is_visible_only_during_overflow(self):
-        app = studio.TTSApp.__new__(studio.TTSApp)
-        app.grp_basic_canvas = mock.Mock()
-        app.grp_basic_scrollbar = mock.Mock()
-        app._grp_basic_scrollbar_visible = False
-
-        app._set_export_basic_scrollbar("0.0", "0.75")
-
-        app.grp_basic_scrollbar.set.assert_called_with("0.0", "0.75")
-        app.grp_basic_scrollbar.pack.assert_called_once_with(
-            side=studio.tk.RIGHT,
-            fill=studio.tk.Y,
-            before=app.grp_basic_canvas,
-        )
-        self.assertTrue(app._grp_basic_scrollbar_visible)
-
-        app._set_export_basic_scrollbar("0.0", "1.0")
-
-        app.grp_basic_scrollbar.pack_forget.assert_called_once_with()
-        app.grp_basic_canvas.yview_moveto.assert_called_once_with(0)
-        self.assertFalse(app._grp_basic_scrollbar_visible)
+        self.assertIn("self.btn_mass_apply_basic.grid(", basic_block)
 
     def test_format_stays_compact_and_actions_use_separate_row(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
@@ -2203,9 +3925,22 @@ class ExportLayoutContractTests(unittest.TestCase):
         self.assertIn("width=5", format_block)
 
         effects_row = setup_source.index("row3 = ttk.Frame(export_frame)")
+        summary_row = setup_source.index(
+            "profile_summary_row = ttk.Frame(export_frame)"
+        )
         actions_row = setup_source.index("row4 = ttk.Frame(export_frame)")
         middle_panel = setup_source.index("self.export_mid_frame = ttk.Frame(frame)")
-        self.assertLess(effects_row, actions_row)
+        profile_button = setup_source.index(
+            "self.btn_audio_profiles_export = ttk.Button("
+        )
+        effects_checkbox = setup_source.index(
+            "self.chk_export_fx = ttk.Checkbutton("
+        )
+        self.assertLess(profile_button, effects_row)
+        self.assertGreater(effects_checkbox, effects_row)
+        self.assertLess(effects_checkbox, summary_row)
+        self.assertLess(effects_row, summary_row)
+        self.assertLess(summary_row, actions_row)
         self.assertLess(actions_row, middle_panel)
 
         actions_block = setup_source[actions_row:middle_panel]
@@ -2237,38 +3972,97 @@ class ExportLayoutContractTests(unittest.TestCase):
             "self.btn_export_stop = ttk.Button(\n            export_actions,",
             actions_block,
         )
+        self.assertNotIn("self.btn_audio_profiles_export", actions_block)
+        summary_block = setup_source[summary_row:actions_row]
+        self.assertIn("self.lbl_export_audio_profile_summary", summary_block)
+        self.assertNotIn("self.btn_export_start", summary_block)
+        self.assertIn('profile_summary_row.bind("<Configure>"', summary_block)
+        self.assertIn("wraplength=max(320, event.width - 10)", summary_block)
+
+        self.assertIn("self.root.minsize(", source)
+        status_start = setup_source.index("self.lbl_export_status = ttk.Label(")
+        status_end = setup_source.index(
+            "self._status_label_kinds[self.lbl_export_status]", status_start
+        )
+        status_block = setup_source[status_start:status_end]
+        self.assertNotIn("width=", status_block)
+        self.assertIn(
+            "self.export_progress.pack(side=tk.RIGHT, fill=tk.X, expand=True",
+            setup_source,
+        )
+
+    def test_normalizer_actions_are_reserved_below_the_editors(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("    def setup_normalizer_tab(self):")
+        end = source.index("    def _open_normalizer_tab_from_settings", start)
+        setup_source = source[start:end]
+
+        controls_pack = setup_source.index(
+            "preview_controls.pack(side=tk.BOTTOM, fill=tk.X"
+        )
+        editor_pack = setup_source.index(
+            "editor_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True)"
+        )
+        self.assertLess(controls_pack, editor_pack)
+        self.assertIn('text="💾 Сохранить TXT…"', setup_source)
+        self.assertIn("self.lbl_normalizer_scope_status", setup_source)
+        self.assertIn("ttk.Frame(main_pane, width=440)", setup_source)
+        self.assertIn("main_pane.add(text_pane, weight=2)", setup_source)
+        self.assertIn("main_pane.add(settings_pane, weight=3)", setup_source)
+        self.assertEqual(setup_source.count("\n            width=44,\n"), 2)
+        self.assertIn("self.normalizer_font_combobox", setup_source)
+        self.assertIn("textvariable=self.font_size_var", setup_source)
+        self.assertIn("self.root.after(10, self.update_fonts)", setup_source)
+
+    def test_settings_explain_global_normalizer_and_profile_copy_semantics(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("    def setup_settings_tab(self):")
+        end = source.index("    # --- Вкладка \"Глоссарий\" ---", start)
+        settings_source = source[start:end]
+
+        self.assertIn('text="Нормализация"', settings_source)
+        self.assertIn("Сохранено глобально", settings_source)
+        self.assertIn("Применить глобально", settings_source)
+        self.assertIn("Профиль копирует параметры", settings_source)
+        self.assertIn("связанным с полями", settings_source)
+        self.assertIn("У вкладки «Экспорт и сборка» свои эффекты", settings_source)
 
     def test_output_settings_offer_32k_bitrate(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
-        start = source.index("        # 6. Вывод и Теги")
+        start = source.index("        # 7. Вывод и Теги")
         end = source.index("    # --- Вкладка \"Глоссарий\" ---", start)
         output_settings = source[start:end]
         self.assertIn(
-            '["32k", "48k", "64k", "128k", "192k", "256k", "320k"]',
+            '["auto", "32k", "48k", "64k", "96k", "128k", "192k", "256k", "320k"]',
             output_settings,
         )
 
-    def test_basic_group_settings_are_vertically_scrollable(self):
+    def test_basic_group_settings_stay_compact_without_canvas_artifacts(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
         start = source.index("    def setup_utils_tab(self):")
         end = source.index("    def _sync_export_mode_controls(self):", start)
         setup_source = source[start:end]
 
-        canvas_start = setup_source.index("self.grp_basic_canvas = tk.Canvas(")
+        basic_start = setup_source.index("self.grp_basic_content = ttk.Frame(")
         tags_start = setup_source.index("# -- Вкладка: Теги --")
-        basic_block = setup_source[canvas_start:tags_start]
+        basic_block = setup_source[basic_start:tags_start]
+        self.assertNotIn("Canvas", basic_block)
+        self.assertNotIn("Scrollbar", basic_block)
+        self.assertIn("self.grp_basic_content.pack(fill=tk.BOTH, expand=True)", basic_block)
+        self.assertIn("flags_row = ttk.Frame(self.grp_basic_content)", basic_block)
         self.assertIn(
-            "self.grp_basic_scrollbar = ttk.Scrollbar(", basic_block
+            "row=1, column=0, columnspan=4, sticky=tk.W", basic_block
         )
-        self.assertIn("command=self.grp_basic_canvas.yview", basic_block)
-        self.assertIn("yscrollcommand=self._set_export_basic_scrollbar", basic_block)
-        self.assertNotIn("self.grp_basic_scrollbar.pack(", basic_block)
-        self.assertIn("background=canvas_background", basic_block)
-        self.assertIn("self._update_export_basic_scroll_region", basic_block)
-        self.assertIn("self._bind_export_basic_scroll_events(", basic_block)
+        self.assertIn("self.chk_merge.pack(side=tk.LEFT)", basic_block)
+        self.assertIn(
+            "self.chk_subfolder.pack(side=tk.LEFT, padx=(6, 0))", basic_block
+        )
         self.assertIn(
             "self.btn_mass_apply_basic = ttk.Button(self.grp_basic_content,",
             basic_block,
+        )
+        self.assertIn(
+            "row=4, column=0, columnspan=4, sticky=tk.W", basic_block
         )
 
         disable_start = source.index("    def _disable_export_settings(self):")
@@ -2280,6 +4074,124 @@ class ExportLayoutContractTests(unittest.TestCase):
             ),
             2,
         )
+
+    def test_export_and_glossary_bulk_actions_are_visible_and_transactional(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        export_start = source.index("    def setup_utils_tab(self):")
+        export_end = source.index(
+            "    def _sync_export_mode_controls(self):", export_start
+        )
+        export_setup = source[export_start:export_end]
+        self.assertIn('text="🔗 Объединить"', export_setup)
+        self.assertIn('text="🧹 Очистить всё"', export_setup)
+        self.assertIn("command=self.merge_selected_export_items", export_setup)
+        self.assertIn("command=self.clear_export_project", export_setup)
+
+        glossary_start = source.index("    def setup_glossary_tab(self):")
+        glossary_end = source.index("    def toggle_glos_fields(self):", glossary_start)
+        glossary_setup = source[glossary_start:glossary_end]
+        self.assertIn('text="🗑 Удалить правила…"', glossary_setup)
+        self.assertIn("command=self.open_glossary_delete_dialog", glossary_setup)
+
+        manager_start = source.index("    def open_glossary_delete_dialog(self):")
+        manager_end = source.index(
+            '    # --- Вкладка "Нормализатор"', manager_start
+        )
+        manager = source[manager_start:manager_end]
+        self.assertIn("notebook = ttk.Notebook(dialog)", manager)
+        self.assertIn('search_var = tk.StringVar()', manager)
+        self.assertIn('text="Выбрать результаты поиска"', manager)
+        self.assertIn('text="Выбрать все в разделе"', manager)
+        self.assertIn('text="Снять всё в разделе"', manager)
+        self.assertIn("показано в разделе", manager)
+        self.assertIn('"<<NotebookTabChanged>>"', manager)
+        self.assertIn('text="🔥 Очистить весь глоссарий…"', manager)
+        self.assertIn("self._replace_glossary_editor_data(updated)", manager)
+
+    def test_export_activity_status_is_compact_and_keeps_both_name_ends(self):
+        short = studio.format_export_activity_status(
+            "Экспорт", "Глава 01.opus"
+        )
+        self.assertEqual(short, "Экспорт: Глава 01.opus")
+
+        long_name = "Очень длинное начало " + "фрагмент " * 20 + "том 99.opus"
+        compact = studio.format_export_activity_status(
+            "Экспорт", long_name, max_subject_chars=40
+        )
+        subject = compact.removeprefix("Экспорт: ")
+        self.assertEqual(len(subject), 40)
+        self.assertTrue(subject.startswith("Очень длинное начало"))
+        self.assertTrue(subject.endswith("том 99.opus"))
+        self.assertIn("…", subject)
+
+        normalized = studio.middle_ellipsize("  Глава\n\t01\x00.opus  ", 40)
+        self.assertEqual(normalized, "Глава 01.opus")
+
+        wide_measure = lambda value: sum(
+            2 if ord(character) > 127 else 1 for character in value
+        )
+        fitted = studio.middle_ellipsize_to_width(
+            "Начало очень длинного имени 章节 99.opus",
+            24,
+            wide_measure,
+        )
+        self.assertLessEqual(wide_measure(fitted), 24)
+        self.assertTrue(fitted.startswith("Начало"))
+        self.assertTrue(fitted.endswith("99.opus"))
+
+    def test_export_activity_restores_full_name_after_resize(self):
+        app = object.__new__(studio.TTSApp)
+        app.root = mock.Mock()
+        app.lbl_export_status = mock.Mock()
+        app.lbl_export_status.master.winfo_width.return_value = 360
+        app.lbl_export_status.cget.return_value = "TkDefaultFont"
+        app._set_status_label = mock.Mock()
+        fake_font = mock.Mock()
+        fake_font.measure.side_effect = lambda value: len(value) * 10
+        full_name = "Начало " + "очень-длинное-имя-" * 8 + "том-99.opus"
+
+        with mock.patch.object(
+            studio.tkfont, "nametofont", return_value=fake_font
+        ):
+            app._set_export_activity_status("Экспорт", full_name)
+            compact = app._set_status_label.call_args.args[1]
+            self.assertIn("…", compact)
+
+            app.lbl_export_status.master.winfo_width.return_value = 4000
+            app._render_export_activity_status()
+            expanded = app._set_status_label.call_args.args[1]
+
+        self.assertEqual(expanded, f"Экспорт: {full_name}")
+        app._set_export_status("Готово!", "success")
+        self.assertIsNone(app._export_status_activity)
+
+        wide = studio.middle_ellipsize_to_width("Глава 01.opus", 50, len)
+        self.assertEqual(wide, "Глава 01.opus")
+        fitted = studio.middle_ellipsize_to_width(
+            "Очень длинное начало и окончание.opus", 18, len
+        )
+        self.assertLessEqual(len(fitted), 18)
+        self.assertIn("…", fitted)
+        self.assertTrue(fitted.startswith("Очень"))
+        self.assertTrue(fitted.endswith("opus"))
+
+    def test_export_worker_uses_short_activity_labels(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        start = source.index("    def start_export_process(self):")
+        end = source.index("    def add_separator_row", start)
+        worker = source[start:end]
+
+        self.assertIn(
+            'self._post_export_activity_status(\n                                    "Склейка"',
+            worker,
+        )
+        self.assertIn(
+            'self._post_export_activity_status(\n                                        "Экспорт"',
+            worker,
+        )
+        self.assertIn('f_set["title"]', worker)
+        self.assertNotIn("Потоковая склейка, эффекты и сохранение", worker)
+        self.assertNotIn("Конвертация:", worker)
 
     def test_stopped_export_resets_status_and_progress_after_worker_finishes(self):
         app = studio.TTSApp.__new__(studio.TTSApp)
@@ -2346,7 +4258,8 @@ class BuildWorkflowContractTests(unittest.TestCase):
         self.assertIn('MACOS_PYTHON_VERSION=$installed_python_version', workflow)
         self.assertIn('"$py" -m venv .venv', workflow)
         self.assertIn("actual_python[:2] != expected_series", workflow)
-        self.assertIn("platform.machine() != expected_arch", workflow)
+        self.assertIn("actual_arch != expected_arch", workflow)
+        self.assertIn('EXPECTED_TARGET_ARCH: ${{ matrix.target_arch }}', workflow)
         self.assertIn("tkinter.TclVersion != 9.0", workflow)
         self.assertIn("tkinter.TkVersion != 9.0", workflow)
 
@@ -2384,7 +4297,7 @@ class BuildWorkflowContractTests(unittest.TestCase):
         source = MODULE_PATH.read_text(encoding="utf-8")
         help_start = source.index('help_text = r"""')
         help_end = source.index(
-            '"""\n\n        self.help_text_widget.insert', help_start
+            '        help_text = help_text.replace', help_start
         )
         help_text = source[help_start:help_end]
 
@@ -2404,17 +4317,195 @@ class BuildWorkflowContractTests(unittest.TestCase):
             self.assertIn("METADATA_BLOCK_PICTURE", document)
         self.assertIn("Промежуточные WAV и Vorbis", help_text)
 
+    def test_help_and_readme_describe_v15_profile_contracts(self):
+        readme = (PROJECT_DIR / "README.md").read_text(encoding="utf-8")
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        help_start = source.index('help_text = r"""')
+        help_end = source.index(
+            '        help_text = help_text.replace', help_start
+        )
+        help_text = source[help_start:help_end]
+
+        for document in (readme, help_text):
+            self.assertIn("ПЕСОЧНИЦА", document.upper())
+            self.assertIn("Verbatim", document)
+            self.assertIn("объединение глоссариев", document.lower())
+            self.assertIn("Аудиопрофили", document)
+            self.assertIn("48 кГц mono", document)
+            self.assertIn("К сборке книги", document)
+            self.assertIn("К экспорту", document)
+            self.assertIn("Сохранить профиль", document)
+            self.assertIn("Сохранить и закрыть", document)
+            self.assertIn("Отмена", document)
+            self.assertIn("Пользовательские параметры", document)
+            self.assertIn("несохранённый глоссарий", document.lower())
+            self.assertIn("повреждённый primary", document.lower())
+            self.assertIn("Удалить правила", document)
+            self.assertIn("Выбрать результаты поиска", document)
+            self.assertRegex(document, r"Выбрать все\s+в\s+разделе")
+            self.assertIn("приоритет", document.lower())
+            self.assertIn("🔗 Объединить", document)
+            self.assertIn("🧹 Очистить всё", document)
+            self.assertIn("многоточ", document.lower())
+
+        self.assertIn('APP_VERSION = "1.5.0"', source)
+        self.assertIn(
+            'APP_PUBLIC_VERSION = APP_VERSION.removesuffix(".0")', source
+        )
+        self.assertEqual(studio.APP_PUBLIC_VERSION, "1.5")
+        self.assertIn("v{APP_PUBLIC_VERSION}", help_text)
+        self.assertIn(
+            '"{APP_PUBLIC_VERSION}", APP_PUBLIC_VERSION, 1', source
+        )
+        self.assertNotIn("v1.5.0", readme)
+        self.assertIn("Нормализатор, профили и verbatim", readme)
+        self.assertIn("SHA256SUMS.txt", readme)
+
     def test_release_matrix_keeps_required_portable_artifacts(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("SileroTTS_Studio_Windows_Portable.exe", workflow)
-        self.assertIn("SileroTTS_Studio_Linux_x86_64_Portable.zip", workflow)
-        self.assertIn("SileroTTS_Studio_Linux_arm64_Portable.zip", workflow)
+        matrix_start = workflow.index("      matrix:\n        include:\n")
+        matrix_end = workflow.index("\n    steps:", matrix_start)
+        matrix_block = workflow[matrix_start:matrix_end]
+        entries = []
+        for chunk in re.split(r"(?m)^          - name: ", matrix_block)[1:]:
+            lines = chunk.splitlines()
+            entry = {"name": lines[0].strip()}
+            for line in lines[1:]:
+                match = re.match(r"^            ([a-z_]+): (.+)$", line)
+                if match:
+                    entry[match.group(1)] = match.group(2).strip('"')
+            entries.append(entry)
+
+        expected_entries = [
+            {
+                "name": "Windows",
+                "os": "windows-latest",
+                "target_arch": "x86_64",
+                "artifact_name": "SileroTTS_Studio_Windows.zip",
+                "portable_artifact_name": (
+                    "SileroTTS_Studio_Windows_Portable.exe"
+                ),
+            },
+            {
+                "name": "Linux x86_64",
+                "os": "ubuntu-latest",
+                "target_arch": "x86_64",
+                "artifact_name": "SileroTTS_Studio_Linux_x86_64.zip",
+                "portable_artifact_name": (
+                    "SileroTTS_Studio_Linux_x86_64_Portable.zip"
+                ),
+            },
+            {
+                "name": "Linux ARM64",
+                "os": "ubuntu-24.04-arm",
+                "target_arch": "arm64",
+                "artifact_name": "SileroTTS_Studio_Linux_arm64.zip",
+                "portable_artifact_name": (
+                    "SileroTTS_Studio_Linux_arm64_Portable.zip"
+                ),
+            },
+            {
+                "name": "macOS Apple Silicon ARM64",
+                "os": "macos-15",
+                "target_arch": "arm64",
+                "artifact_name": (
+                    "SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip"
+                ),
+            },
+            {
+                "name": "macOS Intel x86_64",
+                "os": "macos-15-intel",
+                "target_arch": "x86_64",
+                "artifact_name": "SileroTTS_Studio_macOS_Intel_x86_64.zip",
+            },
+        ]
+        keys = {
+            "name",
+            "os",
+            "target_arch",
+            "artifact_name",
+            "portable_artifact_name",
+        }
+        self.assertEqual(
+            [{key: entry[key] for key in keys if key in entry} for entry in entries],
+            expected_entries,
+        )
+
+        matrix_assets = {
+            entry[key]
+            for entry in entries
+            for key in ("artifact_name", "portable_artifact_name")
+            if key in entry
+        }
+        self.assertEqual(len(matrix_assets), 8)
+
+        release_block = workflow[workflow.index("  release:"):]
+        expected_match = re.search(
+            r"expected=\(\n(?P<body>.*?)\n\s+\)", release_block, re.DOTALL
+        )
+        self.assertIsNotNone(expected_match)
+        expected_assets = re.findall(
+            r"(?m)^\s+(SileroTTS_Studio_\S+)$",
+            expected_match.group("body"),
+        )
+        published_assets = re.findall(
+            r"(?m)^\s+release-assets/(SileroTTS_Studio_\S+)$",
+            release_block,
+        )
+        self.assertEqual(len(expected_assets), 8)
+        self.assertEqual(len(set(expected_assets)), 8)
+        self.assertEqual(set(expected_assets), matrix_assets)
+        self.assertEqual(len(published_assets), 8)
+        self.assertEqual(len(set(published_assets)), 8)
+        self.assertEqual(set(published_assets), matrix_assets)
+
         self.assertIn("--onefile", workflow)
-        self.assertIn("Upload portable release asset", workflow)
+        self.assertIn("Upload portable build artifact", workflow)
         self.assertNotIn("macOS_arm64_Portable", workflow)
+        self.assertEqual(
+            workflow.count("name: ${{ matrix.artifact_name }}-artifact"), 1
+        )
+        self.assertEqual(
+            workflow.count(
+                "name: ${{ matrix.portable_artifact_name }}-artifact"
+            ),
+            1,
+        )
+        self.assertIn('pattern: "*-artifact"', release_block)
+
+    def test_release_is_published_once_only_after_complete_integrity_check(self):
+        workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(workflow.count("softprops/action-gh-release@v2"), 1)
+        self.assertIn("name: Verify and publish complete release", workflow)
+        self.assertIn("needs: build", workflow)
+        self.assertIn(
+            "if: success() && startsWith(github.ref, 'refs/tags/')",
+            workflow,
+        )
+        self.assertIn("actions/download-artifact@v4", workflow)
+        self.assertIn("merge-multiple: true", workflow)
+        self.assertIn('test -s "$artifact"', workflow)
+        self.assertIn("zipped.testzip()", workflow)
+        self.assertIn('unzip -tqq "release-assets/$filename"', workflow)
+        self.assertIn("sha256sum", workflow)
+        self.assertIn("release-assets/SHA256SUMS.txt", workflow)
+        self.assertIn("fail_on_unmatched_files: true", workflow)
+        verify_build = workflow.index("- name: Verify packaged artifacts")
+        upload_build = workflow.index("- name: Upload full build artifact")
+        verify_release = workflow.index(
+            "- name: Verify complete release set and write SHA256SUMS"
+        )
+        publish_release = workflow.index(
+            "- name: Publish release only after every platform passed"
+        )
+        self.assertLess(verify_build, upload_build)
+        self.assertLess(verify_release, publish_release)
 
     def test_release_ffmpeg_is_checked_for_opus_support(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
@@ -2430,8 +4521,24 @@ class BuildWorkflowContractTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn('APP_VERSION_FALLBACK: "1.4.1"', workflow)
-        self.assertIn('version="${GITHUB_REF_NAME#v}"', workflow)
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn('APP_VERSION = "1.5.0"', source)
+        self.assertNotIn("APP_VERSION_FALLBACK", workflow)
+        self.assertNotIn("1.4.1", workflow)
+        self.assertIn('source_version="$(sed -nE', workflow)
+        self.assertIn('version="$source_version"', workflow)
+        self.assertIn(
+            'IFS=. read -r version_major version_minor version_patch', workflow
+        )
+        self.assertIn('expected_tag="v$public_version"', workflow)
+        self.assertIn(
+            '"$GITHUB_REF_NAME" != "$expected_tag"', workflow
+        )
+        self.assertNotIn(
+            '"$GITHUB_REF_NAME" != "v$source_version"', workflow
+        )
+        self.assertNotIn('version="${GITHUB_REF_NAME#v}"', workflow)
+        self.assertNotIn('version="${version%%-*}"', workflow)
 
         build_start = workflow.index("- name: Build macOS app")
         verify_start = workflow.index("- name: Verify macOS bundle contents")
@@ -2461,6 +4568,8 @@ class BuildWorkflowContractTests(unittest.TestCase):
         self.assertIn("windows-full-version.txt", windows_block)
         self.assertIn("windows-portable-version.txt", windows_block)
         self.assertEqual(windows_block.count('--version-file "windows-'), 2)
+        self.assertEqual(windows_block.count("filevers=($versionTuple)"), 1)
+        self.assertEqual(windows_block.count("prodvers=($versionTuple)"), 1)
         self.assertIn("StringStruct('FileVersion', '$env:APP_VERSION')", windows_block)
         self.assertIn("StringStruct('ProductVersion', '$env:APP_VERSION')", windows_block)
         self.assertIn("StringStruct('OriginalFilename', '$OriginalFilename')", windows_block)
@@ -2677,6 +4786,52 @@ class SettingsRecoveryTests(unittest.TestCase):
             config = app.load_settings(path)
 
             self.assertEqual(config["speaker"], "backup_voice")
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                {"speaker": "backup_voice"},
+            )
+
+    def test_save_settings_returns_false_when_target_parent_is_not_directory(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            blocked_parent = Path(tempdir) / "not-a-directory"
+            blocked_parent.write_text("file", encoding="utf-8")
+            app = object.__new__(studio.TTSApp)
+            app.config = {}
+            app.settings_vars = {}
+            app.shared_rate_limiter = mock.Mock()
+            app.update_config_from_ui = mock.Mock()
+            app.ensure_dirs = mock.Mock()
+            app._show_error = mock.Mock()
+
+            saved = app.save_settings(
+                blocked_parent / "settings.json",
+                show_popup=True,
+            )
+
+            self.assertFalse(saved)
+            app._show_error.assert_called_once()
+
+
+class SettingsTransactionContractTests(unittest.TestCase):
+    def test_config_import_and_reset_persist_before_replacing_live_config(self):
+        source = MODULE_PATH.read_text(encoding="utf-8")
+
+        import_start = source.index("    def import_config(self):")
+        import_end = source.index("    def reset_config(self):", import_start)
+        import_block = source[import_start:import_end]
+        self.assertIn("ensure_config_directories(candidate_config)", import_block)
+        self.assertLess(
+            import_block.index("self._persist_settings_snapshot(candidate_config)"),
+            import_block.index("self.config = candidate_config"),
+        )
+
+        reset_start = import_end
+        reset_end = source.index('# --- Вкладка "Синтез из папки" ---', reset_start)
+        reset_block = source[reset_start:reset_end]
+        self.assertLess(
+            reset_block.index("self._persist_settings_snapshot(candidate_config)"),
+            reset_block.index("self.config = candidate_config"),
+        )
 
 
 class ApiStepsUiConfigTests(unittest.TestCase):
@@ -3459,6 +5614,61 @@ class FfmpegSaveCommandTests(unittest.TestCase):
 
         self.assertEqual(self.values_after(command, "-c:a"), ["pcm_s16le"])
         self.assertEqual(self.values_after(command, "-rf64"), ["auto"])
+        self.assertEqual(callbacks[-1][1], "success")
+
+    def test_book_profile_writes_explicit_sample_rate_and_channels(self):
+        processor = self.make_processor(
+            output_sample_rate="24000",
+            output_channels="stereo",
+        )
+
+        _output, command, callbacks = self.run_save(processor, "chapter.mp3")
+
+        self.assertEqual(self.values_after(command, "-ar"), ["24000"])
+        self.assertEqual(self.values_after(command, "-ac"), ["2"])
+        self.assertEqual(callbacks[-1][1], "success")
+
+    def test_book_ogg_profile_uses_selected_bitrate(self):
+        processor = self.make_processor(
+            output_format="ogg",
+            output_bitrate="96k",
+            tag_cover="",
+        )
+
+        _output, command, callbacks = self.run_save(processor, "chapter.ogg")
+
+        self.assertEqual(self.values_after(command, "-c:a"), ["libvorbis"])
+        self.assertEqual(self.values_after(command, "-b:a"), ["96k"])
+        self.assertEqual(callbacks[-1][1], "success")
+
+    def test_book_ogg_auto_uses_encoder_quality_mode_without_bitrate(self):
+        processor = self.make_processor(
+            output_format="ogg",
+            output_bitrate="auto",
+            tag_cover="",
+        )
+
+        _output, command, callbacks = self.run_save(processor, "chapter.ogg")
+
+        self.assertEqual(self.values_after(command, "-c:a"), ["libvorbis"])
+        self.assertNotIn("-b:a", command)
+        self.assertEqual(callbacks[-1][1], "success")
+
+    def test_book_opus_auto_uses_speech_bitrate_and_layout(self):
+        processor = self.make_processor(
+            output_format="opus",
+            output_bitrate="auto",
+            output_sample_rate="48000",
+            output_channels="mono",
+            tag_cover="",
+        )
+
+        _output, command, callbacks = self.run_save(processor, "chapter.opus")
+
+        self.assertEqual(self.values_after(command, "-c:a"), ["libopus"])
+        self.assertEqual(self.values_after(command, "-b:a"), ["48k"])
+        self.assertEqual(self.values_after(command, "-ar"), ["48000"])
+        self.assertEqual(self.values_after(command, "-ac"), ["1"])
         self.assertEqual(callbacks[-1][1], "success")
 
 
