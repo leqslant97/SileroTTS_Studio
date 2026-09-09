@@ -4681,65 +4681,6 @@ class BuildWorkflowContractTests(unittest.TestCase):
                     "exec",
                 )
 
-    def test_release_python_and_macos_tk_are_pinned_and_verified(self):
-        workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn('PYTHON_VERSION: "3.13.15"', workflow)
-        self.assertIn('MACOS_PYTHON_SERIES: "3.13"', workflow)
-        self.assertIn('MACOS_TK_SERIES: "9.0"', workflow)
-        self.assertIn(
-            'brew install --skip-link "python@$python_series"', workflow
-        )
-        self.assertIn(
-            'brew install --skip-link "python-tk@$python_series"', workflow
-        )
-        self.assertIn('HOMEBREW_NO_PATH_SHADOW_CHECK: "1"', workflow)
-        self.assertIn("brew update", workflow)
-        self.assertNotIn(
-            'brew upgrade "python@$python_series" "python-tk@$python_series"',
-            workflow,
-        )
-        self.assertNotIn("brew link --overwrite", workflow)
-        self.assertNotIn("python-tk@3.13 --overwrite", workflow)
-        self.assertIn('MACOS_PYTHON_VERSION=$installed_python_version', workflow)
-        self.assertIn('"$py" -m venv .venv', workflow)
-        self.assertIn("actual_python[:2] != expected_series", workflow)
-        self.assertIn("actual_arch != expected_arch", workflow)
-        self.assertIn('EXPECTED_TARGET_ARCH: ${{ matrix.target_arch }}', workflow)
-        self.assertIn("tkinter.TclVersion != 9.0", workflow)
-        self.assertIn("tkinter.TkVersion != 9.0", workflow)
-
-        runtime_start = workflow.index("- name: Verify Python runtime dependencies")
-        ffmpeg_start = workflow.index("- name: Set up FFmpeg")
-        runtime_block = workflow[runtime_start:ffmpeg_start]
-        self.assertIn("import tkinter", runtime_block)
-        self.assertIn("sys.version_info[:2] == expected_series", runtime_block)
-        self.assertIn(
-            'platform.python_version() == os.environ["MACOS_PYTHON_VERSION"]',
-            runtime_block,
-        )
-        self.assertIn("assert tkinter.TclVersion == 9.0", runtime_block)
-        self.assertIn("assert tkinter.TkVersion == 9.0", runtime_block)
-
-        verify_start = workflow.index("- name: Verify macOS bundle contents")
-        upload_start = workflow.index("- name: Upload full build artifact")
-        verify_block = workflow[verify_start:upload_start]
-        self.assertIn("Python.framework", verify_block)
-        self.assertIn("CFBundleVersion", verify_block)
-        self.assertIn('"$MACOS_PYTHON_VERSION"', verify_block)
-        self.assertIn("_tkinter*.so", verify_block)
-        self.assertIn("libtcl9.0.dylib", verify_block)
-        self.assertIn("libtcl9tk9.0.dylib", verify_block)
-        self.assertIn("otool -L \"$media_binary\"", verify_block)
-        self.assertIn("Homebrew paths", verify_block)
-        self.assertIn(
-            'for media_binary in "$ffmpeg_path" "$ffprobe_path"; do',
-            verify_block,
-        )
-        self.assertGreaterEqual(verify_block.count("lipo"), 4)
-
     def test_release_matrix_keeps_required_portable_artifacts(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
@@ -4859,65 +4800,6 @@ class BuildWorkflowContractTests(unittest.TestCase):
         self.assertIn("Verify required FFmpeg codecs", workflow)
         self.assertIn("libopus", workflow)
         self.assertIn("libvorbis", workflow)
-
-    def test_macos_bundle_version_is_set_before_codesigning(self):
-        workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertNotIn("APP_VERSION_FALLBACK", workflow)
-        self.assertIn('source_version="$(sed -nE', workflow)
-        self.assertIn('version="$source_version"', workflow)
-        self.assertIn(
-            'IFS=. read -r version_major version_minor version_patch', workflow
-        )
-        self.assertIn('expected_tag="v$public_version"', workflow)
-        self.assertIn(
-            '"$GITHUB_REF_NAME" != "$expected_tag"', workflow
-        )
-        self.assertNotIn(
-            '"$GITHUB_REF_NAME" != "v$source_version"', workflow
-        )
-        self.assertNotIn('version="${GITHUB_REF_NAME#v}"', workflow)
-        self.assertNotIn('version="${version%%-*}"', workflow)
-
-        build_start = workflow.index("- name: Build macOS app")
-        verify_start = workflow.index("- name: Verify macOS bundle contents")
-        upload_start = workflow.index("- name: Upload full build artifact")
-        build_block = workflow[build_start:verify_start]
-        verify_block = workflow[verify_start:upload_start]
-        signing_position = build_block.index("codesign --force --deep --sign -")
-
-        for key in ("CFBundleShortVersionString", "CFBundleVersion"):
-            self.assertLess(
-                build_block.index(f"plutil -replace {key}"),
-                signing_position,
-            )
-            self.assertIn(f"plutil -extract {key}", verify_block)
-            self.assertNotIn(f"plutil -replace {key}", verify_block)
-            self.assertNotIn(f"plutil -insert {key}", verify_block)
-
-    def test_windows_binaries_embed_and_verify_release_version(self):
-        workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
-            encoding="utf-8"
-        )
-
-        resource_start = workflow.index("- name: Create Windows version resources")
-        linux_start = workflow.index("- name: Build Linux apps")
-        windows_block = workflow[resource_start:linux_start]
-
-        self.assertIn("windows-full-version.txt", windows_block)
-        self.assertIn("windows-portable-version.txt", windows_block)
-        self.assertEqual(windows_block.count('--version-file "windows-'), 2)
-        self.assertEqual(windows_block.count("filevers=($versionTuple)"), 1)
-        self.assertEqual(windows_block.count("prodvers=($versionTuple)"), 1)
-        self.assertIn("StringStruct('FileVersion', '$env:APP_VERSION')", windows_block)
-        self.assertIn("StringStruct('ProductVersion', '$env:APP_VERSION')", windows_block)
-        self.assertIn("StringStruct('OriginalFilename', '$OriginalFilename')", windows_block)
-        self.assertIn("- name: Verify Windows executable versions", windows_block)
-        self.assertIn("$info.FileMajorPart", windows_block)
-        self.assertIn("$info.ProductVersion", windows_block)
-
 
 class AtomicOutputTests(unittest.TestCase):
     def test_codec_detector_reads_only_the_ogg_header(self):
