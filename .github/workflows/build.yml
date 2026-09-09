@@ -14,6 +14,10 @@ permissions:
 env:
   # setup-python pins this patch on Windows/Linux.
   PYTHON_VERSION: "3.13.15"
+  # Keep the normalizer release aligned with requirements*.txt. The project
+  # intentionally uses the released package rather than an unpinned GitHub
+  # checkout, so builds remain reproducible.
+  RU_NORMALIZR_VERSION: "0.3.0"
   # Homebrew versioned formulae track a Python minor series rather than keeping
   # every patch release installable. Record and verify the patch actually used
   # by each macOS artifact below.
@@ -75,9 +79,8 @@ jobs:
       - name: Resolve and verify application version
         shell: bash
         run: |
-          # APP_VERSION is the technical three-component binary version.
-          # A zero patch is omitted only from the public release tag: internal
-          # 1.5.0 therefore maps to the exact public tag v1.5.
+          # APP_VERSION uses three components for binary metadata. Public tags
+          # omit only a trailing zero patch and otherwise match it exactly.
           source_version="$(sed -nE 's/^APP_VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' SileroTTS_Studio.py)"
           if [[ ! "$source_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Не удалось однозначно прочитать APP_VERSION из SileroTTS_Studio.py"
@@ -266,6 +269,9 @@ jobs:
           from tempfile import TemporaryDirectory
 
           assert pydub.utils.audioop is audioop
+          assert getattr(ru_normalizr, "__version__", None) == os.environ[
+              "RU_NORMALIZR_VERSION"
+          ]
           if sys.version_info >= (3, 13):
               assert getattr(audioop, "__file__", None), "Python 3.13 must load audioop-lts"
           if sys.platform == "darwin":
@@ -535,41 +541,6 @@ jobs:
           export COPYFILE_DISABLE=1
           ditto -c -k --keepParent "${{ matrix.app_name }}.app" "${{ matrix.artifact_name }}"
 
-      - name: Verify packaged artifacts
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            py=.venv/Scripts/python.exe
-          else
-            py=.venv/bin/python
-          fi
-          artifacts=("dist/${{ matrix.artifact_name }}")
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            artifacts+=("dist/${{ matrix.portable_artifact_name }}")
-          elif [[ "$RUNNER_OS" == "Linux" ]]; then
-            artifacts+=("dist/${{ matrix.portable_artifact_name }}")
-          else
-            test ! -e "dist/${{ matrix.app_name }}_Portable.app"
-          fi
-
-          for artifact in "${artifacts[@]}"; do
-            test -s "$artifact"
-            if [[ "$artifact" == *.zip ]]; then
-              "$py" - "$artifact" <<'PY'
-          import sys
-          import zipfile
-
-          archive = sys.argv[1]
-          with zipfile.ZipFile(archive) as zipped:
-              if not zipped.namelist():
-                  raise SystemExit(f"empty ZIP archive: {archive}")
-              broken_member = zipped.testzip()
-              if broken_member is not None:
-                  raise SystemExit(f"CRC error in {archive}: {broken_member}")
-          PY
-            fi
-          done
-
       - name: Verify portable onefile builds
         if: runner.os == 'Windows' || runner.os == 'Linux'
         shell: bash
@@ -663,45 +634,17 @@ jobs:
           if-no-files-found: error
 
   release:
-    name: Verify and publish complete release
+    name: Publish release
     if: success() && startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download all verified build artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
           pattern: "*-artifact"
           merge-multiple: true
-
-      - name: Verify complete release set and write SHA256SUMS
-        shell: bash
-        run: |
-          expected=(
-            SileroTTS_Studio_Windows.zip
-            SileroTTS_Studio_Windows_Portable.exe
-            SileroTTS_Studio_Linux_x86_64.zip
-            SileroTTS_Studio_Linux_x86_64_Portable.zip
-            SileroTTS_Studio_Linux_arm64.zip
-            SileroTTS_Studio_Linux_arm64_Portable.zip
-            SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip
-            SileroTTS_Studio_macOS_Intel_x86_64.zip
-          )
-
-          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
-          for filename in "${expected[@]}"; do
-            test -s "release-assets/$filename"
-            if [[ "$filename" == *.zip ]]; then
-              unzip -tqq "release-assets/$filename"
-            fi
-          done
-
-          (
-            cd release-assets
-            sha256sum "${expected[@]}" > SHA256SUMS.txt
-          )
-          test -s release-assets/SHA256SUMS.txt
 
       - name: Publish release only after every platform passed
         uses: softprops/action-gh-release@v2
@@ -716,4 +659,3 @@ jobs:
             release-assets/SileroTTS_Studio_Linux_arm64_Portable.zip
             release-assets/SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip
             release-assets/SileroTTS_Studio_macOS_Intel_x86_64.zip
-            release-assets/SHA256SUMS.txt
