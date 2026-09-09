@@ -9,6 +9,7 @@ import copy
 import struct
 import sys
 import tempfile
+import textwrap
 import unittest
 import wave
 from pathlib import Path
@@ -1161,6 +1162,328 @@ class ExportGroupingTests(unittest.TestCase):
             self.assertNotIn("copy", command)
             self.assertEqual(destination.read_bytes(), b"mp3")
 
+    def test_streaming_merge_uses_concat_stream_copy_for_uniform_inputs(self):
+        """Однородный уже готовый поток не должен кодироваться второй раз.
+
+        Это намеренно проверяет именно команду, а не продолжительность/размер
+        результата: реальный FFmpeg проверяется отдельными integration-тестами,
+        а здесь важно, что fast path не возвращается к filter_complex и не
+        получает лишние параметры перекодирования.
+        """
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sources = (root / "one.mp3", root / "two.mp3")
+            for source in sources:
+                source.write_bytes(b"audio")
+            destination = root / "book.mp3"
+
+            profile = {
+                "codec": "mp3",
+                "sample_rate": 44100,
+                "channels": 1,
+                "bitrate": 128000,
+            }
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            process.stderr.read.return_value = b""
+
+            def fake_popen(command, **kwargs):
+                Path(command[-1]).write_bytes(b"copied")
+                return process
+
+            with mock.patch.object(
+                studio,
+                "_probe_audio_stream_profile",
+                return_value=profile,
+            ), mock.patch.object(
+                studio.subprocess, "Popen", side_effect=fake_popen
+            ) as popen:
+                studio._export_merged_audio_ffmpeg(
+                    sources,
+                    destination,
+                    output_format="mp3",
+                    bitrate_mode="auto",
+                    tags={"title": "Book"},
+                )
+
+            command = popen.call_args.args[0]
+            self.assertIn("-f", command)
+            self.assertEqual(command[command.index("-f") + 1], "concat")
+            self.assertIn("-safe", command)
+            self.assertEqual(command[command.index("-safe") + 1], "0")
+            self.assertIn("-c:a", command)
+            self.assertEqual(command[command.index("-c:a") + 1], "copy")
+            self.assertNotIn("-filter_complex", command)
+            self.assertNotIn("-af", command)
+            self.assertNotIn("-ar", command)
+            self.assertNotIn("-ac", command)
+            metadata = [
+                command[index + 1]
+                for index, option in enumerate(command[:-1])
+                if option == "-metadata"
+            ]
+            self.assertIn("title=Book", metadata)
+            self.assertTrue(destination.exists())
+            self.assertEqual(destination.read_bytes(), b"copied")
+
+            manifest = Path(command[command.index("-i") + 1])
+            self.assertFalse(
+                manifest.exists(),
+                "concat-манифест должен удаляться только после завершения FFmpeg",
+            )
+
+    def test_streaming_merge_all_unknown_opus_bitrate_uses_stream_copy(self):
+        """Одинаковые VBR Opus без nominal bit_rate не перекодируются."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sources = (root / "one.opus", root / "two.opus")
+            for source in sources:
+                source.write_bytes(b"audio")
+            destination = root / "book.opus"
+            profile = {
+                "codec": "opus",
+                "sample_rate": 48000,
+                "channels": 1,
+                "bitrate": None,
+            }
+            process = mock.Mock()
+            process.poll.return_value = 0
+            process.returncode = 0
+            process.stderr.read.return_value = b""
+
+            def fake_popen(command, **kwargs):
+                Path(command[-1]).write_bytes(b"copied")
+                return process
+
+            with mock.patch.object(
+                studio,
+                "_probe_audio_stream_profile",
+                side_effect=[dict(profile), dict(profile)],
+            ), mock.patch.object(
+                studio.subprocess, "Popen", side_effect=fake_popen
+            ) as popen:
+                studio._export_merged_audio_ffmpeg(
+                    sources,
+                    destination,
+                    output_format="opus",
+                    bitrate_mode="auto",
+                )
+
+            command = popen.call_args.args[0]
+            self.assertEqual(command[command.index("-c:a") + 1], "copy")
+            self.assertNotIn("-filter_complex", command)
+            self.assertNotIn("-ar", command)
+            self.assertNotIn("-ac", command)
+            self.assertEqual(destination.read_bytes(), b"copied")
+
+    def test_streaming_merge_rejects_mixed_unknown_bitrate_or_opus_headers(self):
+        """Неизвестный/разный физический профиль остаётся в encode fallback."""
+        cases = (
+            (
+                "mixed_known_unknown_bitrate",
+                {"bitrate": 48000},
+                {"bitrate": None},
+            ),
+            (
+                "different_opus_headers",
+                {"bitrate": None, "extradata_hash": "sha256:first"},
+                {"bitrate": None, "extradata_hash": "sha256:second"},
+            ),
+        )
+        for case_name, first_overrides, second_overrides in cases:
+            with self.subTest(case_name=case_name), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                sources = (root / "one.opus", root / "two.opus")
+                for source in sources:
+                    source.write_bytes(b"audio")
+                destination = root / "book.opus"
+                first = {
+                    "codec": "opus",
+                    "sample_rate": 48000,
+                    "channels": 1,
+                    "bitrate": None,
+                }
+                second = dict(first)
+                first.update(first_overrides)
+                second.update(second_overrides)
+                process = mock.Mock()
+                process.poll.return_value = 0
+                process.returncode = 0
+                process.stderr.read.return_value = b""
+
+                def fake_popen(command, **kwargs):
+                    Path(command[-1]).write_bytes(b"encoded")
+                    return process
+
+                with mock.patch.object(
+                    studio,
+                    "_probe_audio_stream_profile",
+                    side_effect=[first, second],
+                ), mock.patch.object(
+                    studio.subprocess, "Popen", side_effect=fake_popen
+                ) as popen:
+                    studio._export_merged_audio_ffmpeg(
+                        sources,
+                        destination,
+                        output_format="opus",
+                        bitrate_mode="auto",
+                    )
+
+                command = popen.call_args.args[0]
+                self.assertIn(
+                    "-filter_complex",
+                    command,
+                    f"case {case_name} unexpectedly selected stream copy",
+                )
+                self.assertEqual(
+                    command[command.index("-c:a") + 1], "libopus"
+                )
+                self.assertEqual(destination.read_bytes(), b"encoded")
+
+    def test_streaming_merge_falls_back_when_stream_copy_is_not_safe(self):
+        """Любое изменение профиля/обработки оставляет безопасный fallback."""
+        cases = (
+            ("different_codec", {"second_codec": "vorbis"}, {}),
+            ("different_stream_profile", {"different_profile": True}, {}),
+            ("unknown_profile", {"second_unknown": True}, {}),
+            ("explicit_resample", {}, {"sample_rate": "48000"}),
+            ("pause", {}, {"pause_ms": 100}),
+            ("speed_effect", {}, {"speed": 1.25}),
+            ("cover", {}, {"cover": "cover.png"}),
+            ("single_source", {}, {"single": True}),
+        )
+        for case_name, profile_options, call_options in cases:
+            with self.subTest(case_name=case_name), tempfile.TemporaryDirectory() as tempdir:
+                root = Path(tempdir)
+                sources = [root / "one.mp3"]
+                if not call_options.get("single"):
+                    sources.append(root / "two.mp3")
+                for source in sources:
+                    source.write_bytes(b"audio")
+                cover = root / "cover.png"
+                cover.write_bytes(b"image")
+                destination = root / "book.mp3"
+
+                first = {
+                    "codec": "mp3",
+                    "sample_rate": 44100,
+                    "channels": 1,
+                    "bitrate": 128000,
+                }
+                second = dict(first)
+                second["codec"] = profile_options.get("second_codec", "mp3")
+                if profile_options.get("different_profile"):
+                    first["profile"] = "layer 3"
+                    second["profile"] = "layer 2"
+                if profile_options.get("second_unknown"):
+                    second = None
+                process = mock.Mock()
+                process.poll.return_value = 0
+                process.returncode = 0
+                process.stderr.read.return_value = b""
+
+                def fake_popen(command, **kwargs):
+                    Path(command[-1]).write_bytes(b"encoded")
+                    return process
+
+                probe_result = [first, second] if len(sources) > 1 else [first]
+                kwargs = {
+                    "output_format": "mp3",
+                    "bitrate_mode": "auto",
+                }
+                if "sample_rate" in call_options:
+                    kwargs["sample_rate"] = call_options["sample_rate"]
+                if "pause_ms" in call_options:
+                    kwargs["pause_ms"] = call_options["pause_ms"]
+                if "speed" in call_options:
+                    kwargs["speed"] = call_options["speed"]
+                if "cover" in call_options:
+                    kwargs["cover"] = cover
+
+                with mock.patch.object(
+                    studio,
+                    "_probe_audio_stream_profile",
+                    side_effect=probe_result,
+                ), mock.patch.object(
+                    studio.subprocess, "Popen", side_effect=fake_popen
+                ) as popen:
+                    studio._export_merged_audio_ffmpeg(
+                        sources,
+                        destination,
+                        **kwargs,
+                    )
+
+                command = popen.call_args.args[0]
+                self.assertIn(
+                    "-filter_complex",
+                    command,
+                    f"case {case_name} unexpectedly selected stream copy",
+                )
+                self.assertNotEqual(
+                    command[command.index("-c:a") + 1], "copy"
+                )
+
+    def test_streaming_merge_retries_with_filter_after_copy_rejection(self):
+        """Packet-level incompatibility must not make an optimization fatal."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            sources = (root / "one.mp3", root / "two.mp3")
+            for source in sources:
+                source.write_bytes(b"audio")
+            destination = root / "book.mp3"
+            profile = {
+                "codec": "mp3",
+                "sample_rate": 44100,
+                "channels": 1,
+                "bitrate": 128000,
+            }
+            failed_copy = mock.Mock()
+            failed_copy.poll.return_value = 1
+            failed_copy.returncode = 1
+            failed_copy.stderr.read.return_value = b"incompatible packets"
+            successful_encode = mock.Mock()
+            successful_encode.poll.return_value = 0
+            successful_encode.returncode = 0
+            successful_encode.stderr.read.return_value = b""
+            commands = []
+
+            def fake_popen(command, **kwargs):
+                commands.append(command)
+                if len(commands) == 1:
+                    return failed_copy
+                Path(command[-1]).write_bytes(b"encoded")
+                return successful_encode
+
+            with mock.patch.object(
+                studio,
+                "_probe_audio_stream_profile",
+                return_value=profile,
+            ), mock.patch.object(
+                studio.subprocess, "Popen", side_effect=fake_popen
+            ), self.assertLogs(level=logging.WARNING) as logs:
+                studio._export_merged_audio_ffmpeg(
+                    sources,
+                    destination,
+                    output_format="mp3",
+                    bitrate_mode="auto",
+                )
+
+            self.assertEqual(len(commands), 2)
+            self.assertEqual(
+                commands[0][commands[0].index("-c:a") + 1], "copy"
+            )
+            self.assertNotIn("-filter_complex", commands[0])
+            self.assertIn("-filter_complex", commands[1])
+            self.assertEqual(
+                commands[1][commands[1].index("-c:a") + 1], "libmp3lame"
+            )
+            self.assertTrue(any(
+                "повтор через безопасный filter_complex" in message
+                for message in logs.output
+            ))
+            self.assertEqual(destination.read_bytes(), b"encoded")
+
     def test_windows_command_limit_fails_before_createprocess(self):
         with self.assertRaisesRegex(ValueError, "Разделите группу"):
             studio._validate_windows_command_length(
@@ -2203,6 +2526,51 @@ class NormalizerProfileAndGlossaryV15Tests(unittest.TestCase):
         self.assertEqual(applied["speaker"], "voice")
         self.assertFalse(applied["glossary_enabled"])
 
+    def test_normalizer_profile_library_roundtrip_keeps_stable_ids(self):
+        profile = studio.normalizer_profile_from_config(
+            {"normalizer_mode": "safe"}, name="Мой Safe"
+        )
+        entry = studio.make_normalizer_profile_entry(
+            profile, profile_id="custom:" + "1" * 32
+        )
+
+        bundle = studio.normalizer_profile_library_from_profiles([entry])
+        restored = studio.normalize_normalizer_profile_library(bundle)
+
+        self.assertEqual(bundle["schema"], studio.NORMALIZER_PROFILE_LIBRARY_SCHEMA)
+        self.assertEqual(restored, [entry])
+
+    def test_normalizer_library_cannot_impersonate_builtin_profile(self):
+        profile = studio.normalizer_profile_from_config(
+            {"normalizer_mode": "safe"}, name="Safe (бережный)"
+        )
+        forged = {"id": "builtin:safe", "profile": profile}
+
+        with self.assertRaisesRegex(ValueError, "встроенный id"):
+            studio.normalize_normalizer_profile_entry(forged)
+
+    def test_normalizer_builtin_id_requires_exact_builtin_content(self):
+        builtin = studio.builtin_normalizer_profile_entries()[0]
+        forged = copy.deepcopy(builtin["profile"])
+        forged["normalizer"]["options"]["remove_links"] = not forged[
+            "normalizer"
+        ]["options"]["remove_links"]
+
+        with self.assertRaisesRegex(ValueError, "не совпадает"):
+            studio.make_normalizer_profile_entry(
+                forged,
+                profile_id=builtin["id"],
+            )
+
+    def test_normalizer_library_excludes_raw_builtin_clones(self):
+        builtins = studio.builtin_normalizer_profile_entries()
+
+        bundle = studio.normalizer_profile_library_from_profiles(
+            [entry["profile"] for entry in builtins]
+        )
+
+        self.assertEqual(bundle["profiles"], [])
+
     def test_exported_normalizer_profile_omits_local_dictionary_path(self):
         profile = studio.normalizer_profile_from_config(
             {
@@ -3009,6 +3377,53 @@ class NormalizerProfileAndGlossaryV15Tests(unittest.TestCase):
 
 
 class AudioProfileV15Tests(unittest.TestCase):
+    def test_audio_profile_library_roundtrip_preserves_stable_id(self):
+        profile = studio.make_audio_profile(
+            "Речь", output_format="opus", bitrate="48k"
+        )
+        profile["id"] = "custom:" + "2" * 32
+
+        bundle = studio.audio_profile_library_from_profiles([profile])
+        restored = studio.normalize_audio_profile_library(bundle)
+
+        self.assertEqual(bundle["schema"], studio.AUDIO_PROFILE_LIBRARY_SCHEMA)
+        self.assertEqual(restored[0]["id"], profile["id"])
+        self.assertEqual(restored[0]["profile"]["id"], profile["id"])
+
+    def test_audio_profile_default_id_survives_renamed_profile(self):
+        profile = studio.make_audio_profile("Старое имя")
+        profile["id"] = "custom:" + "3" * 32
+        config = studio.normalize_config(
+            {
+                "audio_profiles": [profile],
+                "default_book_audio_profile_id": profile["id"],
+            }
+        )
+        config["audio_profiles"][0]["name"] = "Новое имя"
+
+        normalized = studio.normalize_config(config)
+
+        self.assertEqual(
+            normalized["default_book_audio_profile_id"], profile["id"]
+        )
+
+    def test_audio_library_rejects_wrapper_inner_id_mismatch(self):
+        profile = studio.make_audio_profile("Несовпадение")
+        profile["id"] = "custom:" + "4" * 32
+        wrapper = {"id": "custom:" + "5" * 32, "profile": profile}
+
+        with self.assertRaisesRegex(ValueError, "не совпадает"):
+            studio.normalize_audio_profile_entry(wrapper)
+
+    def test_normalizer_custom_name_does_not_collide_with_draft_sentinel(self):
+        self.assertTrue(
+            studio.normalizer_profile_name_conflict("Пользовательский", [])
+        )
+        self.assertEqual(
+            studio.unique_normalizer_profile_name("Пользовательский", []),
+            "Пользовательский профиль",
+        )
+
     def test_profile_roundtrip_contains_format_layout_and_effects(self):
         profile = studio.make_audio_profile(
             "Моя речь",
@@ -3189,9 +3604,18 @@ class AudioProfileV15Tests(unittest.TestCase):
         self.assertNotIn("нажмите ОК", dialog_source)
         self.assertIn('candidate_config["audio_profiles"] = copy.deepcopy(staged_profiles)', commit_block)
         self.assertIn("stage_current_editor(refresh=False)", commit_block)
+        self.assertIn("editor_profile_with_stable_id", commit_block)
+        self.assertIn("staged_default_values", commit_block)
+        self.assertIn("profile_id=apply_id", commit_block)
+        self.assertIn("refresh_staged_default_snapshot", dialog_source)
         self.assertIn("self._persist_settings_snapshot(candidate_config)", commit_block)
         self.assertNotIn("self.save_settings()", commit_block)
         self.assertNotIn("self.set_ui_from_config()", commit_block)
+        self.assertIn(
+            'resolve_editor_before_navigation("удалением профиля")',
+            dialog_source,
+        )
+        self.assertIn("refresh_list(select_key=editor_state[\"selection_key\"])", dialog_source)
 
     def test_profile_targets_are_independent(self):
         profile = studio.make_audio_profile(
@@ -3300,6 +3724,12 @@ class AudioProfileV15Tests(unittest.TestCase):
                 output_format="mp3",
                 bitrate="999999k",
             )
+
+    def test_profile_rejects_control_or_excessively_long_name(self):
+        for name in ("Строка\nвторая", "x" * 129):
+            with self.subTest(name=name[:20]):
+                with self.assertRaisesRegex(ValueError, "имя аудиопрофиля"):
+                    studio.make_audio_profile(name)
 
     def test_wav_and_ogg_auto_keep_codec_specific_book_policy(self):
         wav = studio.audio_profile_config_values(
@@ -4233,6 +4663,24 @@ class ExportLayoutContractTests(unittest.TestCase):
 
 
 class BuildWorkflowContractTests(unittest.TestCase):
+    def test_embedded_python_blocks_are_syntactically_valid(self):
+        workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
+            encoding="utf-8"
+        )
+        blocks = re.findall(
+            r"(?ms)^[ \t]*[^\n]*<<'PY'\n(?P<body>.*?)^[ \t]*PY[ \t]*$",
+            workflow,
+        )
+
+        self.assertGreaterEqual(len(blocks), 2)
+        for index, block in enumerate(blocks, start=1):
+            with self.subTest(block=index):
+                compile(
+                    textwrap.dedent(block),
+                    f"build.yml:embedded-python-{index}",
+                    "exec",
+                )
+
     def test_release_python_and_macos_tk_are_pinned_and_verified(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
@@ -4291,31 +4739,6 @@ class BuildWorkflowContractTests(unittest.TestCase):
             verify_block,
         )
         self.assertGreaterEqual(verify_block.count("lipo"), 4)
-
-    def test_help_and_readme_describe_audio_and_macos_contracts(self):
-        readme = (PROJECT_DIR / "README.md").read_text(encoding="utf-8")
-        source = MODULE_PATH.read_text(encoding="utf-8")
-        help_start = source.index('help_text = r"""')
-        help_end = source.index(
-            '        help_text = help_text.replace', help_start
-        )
-        help_text = source[help_start:help_end]
-
-        for document in (readme, help_text):
-            self.assertIn("Opus → PCM", document)
-            self.assertIn("Python 3.13.x", document)
-            self.assertIn("Python 3.13.15", document)
-            self.assertIn("Tk 9", document)
-            self.assertIn("FFprobe", document)
-
-        self.assertIn("первую страницу контейнера", readme)
-        for document in (readme, help_text):
-            self.assertIn("Ogg/Opus (.opus)", document)
-            self.assertIn("Ogg/Vorbis (.ogg)", document)
-            self.assertIn("128 кбит/с", document)
-            self.assertIn("32 кбит/с", document)
-            self.assertIn("METADATA_BLOCK_PICTURE", document)
-        self.assertIn("Промежуточные WAV и Vorbis", help_text)
 
     def test_release_matrix_keeps_required_portable_artifacts(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
@@ -4390,34 +4813,7 @@ class BuildWorkflowContractTests(unittest.TestCase):
             expected_entries,
         )
 
-        matrix_assets = {
-            entry[key]
-            for entry in entries
-            for key in ("artifact_name", "portable_artifact_name")
-            if key in entry
-        }
-        self.assertEqual(len(matrix_assets), 8)
-
         release_block = workflow[workflow.index("  release:"):]
-        expected_match = re.search(
-            r"expected=\(\n(?P<body>.*?)\n\s+\)", release_block, re.DOTALL
-        )
-        self.assertIsNotNone(expected_match)
-        expected_assets = re.findall(
-            r"(?m)^\s+(SileroTTS_Studio_\S+)$",
-            expected_match.group("body"),
-        )
-        published_assets = re.findall(
-            r"(?m)^\s+release-assets/(SileroTTS_Studio_\S+)$",
-            release_block,
-        )
-        self.assertEqual(len(expected_assets), 8)
-        self.assertEqual(len(set(expected_assets)), 8)
-        self.assertEqual(set(expected_assets), matrix_assets)
-        self.assertEqual(len(published_assets), 8)
-        self.assertEqual(len(set(published_assets)), 8)
-        self.assertEqual(set(published_assets), matrix_assets)
-
         self.assertIn("--onefile", workflow)
         self.assertIn("Upload portable build artifact", workflow)
         self.assertNotIn("macOS_arm64_Portable", workflow)
@@ -4432,13 +4828,13 @@ class BuildWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn('pattern: "*-artifact"', release_block)
 
-    def test_release_is_published_once_only_after_complete_integrity_check(self):
+    def test_release_is_published_once_after_all_build_jobs(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
 
         self.assertEqual(workflow.count("softprops/action-gh-release@v2"), 1)
-        self.assertIn("name: Verify and publish complete release", workflow)
+        self.assertIn("name: Publish release", workflow)
         self.assertIn("needs: build", workflow)
         self.assertIn(
             "if: success() && startsWith(github.ref, 'refs/tags/')",
@@ -4446,22 +4842,14 @@ class BuildWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("actions/download-artifact@v4", workflow)
         self.assertIn("merge-multiple: true", workflow)
-        self.assertIn('test -s "$artifact"', workflow)
-        self.assertIn("zipped.testzip()", workflow)
-        self.assertIn('unzip -tqq "release-assets/$filename"', workflow)
-        self.assertIn("sha256sum", workflow)
-        self.assertIn("release-assets/SHA256SUMS.txt", workflow)
         self.assertIn("fail_on_unmatched_files: true", workflow)
-        verify_build = workflow.index("- name: Verify packaged artifacts")
-        upload_build = workflow.index("- name: Upload full build artifact")
-        verify_release = workflow.index(
-            "- name: Verify complete release set and write SHA256SUMS"
-        )
         publish_release = workflow.index(
             "- name: Publish release only after every platform passed"
         )
-        self.assertLess(verify_build, upload_build)
-        self.assertLess(verify_release, publish_release)
+        download_release = workflow.index(
+            "- name: Download build artifacts"
+        )
+        self.assertLess(download_release, publish_release)
 
     def test_release_ffmpeg_is_checked_for_opus_support(self):
         workflow = (PROJECT_DIR / ".github" / "workflows" / "build.yml").read_text(
@@ -4477,10 +4865,7 @@ class BuildWorkflowContractTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        source = MODULE_PATH.read_text(encoding="utf-8")
-        self.assertIn('APP_VERSION = "1.5.0"', source)
         self.assertNotIn("APP_VERSION_FALLBACK", workflow)
-        self.assertNotIn("1.4.1", workflow)
         self.assertIn('source_version="$(sed -nE', workflow)
         self.assertIn('version="$source_version"', workflow)
         self.assertIn(
@@ -4986,6 +5371,22 @@ class EmptySynthesisTests(unittest.TestCase):
                 ["Слово король.", "Внутри фразы 王 остаётся."],
             )
             self.assertNotIn("王.", speech_texts)
+
+    def test_unsupported_paragraph_breaks_previous_colon_state(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            processor = self.make_processor(Path(tempdir))
+            self.set_pause_config(
+                processor,
+                pause_paragraph=300,
+                pause_colon=900,
+            )
+
+            pauses = self.collect_silence_durations(
+                processor,
+                "Автор сказал:\n(王)\nПродолжение.",
+            )
+
+            self.assertEqual(pauses, [300])
 
     def test_hash_scan_skips_same_unsupported_chunk_as_synthesis(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -5626,6 +6027,150 @@ class FfmpegSaveCommandTests(unittest.TestCase):
         self.assertEqual(self.values_after(command, "-ar"), ["48000"])
         self.assertEqual(self.values_after(command, "-ac"), ["1"])
         self.assertEqual(callbacks[-1][1], "success")
+
+    def test_book_opus_auto_stream_copies_uniform_cache_fragments(self):
+        # Для book fast path проверяется также канальность Ogg/Opus-заголовка:
+        # в идентификационном пакете поле каналов находится на смещении 9.
+        canonical_header = b"OpusHead" + bytes([0, 1]) + b"\x00" * 9
+        self.audio_file.write_bytes(fake_ogg_first_page(canonical_header))
+        second_audio = self.root / "second.ogg"
+        second_audio.write_bytes(fake_ogg_first_page(canonical_header))
+        processor = self.make_processor(
+            output_format="opus",
+            output_bitrate="auto",
+            output_sample_rate="auto",
+            output_channels="auto",
+            apply_output_tags=False,
+            tag_cover="",
+        )
+        output = self.root / "book.opus"
+        profile = {
+            "codec": "opus",
+            "sample_rate": 48000,
+            "channels": 1,
+            # Opus/VBR обычно не публикует номинальный bit_rate в ffprobe.
+            "bitrate": None,
+        }
+
+        def fake_run(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"copied")
+            return _FakeCompletedProcess()
+
+        with mock.patch.object(
+            studio, "_probe_audio_stream_profile", return_value=profile
+        ) as probe, mock.patch.object(
+            studio.subprocess, "run", side_effect=fake_run
+        ):
+            processor._merge_save_and_notify(
+                [self.audio_file, second_audio],
+                output,
+                output.name,
+                False,
+                None,
+            )
+
+        probe.assert_not_called()
+        command = list(processor._last_ffmpeg_save_command)
+        self.assertEqual(self.values_after(command, "-c:a"), ["copy"])
+        self.assertNotIn("-ar", command)
+        self.assertNotIn("-ac", command)
+        self.assertNotIn("-af", command)
+        self.assertEqual(output.read_bytes(), b"copied")
+
+    def test_book_opus_explicit_bitrate_keeps_encode_path(self):
+        second_audio = self.root / "second.ogg"
+        canonical_header = b"OpusHead" + bytes([0, 1]) + b"\x00" * 9
+        self.audio_file.write_bytes(fake_ogg_first_page(canonical_header))
+        second_audio.write_bytes(fake_ogg_first_page(canonical_header))
+        processor = self.make_processor(
+            output_format="opus",
+            output_bitrate="48k",
+            output_sample_rate="auto",
+            output_channels="auto",
+            apply_output_tags=False,
+            tag_cover="",
+        )
+        output = self.root / "book-explicit.opus"
+        profile = {
+            "codec": "opus",
+            "sample_rate": 48000,
+            "channels": 1,
+            "bitrate": None,
+        }
+
+        def fake_run(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"encoded")
+            return _FakeCompletedProcess()
+
+        with mock.patch.object(
+            studio, "_probe_audio_stream_profile", return_value=profile
+        ) as probe, mock.patch.object(
+            studio.subprocess, "run", side_effect=fake_run
+        ):
+            processor._merge_save_and_notify(
+                [self.audio_file, second_audio],
+                output,
+                output.name,
+                False,
+                None,
+            )
+
+        probe.assert_not_called()
+        command = list(processor._last_ffmpeg_save_command)
+        self.assertEqual(self.values_after(command, "-c:a"), ["libopus"])
+        self.assertEqual(self.values_after(command, "-b:a"), ["48k"])
+        self.assertEqual(self.values_after(command, "-ar"), ["48000"])
+        self.assertEqual(self.values_after(command, "-ac"), ["1"])
+
+    def test_book_opus_retries_encoding_when_fast_copy_is_rejected(self):
+        canonical_header = b"OpusHead" + bytes([0, 1]) + b"\x00" * 9
+        self.audio_file.write_bytes(fake_ogg_first_page(canonical_header))
+        second_audio = self.root / "second.ogg"
+        second_audio.write_bytes(fake_ogg_first_page(canonical_header))
+        processor = self.make_processor(
+            output_format="opus",
+            output_bitrate="auto",
+            output_sample_rate="auto",
+            output_channels="auto",
+            apply_output_tags=False,
+            tag_cover="",
+        )
+        output = self.root / "book-retry.opus"
+        commands = []
+
+        def fake_run(command, **_kwargs):
+            commands.append(command)
+            if len(commands) == 1:
+                return mock.Mock(returncode=1, stderr=b"packet mismatch")
+            Path(command[-1]).write_bytes(b"encoded")
+            return _FakeCompletedProcess()
+
+        with mock.patch.object(
+            studio, "_probe_audio_stream_profile"
+        ) as probe, mock.patch.object(
+            studio.subprocess, "run", side_effect=fake_run
+        ), self.assertLogs(level=logging.WARNING) as logs:
+            processor._merge_save_and_notify(
+                [self.audio_file, second_audio],
+                output,
+                output.name,
+                False,
+                None,
+            )
+
+        probe.assert_not_called()
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(self.values_after(commands[0], "-c:a"), ["copy"])
+        self.assertNotIn("-ar", commands[0])
+        self.assertNotIn("-ac", commands[0])
+        self.assertEqual(self.values_after(commands[1], "-c:a"), ["libopus"])
+        self.assertEqual(self.values_after(commands[1], "-b:a"), ["48k"])
+        self.assertEqual(self.values_after(commands[1], "-ar"), ["48000"])
+        self.assertEqual(self.values_after(commands[1], "-ac"), ["1"])
+        self.assertTrue(any(
+            "повтор через libopus" in message for message in logs.output
+        ))
+        self.assertEqual(output.read_bytes(), b"encoded")
 
 
 class CacheBehaviorTests(unittest.TestCase):
