@@ -127,12 +127,23 @@ jobs:
           fi
           /usr/bin/arch -x86_64 /usr/bin/uname -m
           # ARM Homebrew остаётся в /opt/homebrew; Intel использует отдельный префикс.
-          # Права меняются только у каталогов на одноразовой машине Actions.
-          for directory in /usr/local/Homebrew /usr/local/Cellar /usr/local/opt \
-            /usr/local/bin /usr/local/sbin /usr/local/lib /usr/local/include \
-            /usr/local/share /usr/local/etc /usr/local/var /usr/local/Frameworks; do
+          # Подготавливаем также вложенные каталоги из проверки Homebrew:
+          # смена владельца share не делает существующий share/man доступным.
+          # Права меняются только у перечисленных каталогов одноразового runner.
+          for relative_directory in Homebrew Cellar opt bin sbin lib include share etc var Frameworks \
+            etc/bash_completion.d lib/cps lib/pkgconfig "lib/python$MACOS_PYTHON_SERIES" \
+            "lib/python$MACOS_PYTHON_SERIES/site-packages" \
+            share/aclocal share/doc share/info share/locale share/cps share/man \
+            share/man/man1 share/man/man2 share/man/man3 share/man/man4 \
+            share/man/man5 share/man/man6 share/man/man7 share/man/man8 \
+            share/zsh share/zsh/site-functions share/fish share/fish/vendor_completions.d \
+            share/fish/vendor_functions.d share/pwsh share/pwsh/completions \
+            var/log var/homebrew var/homebrew/linked var/homebrew/locks; do
+            directory="/usr/local/$relative_directory"
             sudo mkdir -p "$directory"
             sudo chown "$(id -un):$(id -gn)" "$directory"
+            sudo chmod u+rwx "$directory"
+            test -w "$directory"
           done
           # Homebrew определяет Intel-префикс по стандартной ссылке brew.
           # Без неё репозиторий в /usr/local/Homebrew ошибочно становится префиксом.
