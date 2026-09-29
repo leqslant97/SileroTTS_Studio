@@ -376,7 +376,7 @@ jobs:
               "$download_url" -o "$tools_dir/$tool.zip"
             unzip -o -q "$tools_dir/$tool.zip" -d "$tools_dir"
             chmod +x "$tools_dir/$tool"
-            /usr/bin/lipo -verify_arch x86_64 "$tools_dir/$tool"
+            /usr/bin/lipo "$tools_dir/$tool" -verify_arch x86_64
             /usr/bin/arch -x86_64 "$tools_dir/$tool" -version
           done
           echo "$tools_dir" >> "$GITHUB_PATH"
