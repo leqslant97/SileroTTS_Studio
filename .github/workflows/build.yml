@@ -116,33 +116,31 @@ jobs:
 
       - name: Set up Homebrew Python and Tk on macOS
         if: runner.os == 'macOS'
+        timeout-minutes: 60
         shell: bash
         env:
-          # На образах Intel уже есть ссылки Python в /usr/local/bin.
-          # Они не влияют на сборку: ниже каждый вызов Python использует
-          # абсолютный путь из выбранной формулы.
+          # Все вызовы Python ниже используют абсолютный путь к выбранной формуле.
           HOMEBREW_NO_PATH_SHADOW_CHECK: "1"
         run: |
-          # Сборка macOS от setup-python сейчас содержит Tk 8.6. Используем
-          # отдельную формулу tkinter из Homebrew, чтобы PyInstaller собрал Tcl/Tk 9.
-          # На образе GitHub может быть устаревший кэш tap или bottle. Обновляем
-          # метаданные формул, чтобы Python и python-tk устанавливались одной
-          # совместимой парой.
-          # Образы Intel содержат ссылки /usr/local/bin, принадлежащие образу.
-          # Homebrew 4.5+ умеет установить keg, не пытаясь заменить эти ссылки.
-          # Не меняем глобальный Python runner и ниже используем только opt-префиксы
-          # формул; это устраняет конфликт ссылок и затенение PATH.
+          # Обновляем формулы вместе, чтобы Python и tkinter использовали одну версию.
           brew update
           python_series="$MACOS_PYTHON_SERIES"
           brew install --skip-link "python@$python_series"
-          brew install --skip-link "python-tk@$python_series"
+          # Python ищет pip в общем site-packages Homebrew. --skip-link не создаёт
+          # эти ссылки; сборка tkinter из исходников тогда падает с No module named pip.
+          # В одноразовом runner разрешаем заменить ссылки предустановленного Python.
+          brew link --overwrite "python@$python_series"
           python_prefix="$(brew --prefix "python@$python_series")"
           python_bin="$python_prefix/bin/python$python_series"
           test -x "$python_bin"
+          "$python_bin" -m pip --version
+          # Для Intel зависимости могут собираться из исходников. Подробный вывод
+          # показывает ход компиляции вместо многоминутного молчания на этапе make.
+          brew install --verbose --skip-link "python-tk@$python_series"
           echo "MACOS_PYTHON=$python_bin" >> "$GITHUB_ENV"
           echo "Homebrew Python: $python_bin"
           "$python_bin" --version
-          installed_python_version="$($python_bin -c 'import platform; print(platform.python_version())')"
+          installed_python_version="$("$python_bin" -c 'import platform; print(platform.python_version())')"
           if [[ "${installed_python_version%.*}" != "$MACOS_PYTHON_SERIES" ]]; then
             echo "::error::Homebrew installed Python $installed_python_version; expected $MACOS_PYTHON_SERIES.x"
             exit 1
@@ -246,6 +244,9 @@ jobs:
           python -m pip install -r requirements-release.txt
           python -m pip check
 
+      - name: Set up FFmpeg
+        uses: AnimMouse/setup-ffmpeg@v1
+
       - name: Verify Python runtime dependencies
         shell: bash
         run: |
@@ -312,9 +313,6 @@ jobs:
           print("pydub:", pydub.__file__)
           print("EbookLib EPUB smoke test: OK")
           PY
-
-      - name: Set up FFmpeg
-        uses: AnimMouse/setup-ffmpeg@v1
 
       - name: Verify required FFmpeg codecs
         shell: bash
