@@ -30,6 +30,10 @@ env:
   # Для обновления формул меняем ревизию: она входит в ключ кэша.
   MACOS_INTEL_BREW_VERSION: "7.0.7"
   MACOS_INTEL_CORE_REVISION: "146dcd3798d82b3e916ae27a08956e8ca4e08715"
+  # После истечения Actions Cache этот архив позволяет восстановить проверенное
+  # окружение до резервной установки Homebrew.
+  MACOS_INTEL_TOOLCHAIN_RELEASE_TAG: "toolchain-macos-intel-2026-09"
+  MACOS_INTEL_TOOLCHAIN_ARCHIVE: "macos-intel-toolchain-python-3.13.15-tk-9.0-brew-7.0.7-core-146dcd3798d82b3e916ae27a08956e8ca4e08715-ffmpeg-9.0.2.tar.gz"
 
 jobs:
   build:
@@ -163,12 +167,80 @@ jobs:
             /usr/local/etc/ca-certificates
           key: macos-15-x86_64-python-${{ env.PYTHON_VERSION }}-tk-${{ env.MACOS_TK_SERIES }}-brew-${{ env.MACOS_INTEL_BREW_VERSION }}-core-${{ env.MACOS_INTEL_CORE_REVISION }}-v1
 
+      - name: Restore Intel toolchain from technical Release
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64' && steps.intel-toolchain.outputs.cache-hit != 'true'
+        id: intel-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOLCHAIN_RELEASE_TAG: ${{ env.MACOS_INTEL_TOOLCHAIN_RELEASE_TAG }}
+          TOOLCHAIN_ARCHIVE: ${{ env.MACOS_INTEL_TOOLCHAIN_ARCHIVE }}
+        run: |
+          archive_path="$RUNNER_TEMP/$TOOLCHAIN_ARCHIVE"
+          release_api="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TOOLCHAIN_RELEASE_TAG"
+          release_json=""
+          if ! release_json="$(curl --fail --silent --show-error --location \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$release_api")"; then
+            echo "::warning::Технический релиз $TOOLCHAIN_RELEASE_TAG недоступен; используется Homebrew."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          asset_url=""
+          if ! asset_url="$(jq -er --arg name "$TOOLCHAIN_ARCHIVE" \
+            '.assets[] | select(.name == $name) | .url' <<< "$release_json")"; then
+            echo "::warning::В техническом релизе нет архива $TOOLCHAIN_ARCHIVE; используется Homebrew."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! curl --fail --silent --show-error --location --retry 3 \
+            --header "Accept: application/octet-stream" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$asset_url" -o "$archive_path"; then
+            echo "::warning::Не удалось скачать архив технического релиза; используется Homebrew."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! tar -xzf "$archive_path" -C / ./usr/local; then
+            echo "::warning::Не удалось восстановить Intel Homebrew-префикс; используется Homebrew."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          tools_root="$RUNNER_TEMP/intel-toolchain-tools"
+          mkdir -p "$tools_root"
+          if ! tar -xzf "$archive_path" -C "$tools_root" ./tools; then
+            echo "::warning::Не удалось извлечь Intel FFmpeg из архива; используется загрузка FFmpeg."
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+            echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tools_dir="$tools_root/tools"
+          test -x "$tools_dir/ffmpeg"
+          test -x "$tools_dir/ffprobe"
+          /usr/bin/lipo "$tools_dir/ffmpeg" -verify_arch x86_64
+          /usr/bin/lipo "$tools_dir/ffprobe" -verify_arch x86_64
+          echo "$tools_dir" >> "$GITHUB_PATH"
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg-restored=true" >> "$GITHUB_OUTPUT"
+
       - name: Set up Intel Python and Tk under Rosetta
         if: runner.os == 'macOS' && matrix.target_arch == 'x86_64'
         timeout-minutes: 90
         shell: /usr/bin/arch -x86_64 /bin/bash --noprofile --norc -eo pipefail {0}
         env:
           INTEL_CACHE_HIT: ${{ steps.intel-toolchain.outputs.cache-hit }}
+          INTEL_ARCHIVE_HIT: ${{ steps.intel-release.outputs.restored }}
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_FROM_API: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
@@ -179,7 +251,7 @@ jobs:
           export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
           unset HOMEBREW_PREFIX HOMEBREW_CELLAR HOMEBREW_REPOSITORY
           intel_brew=/usr/local/bin/brew
-          if [[ "$INTEL_CACHE_HIT" != "true" ]]; then
+          if [[ "$INTEL_CACHE_HIT" != "true" && "$INTEL_ARCHIVE_HIT" != "true" ]]; then
             git clone --depth 1 --branch "$MACOS_INTEL_BREW_VERSION" \
               https://github.com/Homebrew/brew.git /usr/local/Homebrew
             core_dir=/usr/local/Homebrew/Library/Taps/homebrew/homebrew-core
@@ -361,7 +433,7 @@ jobs:
         uses: AnimMouse/setup-ffmpeg@v1
 
       - name: Set up Intel FFmpeg and FFprobe
-        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64'
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64' && steps.intel-release.outputs.ffmpeg-restored != 'true'
         shell: bash
         run: |
           # Обычный action выбирает архитектуру runner; здесь нужны Intel-бинарники.
