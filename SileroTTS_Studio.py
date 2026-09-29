@@ -8959,6 +8959,8 @@ def _probe_audio_stream_profile(path):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             startupinfo=startupinfo,
         )
@@ -10248,6 +10250,8 @@ def _probe_audio_duration(path):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             startupinfo=startupinfo,
         )
@@ -10604,6 +10608,7 @@ def probe_m4b_chapters(path, *, timeout=30):
         "-show_streams",
         str(source),
     ]
+    # FFprobe выводит JSON в UTF-8 независимо от системной кодировки Windows.
     try:
         result = subprocess.run(
             command,
@@ -10611,6 +10616,8 @@ def probe_m4b_chapters(path, *, timeout=30):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             startupinfo=startupinfo,
         )
