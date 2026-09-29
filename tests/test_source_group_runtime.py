@@ -30,6 +30,8 @@ class SourceGroupOutputRuntimeTests(unittest.TestCase):
         self.source = self.root / "texts"
         self.source.mkdir()
         self.output = self.root / "audio"
+        # Настоящий TTSProcessor создаёт папку вывода до запуска очереди.
+        self.output.mkdir()
         self.paths = {}
         self.fragments = {}
         for number in range(1, 5):
@@ -52,15 +54,10 @@ class SourceGroupOutputRuntimeTests(unittest.TestCase):
         self.processor.encode_semaphore = None
         self.processor.processing_statuses_ram = {}
         self.processor.process_text_file.side_effect = self.collect
-
-        def mark_status(path, status):
-            key = str(Path(path).resolve())
-            if status in {"error", "warning"}:
-                self.processor.processing_statuses_ram[key] = status
-            else:
-                self.processor.processing_statuses_ram.pop(key, None)
-
-        self.processor._mark_output_status.side_effect = mark_status
+        self.processor.cache_lock = threading.RLock()
+        self.processor._mark_output_status.side_effect = (
+            studio.TTSProcessor._mark_output_status.__get__(self.processor)
+        )
         self.app = object.__new__(studio.TTSApp)
         self.app._source_plan_dirty = True
         self.app._invalidate_source_runtime_m4b_plan()
@@ -355,7 +352,7 @@ class SourceGroupOutputRuntimeTests(unittest.TestCase):
                 self.run_queue()
 
                 self.assertFalse(first_group["path"].exists())
-                self.assertEqual(self.processor.processing_statuses_ram[str(first_group["path"])], "error")
+                self.assertEqual(self.processor.processing_statuses_ram[str(first_group["path"].resolve())], "error")
                 self.assertTrue(healthy_group["path"].is_file())
                 self.assertTrue(self.app.finish_processing.call_args.args[-1])
 
@@ -372,7 +369,7 @@ class SourceGroupOutputRuntimeTests(unittest.TestCase):
         self.processor.process_text_file.side_effect = collect
         self.run_queue()
         self.assertTrue(first_group["path"].is_file())
-        self.assertEqual(self.processor.processing_statuses_ram[str(first_group["path"])], "warning")
+        self.assertEqual(self.processor.processing_statuses_ram[str(first_group["path"].resolve())], "warning")
         self.assertTrue(self.app.finish_processing.call_args.args[-1])
         healthy_state = healthy_group["path"].read_bytes(), healthy_group["path"].stat().st_mtime_ns
         self.encoded.clear()
@@ -430,7 +427,7 @@ class SourceGroupOutputRuntimeTests(unittest.TestCase):
         with mock.patch.object(studio, "_export_merged_audio_ffmpeg", side_effect=encode):
             self.run_queue()
         self.assertTrue(self.app.finish_processing.call_args.args[-1])
-        self.assertEqual(self.processor.processing_statuses_ram[str(failed["path"])], "error")
+        self.assertEqual(self.processor.processing_statuses_ram[str(failed["path"].resolve())], "error")
         stable = {
             record["path"]: (record["path"].read_bytes(), record["path"].stat().st_mtime_ns)
             for record in self.records if record is not failed

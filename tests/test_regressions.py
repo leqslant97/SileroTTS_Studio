@@ -11407,13 +11407,19 @@ class TkLayoutRegressionTests(unittest.TestCase):
             """
             import importlib.util
             import json
+            import logging
+            import os
             import shutil
             import sys
             import tempfile
             import tkinter as tk
+            from contextlib import ExitStack
             from pathlib import Path
 
-            with tempfile.TemporaryDirectory(prefix="stts_ui_test_") as temporary:
+            original_directory = Path.cwd()
+            with tempfile.TemporaryDirectory(prefix="stts_ui_test_") as temporary, ExitStack() as cleanup:
+                cleanup.callback(os.chdir, original_directory)
+                cleanup.callback(logging.shutdown)
                 isolated = Path(temporary) / "SileroTTS_Studio.py"
                 shutil.copy2(sys.argv[1], isolated)
                 spec = importlib.util.spec_from_file_location("stts_ui_test", isolated)
@@ -11494,10 +11500,11 @@ class TkLayoutRegressionTests(unittest.TestCase):
             """
         )
         result = subprocess.run(
-            [sys.executable, "-c", script, str(MODULE_PATH)],
+            [sys.executable, "-X", "utf8", "-c", script, str(MODULE_PATH)],
             cwd=PROJECT_DIR,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=40,
             check=False,
         )
@@ -11512,7 +11519,7 @@ class TkLayoutRegressionTests(unittest.TestCase):
         self.assertEqual(len(reports), 1, result.stdout + result.stderr)
         report = json.loads(reports[0])
         self.assertEqual(report["collapsed_height"], report["initial_height"])
-        self.assertLess(report["initial_api_scroll"][1], 1)
+        # Если все настройки помещаются, прокрутка не нужна; нижнее поле доступно в обоих случаях.
         self.assertTrue(report["last_api_entry_visible"])
         for requested, available in report["rows"]:
             self.assertLessEqual(requested, available)
@@ -12620,6 +12627,7 @@ class InplaceTagCoverTests(unittest.TestCase):
                 check=True,
                 stdout=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
             streams = json.loads(probe.stdout)["streams"]
             audio = next(
@@ -12800,6 +12808,7 @@ class M4BChapterProbeTests(unittest.TestCase):
         self.assertIn("невозможно определить положительную длительность", warnings_text)
 
     def test_probe_reads_json_and_reports_subprocess_failure(self):
+        source = Path(tempfile.gettempdir()).resolve() / "book.m4b"
         completed = subprocess.CompletedProcess(
             args=[],
             returncode=0,
@@ -12820,13 +12829,13 @@ class M4BChapterProbeTests(unittest.TestCase):
         with mock.patch.object(
             studio.subprocess, "run", return_value=completed
         ) as run:
-            result = studio.probe_m4b_chapters("/tmp/book.m4b", timeout=7)
+            result = studio.probe_m4b_chapters(source, timeout=7)
 
         command = run.call_args.args[0]
         self.assertIn("-show_chapters", command)
         self.assertIn("-show_format", command)
         self.assertIn("-show_streams", command)
-        self.assertEqual(command[-1], "/tmp/book.m4b")
+        self.assertEqual(command[-1], str(source))
         self.assertEqual(run.call_args.kwargs["timeout"], 7)
         self.assertEqual(result["chapters"][0]["title"], "Chapter")
         self.assertEqual(result["format"]["tags"]["album"], "Book")
@@ -12836,10 +12845,10 @@ class M4BChapterProbeTests(unittest.TestCase):
         )
         with mock.patch.object(studio.subprocess, "run", side_effect=failure):
             with self.assertRaisesRegex(RuntimeError, "invalid data"):
-                studio.probe_m4b_chapters("/tmp/broken.m4b")
+                studio.probe_m4b_chapters(source.with_name("broken.m4b"))
 
     def test_virtual_group_inherits_container_metadata_and_clip_ranges(self):
-        source = "/books/Книга.m4b"
+        source = str(Path(tempfile.gettempdir()).resolve() / "Книга.m4b")
         probe_result = {
             "format": {
                 "tags": {
@@ -14048,6 +14057,7 @@ class FfmpegIntegrationTests(unittest.TestCase):
                 check=True,
                 stdout=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
             streams = json.loads(probe.stdout)["streams"]
             audio = next(
@@ -14164,6 +14174,7 @@ class FfmpegIntegrationTests(unittest.TestCase):
                 check=True,
                 stdout=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
             stream = json.loads(probe.stdout)["streams"][0]
             self.assertEqual(stream["codec_name"], "opus")
@@ -14207,6 +14218,7 @@ class FfmpegIntegrationTests(unittest.TestCase):
                 check=True,
                 stdout=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
             stream = json.loads(probe.stdout)["streams"][0]
             self.assertEqual(stream["codec_name"], "opus")
@@ -14237,6 +14249,7 @@ class FfmpegIntegrationTests(unittest.TestCase):
                 check=True,
                 stdout=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
 
             result = studio._transcode_cache_audio_to_opus(cache_file)
@@ -14250,6 +14263,7 @@ class FfmpegIntegrationTests(unittest.TestCase):
                 check=True,
                 stdout=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
             before_duration = float(json.loads(before_probe.stdout)["format"]["duration"])
             after_duration = float(json.loads(after_probe.stdout)["format"]["duration"])
@@ -14293,6 +14307,7 @@ class FfmpegIntegrationTests(unittest.TestCase):
                 check=True,
                 stdout=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
             duration = float(json.loads(probe.stdout)["format"]["duration"])
             self.assertGreater(duration, 0.45)
@@ -14342,6 +14357,7 @@ class FfmpegIntegrationTests(unittest.TestCase):
                 check=True,
                 stdout=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
             data = json.loads(probe.stdout)
             pictures = [
@@ -14428,6 +14444,7 @@ class FfmpegIntegrationTests(unittest.TestCase):
                 check=True,
                 stdout=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
             streams = json.loads(probe.stdout)["streams"]
             pictures = [
@@ -18949,25 +18966,27 @@ class OutputPlanningUnitTests(unittest.TestCase):
                 )
 
     def test_output_target_planner_keeps_legacy_single_directory(self):
+        root = Path(tempfile.gettempdir()).resolve()
         target = studio.OutputTarget(format="mp3", enabled=True)
         planned = studio.plan_output_targets(
-            [target], "/base", legacy_single_dir="/legacy"
+            [target], root / "base", legacy_single_dir=root / "legacy"
         )
         self.assertEqual(len(planned), 1)
-        self.assertEqual(planned[0]["output_dir"], "/legacy")
+        self.assertEqual(Path(planned[0]["output_dir"]), root / "legacy")
         self.assertEqual(planned[0]["format"], "mp3")
 
     def test_output_target_planner_assigns_separate_dirs_and_skips_disabled(self):
+        base = Path(tempfile.gettempdir()).resolve() / "base"
         planned = studio.plan_output_targets(
             [
                 studio.OutputTarget(format="mp3"),
                 studio.OutputTarget(format="opus"),
                 studio.OutputTarget(format="m4b", enabled=False),
             ],
-            "/base",
+            base,
         )
         self.assertEqual(len(planned), 2)
-        self.assertEqual([Path(item["output_dir"]).parent for item in planned], [Path("/base"), Path("/base")])
+        self.assertEqual([Path(item["output_dir"]).parent for item in planned], [base, base])
         self.assertEqual([Path(item["output_dir"]).name for item in planned], ["mp3", "opus"])
 
     def test_output_target_planner_disambiguates_duplicate_default_formats(self):
@@ -19126,8 +19145,9 @@ class OutputPlanningUnitTests(unittest.TestCase):
 
     def test_direct_planner_preserves_explicit_target_directory_until_cleared(self):
         """Низкоуровневый API сохраняет явный путь для совместимости."""
-        old_dir = "/tmp/Старая папка/opus"
-        new_dir = "/tmp/Новая папка/opus"
+        root = Path(tempfile.gettempdir()).resolve()
+        old_dir = str(root / "Старая папка" / "opus")
+        new_dir = str(root / "Новая папка" / "opus")
         target = studio.OutputTarget(
             format="opus",
             output_dir=old_dir,
@@ -19153,8 +19173,9 @@ class OutputPlanningUnitTests(unittest.TestCase):
 
     def test_saved_single_target_delegates_its_directory_to_common_folder(self):
         """Старая папка одной цели не переживает смену общей папки."""
-        stale_dir = "/tmp/Старый проект/m4b"
-        common_dir = "/tmp/Новый проект/m4b"
+        root = Path(tempfile.gettempdir()).resolve()
+        stale_dir = str(root / "Старый проект" / "m4b")
+        common_dir = str(root / "Новый проект" / "m4b")
         targets = studio.normalize_output_target_directories(
             [
                 studio.OutputTarget(

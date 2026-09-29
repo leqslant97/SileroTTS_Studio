@@ -10,14 +10,20 @@ from pathlib import Path
 class SourceTargetDialogTests(unittest.TestCase):
     def test_real_dialog_preserves_custom_targets_and_applies_explicit_profile_changes(self):
         script = textwrap.dedent('''
+            from contextlib import ExitStack
             import copy
             import importlib.util
+            import logging
+            import os
             import shutil
             import sys
             import tempfile
             from pathlib import Path
 
-            with tempfile.TemporaryDirectory() as directory:
+            with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+                # Windows не позволяет удалить текущую папку или открытый лог.
+                cleanup.callback(os.chdir, Path.cwd())
+                cleanup.callback(logging.shutdown)
                 module_path = Path(directory) / "SileroTTS_Studio.py"
                 shutil.copy2(sys.argv[1], module_path)
                 spec = importlib.util.spec_from_file_location("dialog_test", module_path)
@@ -32,6 +38,8 @@ class SourceTargetDialogTests(unittest.TestCase):
                 root.withdraw()
                 try:
                     app = studio.TTSApp(root)
+                    root.deiconify()
+                    root.update()
                     failures = []
                     app._show_error = lambda *args, **kwargs: failures.append(args)
                     custom = studio.normalize_source_synthesis_targets([
@@ -54,7 +62,9 @@ class SourceTargetDialogTests(unittest.TestCase):
                     def open_dialog():
                         app.open_source_output_targets_dialog()
                         root.update()
-                        return next(w for w in root.winfo_children() if w.winfo_class() == "Toplevel" and "Набор выходов —" in w.title())
+                        dialog = next(w for w in root.winfo_children() if w.winfo_class() == "Toplevel" and "Набор выходов —" in w.title())
+                        assert dialog.winfo_viewable()
+                        return dialog
 
                     def profiles(dialog):
                         return [w for w in children(dialog) if w.winfo_class() == "TCombobox" and "Текущие параметры" in w.cget("values")]

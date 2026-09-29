@@ -125,6 +125,34 @@ class InplaceMetadataAuditTests(unittest.TestCase):
         and Path(studio.get_ffprobe_path()).is_file(),
         "Для проверки необходимы FFmpeg и FFprobe",
     )
+    def test_m4b_probe_reads_unicode_independently_of_system_encoding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            source = folder / "chapter.wav"
+            output = folder / "Книга.m4b"
+            subprocess.run([
+                studio.get_ffmpeg_path(), "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=duration=0.1", str(source),
+            ], check=True)
+            studio._export_m4b_ffmpeg(
+                [source], output,
+                chapters=[{"title": "Глава Ёж — 海", "duration": .1}],
+                tags={"title": "Книга", "album": "Серия приключений"},
+            )
+            for encoding in ("cp1251", "cp1252"):
+                with self.subTest(encoding=encoding), mock.patch.object(
+                    subprocess, "_text_encoding", return_value=encoding,
+                ):
+                    result = studio.probe_m4b_chapters(output)
+                    self.assertEqual(result["chapters"][0]["title"], "Глава Ёж — 海")
+                    self.assertEqual(result["format"]["tags"]["title"], "Книга")
+                    self.assertEqual(result["format"]["tags"]["album"], "Серия приключений")
+
+    @unittest.skipUnless(
+        Path(studio.get_ffmpeg_path()).is_file()
+        and Path(studio.get_ffprobe_path()).is_file(),
+        "Для проверки необходимы FFmpeg и FFprobe",
+    )
     def test_m4b_cover_and_tags_keep_chapters_and_volume_numbers(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)

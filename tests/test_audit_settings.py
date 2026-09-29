@@ -93,7 +93,10 @@ class BatchFolderSafetyTests(unittest.TestCase):
 class NormalizerProfileTransactionTests(unittest.TestCase):
     def test_delete_cancel_failed_save_and_commit_preserve_preview_identity(self):
         script = textwrap.dedent('''
+            from contextlib import ExitStack
             import importlib.util
+            import logging
+            import os
             import shutil
             import sys
             import tempfile
@@ -110,7 +113,11 @@ class NormalizerProfileTransactionTests(unittest.TestCase):
                 return next(w for w in descendants(dialog)
                             if w.winfo_class() == "TButton" and w.cget("text") == text)
 
-            with tempfile.TemporaryDirectory(prefix="stts_profile_audit_") as temp:
+            with tempfile.TemporaryDirectory(prefix="stts_profile_audit_") as temp, ExitStack() as cleanup:
+                # Импорт меняет рабочую папку и открывает лог: освобождаем оба
+                # ресурса до удаления временной папки, в том числе при ошибке.
+                cleanup.callback(os.chdir, Path.cwd())
+                cleanup.callback(logging.shutdown)
                 isolated = Path(temp) / "SileroTTS_Studio.py"
                 shutil.copy2(sys.argv[1], isolated)
                 spec = importlib.util.spec_from_file_location("studio_profile_audit", isolated)
@@ -124,6 +131,10 @@ class NormalizerProfileTransactionTests(unittest.TestCase):
                 root.withdraw()
                 try:
                     app = module.TTSApp(root)
+                    # На Windows скрытый родитель скрывает и transient-диалог;
+                    # пользовательский выбор проверяем в отображённом окне.
+                    root.deiconify()
+                    root.update()
                     entry = module.make_normalizer_profile_entry(
                         module.normalizer_profile_from_config(app.config, name="Личный профиль")
                     )
@@ -140,19 +151,24 @@ class NormalizerProfileTransactionTests(unittest.TestCase):
                         dialog = next(w for w in root.winfo_children()
                                       if isinstance(w, tk.Toplevel)
                                       and w.title() == "Профили нормализации")
+                        assert dialog.winfo_viewable()
                         listing = next(w for w in descendants(dialog)
                                        if w.winfo_class() == "Listbox")
                         listing.selection_clear(0, tk.END)
                         listing.selection_set(listing.size() - 1)
                         listing.event_generate("<<ListboxSelect>>")
                         root.update()
-                        button(dialog, "🗑 Удалить").invoke()
+                        delete = button(dialog, "🗑 Удалить")
+                        assert not delete.instate(["disabled"])
+                        delete.invoke()
                         root.update()
+                        assert listing.size() == len(module.builtin_normalizer_profile_entries())
                         return dialog
 
                     dialog = delete_draft()
                     assert app._normalizer_preview_profile_id == entry["id"]
                     button(dialog, "Отмена").invoke()
+                    root.update()
                     assert app._normalizer_preview_profile_id == entry["id"]
                     assert app.config["normalizer_profiles"] == [entry]
                     app._persist_settings_snapshot.assert_not_called()
@@ -160,11 +176,16 @@ class NormalizerProfileTransactionTests(unittest.TestCase):
                     dialog = delete_draft()
                     app._persist_settings_snapshot.side_effect = OSError("Недоступная папка")
                     button(dialog, "Сохранить и закрыть").invoke()
+                    root.update()
                     assert app._normalizer_preview_profile_id == entry["id"]
                     assert app.config["normalizer_profiles"] == [entry]
                     app._show_error.assert_called_once()
+                    app._persist_settings_snapshot.assert_called_once()
+                    assert app._persist_settings_snapshot.call_args.args[0]["normalizer_profiles"] == []
                     app._persist_settings_snapshot.side_effect = None
                     button(dialog, "Сохранить и закрыть").invoke()
+                    root.update()
+                    assert app._persist_settings_snapshot.call_count == 2
                     assert app.config["normalizer_profiles"] == []
                     assert app._normalizer_preview_profile_id is None
                     assert app._normalizer_preview_profile_name == "Пользовательский"
