@@ -1,0 +1,220 @@
+name: Package macOS Intel toolchain
+
+on:
+  workflow_dispatch:
+    inputs:
+      cache_key:
+        description: "Точный ключ кэша Intel Python/Tk из build.yml"
+        required: true
+        type: string
+        default: "macos-15-x86_64-python-3.13.15-tk-9.0-brew-7.0.7-core-146dcd3798d82b3e916ae27a08956e8ca4e08715-v1"
+      release_tag:
+        description: "Тег отдельного технического релиза"
+        required: true
+        type: string
+        default: "toolchain-macos-intel-2026-09"
+      archive_version:
+        description: "Версия архива для имени файла"
+        required: true
+        type: string
+        default: "python-3.13.15-tk-9.0-brew-7.0.7-core-146dcd3798d82b3e916ae27a08956e8ca4e08715-ffmpeg-9.0.2"
+      publish:
+        description: "Сразу опубликовать релиз; без флажка создаётся черновик"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.13.15"
+  MACOS_PYTHON_SERIES: "3.13"
+  MACOS_TK_SERIES: "9.0"
+  MACOS_INTEL_BREW_VERSION: "7.0.7"
+  MACOS_INTEL_CORE_REVISION: "146dcd3798d82b3e916ae27a08956e8ca4e08715"
+  FFMPEG_VERSION: "9.0.2"
+
+jobs:
+  package:
+    name: Package verified Intel environment
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Prepare Rosetta and cache directories
+        shell: bash
+        run: |
+          if ! /usr/bin/arch -x86_64 /usr/bin/true; then
+            sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+          fi
+          /usr/bin/arch -x86_64 /usr/bin/uname -m
+
+          # Кэш распаковывается текущим пользователем в стандартный Intel-префикс.
+          for relative_directory in Homebrew Cellar opt lib etc \
+            "lib/python$MACOS_PYTHON_SERIES" \
+            "lib/python$MACOS_PYTHON_SERIES/site-packages" \
+            "etc/openssl@3" etc/ca-certificates; do
+            directory="/usr/local/$relative_directory"
+            sudo mkdir -p "$directory"
+            sudo chown "$(id -un):$(id -gn)" "$directory"
+            sudo chmod u+rwx "$directory"
+            test -w "$directory"
+          done
+
+      - name: Restore verified Intel Python and Tk cache
+        id: intel-toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /usr/local/Homebrew
+            /usr/local/Cellar
+            /usr/local/opt
+            /usr/local/lib/python${{ env.MACOS_PYTHON_SERIES }}
+            /usr/local/etc/openssl@3
+            /usr/local/etc/ca-certificates
+          key: ${{ inputs.cache_key }}
+
+      - name: Require an exact cache hit
+        shell: bash
+        env:
+          CACHE_KEY: ${{ inputs.cache_key }}
+        run: |
+          if [[ "${{ steps.intel-toolchain.outputs.cache-hit }}" != "true" ]]; then
+            echo "::error::Не найден точный кэш Intel Python/Tk: $CACHE_KEY"
+            echo "Сначала нужно успешно выполнить macOS Intel job из build.yml."
+            exit 1
+          fi
+
+      - name: Verify cached Intel Python and Tk
+        shell: bash
+        run: |
+          python_bin="/usr/local/opt/python@$MACOS_PYTHON_SERIES/bin/python$MACOS_PYTHON_SERIES"
+          test -x "$python_bin"
+          /usr/bin/lipo "$python_bin" -verify_arch x86_64
+          /usr/bin/arch -x86_64 "$python_bin" - <<'PY'
+          import os
+          import platform
+          import sys
+          import tkinter
+
+          assert platform.machine() == "x86_64", platform.machine()
+          assert platform.python_version() == os.environ["PYTHON_VERSION"]
+          assert tkinter.TclVersion == 9.0
+          assert tkinter.TkVersion == 9.0
+          patchlevel = str(tkinter.Tcl().call("info", "patchlevel"))
+          assert patchlevel.startswith(os.environ["MACOS_TK_SERIES"] + "."), patchlevel
+          print("Python:", platform.python_version())
+          print("Tk:", patchlevel)
+          print("_tkinter:", tkinter._tkinter.__file__)
+          PY
+
+          tk_module="$(/usr/bin/arch -x86_64 "$python_bin" -c 'import tkinter._tkinter; print(tkinter._tkinter.__file__)')"
+          /usr/bin/lipo "$tk_module" -verify_arch x86_64
+
+      - name: Download and verify Intel FFmpeg tools
+        id: ffmpeg
+        shell: bash
+        run: |
+          tools_dir="$RUNNER_TEMP/ffmpeg-x86_64"
+          mkdir -p "$tools_dir"
+          for tool in ffmpeg ffprobe; do
+            download_url="$(curl --fail --silent --show-error --location --retry 3 \
+              "https://evermeet.cx/ffmpeg/info/$tool/$FFMPEG_VERSION" | jq -er '.download.zip.url')"
+            curl --fail --silent --show-error --location --retry 3 \
+              "$download_url" -o "$tools_dir/$tool.zip"
+            unzip -o -q "$tools_dir/$tool.zip" -d "$tools_dir"
+            chmod +x "$tools_dir/$tool"
+            /usr/bin/lipo "$tools_dir/$tool" -verify_arch x86_64
+            /usr/bin/arch -x86_64 "$tools_dir/$tool" -version
+          done
+          echo "tools_dir=$tools_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Verify required Intel FFmpeg codecs
+        shell: bash
+        run: |
+          tools_dir="${{ steps.ffmpeg.outputs.tools_dir }}"
+          encoders="$(/usr/bin/arch -x86_64 "$tools_dir/ffmpeg" -hide_banner -encoders 2>&1)"
+          decoders="$(/usr/bin/arch -x86_64 "$tools_dir/ffmpeg" -hide_banner -decoders 2>&1)"
+          grep -q 'libopus' <<< "$encoders"
+          grep -q 'libvorbis' <<< "$encoders"
+          grep -Eq '[[:space:]]opus([[:space:]]|$)' <<< "$decoders"
+          grep -Eq '[[:space:]]vorbis([[:space:]]|$)' <<< "$decoders"
+
+      - name: Create versioned toolchain archive
+        id: archive
+        shell: bash
+        env:
+          ARCHIVE_VERSION: ${{ inputs.archive_version }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          archive_version="$ARCHIVE_VERSION"
+          release_tag="$RELEASE_TAG"
+          if [[ ! "$archive_version" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::archive_version содержит недопустимые символы"
+            exit 1
+          fi
+          if [[ ! "$release_tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::release_tag содержит недопустимые символы"
+            exit 1
+          fi
+
+          archive_root="$RUNNER_TEMP/intel-toolchain-root"
+          archive_path="$RUNNER_TEMP/macos-intel-toolchain-$archive_version.tar.gz"
+          rm -rf "$archive_root"
+          mkdir -p "$archive_root/usr/local" "$archive_root/tools"
+
+          # Эти каталоги соответствуют успешно восстановленному кэшу.
+          for relative_path in \
+            usr/local/Homebrew \
+            usr/local/Cellar \
+            usr/local/opt \
+            "usr/local/lib/python$MACOS_PYTHON_SERIES" \
+            usr/local/etc/openssl@3 \
+            usr/local/etc/ca-certificates; do
+            source_path="/$relative_path"
+            if [[ ! -e "$source_path" && ! -L "$source_path" ]]; then
+              echo "::error::Отсутствует компонент кэша: $source_path"
+              exit 1
+            fi
+            destination_path="$archive_root/$relative_path"
+            mkdir -p "$(dirname "$destination_path")"
+            cp -a "$source_path" "$destination_path"
+          done
+
+          tools_dir="${{ steps.ffmpeg.outputs.tools_dir }}"
+          cp -a "$tools_dir/ffmpeg" "$archive_root/tools/ffmpeg"
+          cp -a "$tools_dir/ffprobe" "$archive_root/tools/ffprobe"
+
+          {
+            printf '%s\n' "Silero TTS Studio macOS Intel build toolchain"
+            printf '%s\n' "Target: macOS 15 ARM64 runner under Rosetta, x86_64 binaries"
+            printf 'Python: %s\n' "$PYTHON_VERSION"
+            printf 'Tcl/Tk: %s.x\n' "$MACOS_TK_SERIES"
+            printf 'Homebrew: %s\n' "$MACOS_INTEL_BREW_VERSION"
+            printf 'Homebrew core revision: %s\n' "$MACOS_INTEL_CORE_REVISION"
+            printf 'FFmpeg/FFprobe: %s\n' "$FFMPEG_VERSION"
+            printf '%s\n' "Restore the usr/local tree at the Intel Homebrew prefix and use tools/ffmpeg and tools/ffprobe."
+          } > "$archive_root/TOOLCHAIN-MANIFEST.txt"
+
+          tar -czf "$archive_path" -C "$archive_root" .
+          tar -tzf "$archive_path" >/dev/null
+          ls -lh "$archive_path"
+          echo "archive_path=$archive_path" >> "$GITHUB_OUTPUT"
+
+      - name: Publish technical release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: macOS Intel build toolchain ${{ inputs.archive_version }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ !inputs.publish }}
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Технический архив окружения для сборки macOS Intel x86_64.
+
+            В архив входят проверенные Python/Tcl/Tk/Homebrew-компоненты и Intel-бинарники FFmpeg/FFprobe.
+            Он предназначен для workflow сборки и не является пользовательским приложением.
+          files: ${{ steps.archive.outputs.archive_path }}
+          fail_on_unmatched_files: true
