@@ -109,7 +109,7 @@ jobs:
           print("_tkinter:", tkinter._tkinter.__file__)
           PY
 
-          tk_module="$(/usr/bin/arch -x86_64 "$python_bin" -c 'import tkinter._tkinter; print(tkinter._tkinter.__file__)')"
+          tk_module="$(/usr/bin/arch -x86_64 "$python_bin" -c 'import _tkinter; print(_tkinter.__file__)')"
           /usr/bin/lipo "$tk_module" -verify_arch x86_64
 
       - name: Download and verify Intel FFmpeg tools
