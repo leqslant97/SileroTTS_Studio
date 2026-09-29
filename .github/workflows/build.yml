@@ -26,6 +26,10 @@ env:
   # сейчас содержит Tk 8.6. Сборке Aqua нужен Tk 9 для надёжного переключения
   # между светлым и тёмным оформлением системы на лету.
   MACOS_TK_SERIES: "9.0"
+  # Intel-окружение собирается под Rosetta и сохраняется целиком с зависимостями.
+  # Для обновления формул меняем ревизию: она входит в ключ кэша.
+  MACOS_INTEL_BREW_VERSION: "7.0.7"
+  MACOS_INTEL_CORE_REVISION: "146dcd3798d82b3e916ae27a08956e8ca4e08715"
 
 jobs:
   build:
@@ -66,7 +70,7 @@ jobs:
             pyinstaller: .venv/bin/pyinstaller
             target_arch: arm64
           - name: macOS Intel x86_64
-            os: macos-15-intel
+            os: macos-15
             app_name: SileroTTS_Studio_macOS_x86_64
             artifact_name: SileroTTS_Studio_macOS_Intel_x86_64.zip
             pyinstaller: .venv/bin/pyinstaller
@@ -114,8 +118,107 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Set up Homebrew Python and Tk on macOS
-        if: runner.os == 'macOS'
+      - name: Prepare Rosetta and Intel Homebrew directories
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64'
+        shell: bash
+        run: |
+          if ! /usr/bin/arch -x86_64 /usr/bin/true; then
+            sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+          fi
+          /usr/bin/arch -x86_64 /usr/bin/uname -m
+          # ARM Homebrew остаётся в /opt/homebrew; Intel использует отдельный префикс.
+          # Права меняются только у каталогов на одноразовой машине Actions.
+          for directory in /usr/local/Homebrew /usr/local/Cellar /usr/local/opt \
+            /usr/local/bin /usr/local/sbin /usr/local/lib /usr/local/include \
+            /usr/local/share /usr/local/etc /usr/local/var /usr/local/Frameworks; do
+            sudo mkdir -p "$directory"
+            sudo chown "$(id -un):$(id -gn)" "$directory"
+          done
+          # Homebrew определяет Intel-префикс по стандартной ссылке brew.
+          # Без неё репозиторий в /usr/local/Homebrew ошибочно становится префиксом.
+          ln -sfn /usr/local/Homebrew/bin/brew /usr/local/bin/brew
+
+      - name: Restore Intel Python and Tk
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64'
+        id: intel-toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /usr/local/Homebrew
+            /usr/local/Cellar
+            /usr/local/opt
+            /usr/local/lib/python${{ env.MACOS_PYTHON_SERIES }}
+            /usr/local/etc/openssl@3
+            /usr/local/etc/ca-certificates
+          key: macos-15-x86_64-python-${{ env.PYTHON_VERSION }}-tk-${{ env.MACOS_TK_SERIES }}-brew-${{ env.MACOS_INTEL_BREW_VERSION }}-core-${{ env.MACOS_INTEL_CORE_REVISION }}-v1
+
+      - name: Set up Intel Python and Tk under Rosetta
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64'
+        timeout-minutes: 90
+        shell: /usr/bin/arch -x86_64 /bin/bash --noprofile --norc -eo pipefail {0}
+        env:
+          INTEL_CACHE_HIT: ${{ steps.intel-toolchain.outputs.cache-hit }}
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+          HOMEBREW_NO_PATH_SHADOW_CHECK: "1"
+        run: |
+          # Не допускаем ARM-компиляторы и библиотеки из /opt/homebrew в Intel-окружение.
+          export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+          unset HOMEBREW_PREFIX HOMEBREW_CELLAR HOMEBREW_REPOSITORY
+          intel_brew=/usr/local/bin/brew
+          if [[ "$INTEL_CACHE_HIT" != "true" ]]; then
+            git clone --depth 1 --branch "$MACOS_INTEL_BREW_VERSION" \
+              https://github.com/Homebrew/brew.git /usr/local/Homebrew
+            core_dir=/usr/local/Homebrew/Library/Taps/homebrew/homebrew-core
+            git init "$core_dir"
+            git -C "$core_dir" remote add origin https://github.com/Homebrew/homebrew-core.git
+            git -C "$core_dir" fetch --depth 1 origin "$MACOS_INTEL_CORE_REVISION"
+            git -C "$core_dir" checkout --detach FETCH_HEAD
+            test "$("$intel_brew" --prefix)" = /usr/local
+            # Отдельная установка исключает конфликт bin/openssl со старой версией:
+            # Homebrew не передаёт --skip-link зависимостям устанавливаемой формулы.
+            if "$intel_brew" list --formula openssl@1.1 >/dev/null 2>&1; then
+              "$intel_brew" unlink openssl@1.1
+            fi
+            "$intel_brew" install --verbose --skip-link openssl@3
+            "$intel_brew" install --verbose --overwrite --skip-link "python@$MACOS_PYTHON_SERIES"
+            "$intel_brew" link --overwrite "python@$MACOS_PYTHON_SERIES"
+            "/usr/local/opt/python@$MACOS_PYTHON_SERIES/bin/python$MACOS_PYTHON_SERIES" -m pip --version
+            "$intel_brew" install --verbose --overwrite --skip-link "python-tk@$MACOS_PYTHON_SERIES"
+          fi
+          python_bin="/usr/local/opt/python@$MACOS_PYTHON_SERIES/bin/python$MACOS_PYTHON_SERIES"
+          "$python_bin" -m pip --version
+          "$python_bin" - <<'PY'
+          import os
+          import platform
+          import ssl
+          import tkinter
+          assert platform.machine() == "x86_64", platform.machine()
+          assert platform.python_version() == os.environ["PYTHON_VERSION"]
+          assert tkinter.TclVersion == 9.0 and tkinter.TkVersion == 9.0
+          assert str(tkinter.Tcl().call("info", "patchlevel")).startswith(os.environ["MACOS_TK_SERIES"] + ".")
+          print("Intel Python:", platform.python_version(), "Tk:", tkinter.TkVersion, ssl.OPENSSL_VERSION)
+          PY
+          echo "MACOS_PYTHON=$python_bin" >> "$GITHUB_ENV"
+          echo "MACOS_PYTHON_VERSION=$PYTHON_VERSION" >> "$GITHUB_ENV"
+
+      - name: Cache ready Intel Python and Tk
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64' && steps.intel-toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /usr/local/Homebrew
+            /usr/local/Cellar
+            /usr/local/opt
+            /usr/local/lib/python${{ env.MACOS_PYTHON_SERIES }}
+            /usr/local/etc/openssl@3
+            /usr/local/etc/ca-certificates
+          key: ${{ steps.intel-toolchain.outputs.cache-primary-key }}
+
+      - name: Set up Homebrew Python and Tk on Apple Silicon
+        if: runner.os == 'macOS' && matrix.target_arch == 'arm64'
         timeout-minutes: 60
         shell: bash
         env:
@@ -134,8 +237,6 @@ jobs:
           python_bin="$python_prefix/bin/python$python_series"
           test -x "$python_bin"
           "$python_bin" -m pip --version
-          # Для Intel зависимости могут собираться из исходников. Подробный вывод
-          # показывает ход компиляции вместо многоминутного молчания на этапе make.
           brew install --verbose --skip-link "python-tk@$python_series"
           echo "MACOS_PYTHON=$python_bin" >> "$GITHUB_ENV"
           echo "Homebrew Python: $python_bin"
@@ -245,10 +346,34 @@ jobs:
           python -m pip check
 
       - name: Set up FFmpeg
+        if: runner.os != 'macOS' || matrix.target_arch != 'x86_64'
         uses: AnimMouse/setup-ffmpeg@v1
+
+      - name: Set up Intel FFmpeg and FFprobe
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64'
+        shell: bash
+        run: |
+          # Обычный action выбирает архитектуру runner; здесь нужны Intel-бинарники.
+          tools_dir="$RUNNER_TEMP/ffmpeg-x86_64"
+          mkdir -p "$tools_dir"
+          ffmpeg_version="$(curl --fail --silent --show-error --location --retry 3 \
+            https://evermeet.cx/ffmpeg/info/ffmpeg/release | jq -er '.version')"
+          for tool in ffmpeg ffprobe; do
+            download_url="$(curl --fail --silent --show-error --location --retry 3 \
+              "https://evermeet.cx/ffmpeg/info/$tool/$ffmpeg_version" | jq -er '.download.zip.url')"
+            curl --fail --silent --show-error --location --retry 3 \
+              "$download_url" -o "$tools_dir/$tool.zip"
+            unzip -o -q "$tools_dir/$tool.zip" -d "$tools_dir"
+            chmod +x "$tools_dir/$tool"
+            /usr/bin/lipo -verify_arch x86_64 "$tools_dir/$tool"
+            /usr/bin/arch -x86_64 "$tools_dir/$tool" -version
+          done
+          echo "$tools_dir" >> "$GITHUB_PATH"
 
       - name: Verify Python runtime dependencies
         shell: bash
+        env:
+          EXPECTED_TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             py=.venv/Scripts/python.exe
@@ -280,6 +405,7 @@ jobs:
           if sys.version_info >= (3, 13):
               assert getattr(audioop, "__file__", None), "Python 3.13 must load audioop-lts"
           if sys.platform == "darwin":
+              assert platform.machine() == os.environ["EXPECTED_TARGET_ARCH"]
               expected_series = tuple(
                   map(int, os.environ["MACOS_PYTHON_SERIES"].split("."))
               )
@@ -468,7 +594,11 @@ jobs:
         shell: bash
         run: |
           # Для macOS выпускается только полное приложение onedir со встроенными FFmpeg/FFprobe.
-          "${{ matrix.pyinstaller }}" \
+          build_command=("${{ matrix.pyinstaller }}")
+          if [[ "${{ matrix.target_arch }}" == "x86_64" ]]; then
+            build_command=(/usr/bin/arch -x86_64 "${build_command[@]}")
+          fi
+          "${build_command[@]}" \
             --noconfirm \
             --clean \
             --windowed \
