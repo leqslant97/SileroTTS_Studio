@@ -1,8 +1,10 @@
-# Fully pinned cross-platform Python 3.13 release environment used by GitHub Actions.
-# Generated from and verified against the project's working Python 3.13 runtime;
-# platform-specific PyInstaller packages are guarded by environment markers.
-# Do not install this lock with Python 3.12/3.14. Update only after all CI smoke
-# tests and at least one local Python 3.13 application test pass.
+# Полностью зафиксированное кроссплатформенное окружение Python 3.13,
+# используемое GitHub Actions для релизной сборки.
+# Файл создан и проверен на рабочем окружении проекта Python 3.13;
+# платформенные пакеты PyInstaller ограничены маркерами окружения.
+# Не устанавливайте этот lock-файл с Python 3.12/3.14. Обновляйте его только
+# после всех быстрых проверок CI и хотя бы одного локального теста приложения
+# на Python 3.13.
 audioop-lts==0.2.2
 beautifulsoup4==4.15.0
 certifi==2026.7.22
@@ -33,6 +35,6 @@ soupsieve==2.9.2
 typing_extensions==4.16.0
 urllib3==2.7.0
 
-# Release-only build toolchain.
+# Инструменты, нужные только для релизной сборки.
 pyinstaller==6.22.0
 pyinstaller-hooks-contrib==2026.6

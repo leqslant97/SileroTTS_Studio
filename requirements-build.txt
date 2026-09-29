@@ -1,5 +1,5 @@
-# Local build environment for the supported Python 3.13 toolchain.
-# GitHub Actions release artifacts use requirements-release.txt instead.
+# Локальное окружение сборки для поддерживаемой цепочки Python 3.13.
+# Для артефактов релиза GitHub Actions используется requirements-release.txt.
 -r requirements.txt
 pyinstaller==6.22.0
 pyinstaller-hooks-contrib==2026.6
