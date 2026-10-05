@@ -18319,7 +18319,7 @@ class OutputPlanningUnitTests(unittest.TestCase):
                 output,
                 files,
                 targets=[studio.OutputTarget(format="m4b")],
-                # Пользователь не нажал «Подготовить оценочный план M4B».
+                # Пользователь ещё не подготовил план групп.
                 source_m4b_groups=(),
                 book_name="Книга",
             )
@@ -18359,7 +18359,7 @@ class OutputPlanningUnitTests(unittest.TestCase):
             first.write_text("one", encoding="utf-8")
 
             # Чистый планировщик получает ту же готовую метку группы, которую
-            # Интерфейс сохраняет настройки после подготовки плана M4B для источников.
+            # интерфейс сохраняет после подготовки плана групп из TXT.
             planned = studio.plan_source_synthesis_target_paths(
                 root,
                 output,
@@ -20031,8 +20031,8 @@ class OutputPlanningUnitTests(unittest.TestCase):
         self.assertEqual(diagnostic["explicit"], (old_dir,))
         self.assertTrue(diagnostic["single_mismatch"])
 
-        # Несколько целей могут намеренно указывать на разные места; эта
-        # диагностика ограничена неожиданностью только для одной цели.
+        # Для нескольких целей разные папки допустимы. Несовпадение с общей
+        # папкой экспорта отмечается только при единственной активной цели.
         multi = studio.output_target_directory_diagnostics(
             [
                 target,

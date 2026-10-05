@@ -75,7 +75,7 @@ class SourceOutputStatusTests(unittest.TestCase):
         )
 
     def legacy_case(self, *, groups=1):
-        """Возвращает очередь старого односоставного вывода без наборов целей."""
+        """Возвращает очередь с одним форматом вывода без набора целей."""
         case = self.make_case(groups=groups)
         # ``make_case`` создаёт современный набор целей по умолчанию, поэтому
         # убираем его из снимка полностью: process_queue выбирает старую ветку
