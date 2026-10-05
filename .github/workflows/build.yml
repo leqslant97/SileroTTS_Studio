@@ -210,11 +210,20 @@ jobs:
             exit 0
           fi
 
-          if ! tar -xzf "$archive_path" -C / ./usr/local; then
-            echo "::warning::Не удалось восстановить Intel Homebrew-префикс; используется Homebrew."
+          # Проверяем архив до изменения префикса, чтобы повреждённая загрузка
+          # могла безопасно перейти к резервной установке Homebrew.
+          if ! tar -tzf "$archive_path" ./usr/local >/dev/null; then
+            echo "::warning::Архив Intel-окружения повреждён или не содержит префикс; используется Homebrew."
             echo "restored=false" >> "$GITHUB_OUTPUT"
             echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          if ! tar -xzf "$archive_path" -C / ./usr/local; then
+            # После частичной распаковки резервная установка не гарантирует
+            # целостность Cellar и ссылок opt; сборку такого окружения прерываем.
+            echo "::error::Не удалось восстановить Intel Homebrew-префикс из проверенного архива."
+            exit 1
           fi
 
           tools_root="$RUNNER_TEMP/intel-toolchain-tools"
@@ -629,11 +638,13 @@ jobs:
             --noconsole `
             --onedir `
             --hidden-import audioop `
+            --collect-data ru_normalizr `
             --add-binary "ffmpeg.exe;." `
             --add-binary "ffprobe.exe;." `
             --version-file "windows-full-version.txt" `
             --name "${{ matrix.app_name }}" `
             SileroTTS_Studio.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Переносимая сборка onefile намеренно использует системные FFmpeg/FFprobe.
           & "${{ matrix.pyinstaller }}" `
@@ -642,9 +653,11 @@ jobs:
             --noconsole `
             --onefile `
             --hidden-import audioop `
+            --collect-data ru_normalizr `
             --version-file "windows-portable-version.txt" `
             --name "${{ matrix.portable_name }}" `
             SileroTTS_Studio.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build Linux apps
         if: runner.os == 'Linux'
@@ -657,6 +670,7 @@ jobs:
             --noconsole \
             --onedir \
             --hidden-import audioop \
+            --collect-data ru_normalizr \
             --add-binary "ffmpeg:." \
             --add-binary "ffprobe:." \
             --name "${{ matrix.app_name }}" \
@@ -669,6 +683,7 @@ jobs:
             --noconsole \
             --onefile \
             --hidden-import audioop \
+            --collect-data ru_normalizr \
             --name "${{ matrix.portable_name }}" \
             SileroTTS_Studio.py
 
@@ -687,6 +702,7 @@ jobs:
             --windowed \
             --onedir \
             --hidden-import audioop \
+            --collect-data ru_normalizr \
             --add-binary "ffmpeg:." \
             --add-binary "ffprobe:." \
             --target-architecture "${{ matrix.target_arch }}" \
