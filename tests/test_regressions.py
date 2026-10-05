@@ -12177,14 +12177,23 @@ class BuildWorkflowContractTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertEqual(workflow.count("softprops/action-gh-release@v2"), 1)
+        self.assertEqual(workflow.count("softprops/action-gh-release@v3"), 1)
         self.assertIn("name: Publish release", workflow)
         self.assertIn("needs: build", workflow)
         self.assertIn(
             "if: success() && startsWith(github.ref, 'refs/tags/')",
             workflow,
         )
-        self.assertIn("actions/download-artifact@v4", workflow)
+        for action in (
+            "actions/checkout@v7",
+            "actions/setup-python@v7",
+            "actions/cache/restore@v6",
+            "actions/cache/save@v6",
+            "actions/upload-artifact@v7",
+            "actions/download-artifact@v8",
+        ):
+            with self.subTest(action=action):
+                self.assertIn(action, workflow)
         self.assertIn("merge-multiple: true", workflow)
         self.assertIn("fail_on_unmatched_files: true", workflow)
         publish_release = workflow.index(
