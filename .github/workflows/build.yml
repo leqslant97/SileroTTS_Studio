@@ -1,0 +1,815 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # setup-python закрепляет эту версию на Windows/Linux.
+  PYTHON_VERSION: "3.13.15"
+  # Версия нормализатора должна совпадать с requirements*.txt. Проект
+  # использует выпущенный пакет, а не копию с GitHub без фиксированной версии,
+  # чтобы сборки оставались воспроизводимыми.
+  RU_NORMALIZR_VERSION: "0.3.0"
+  # Имена формул Homebrew задают минорную ветку Python; точные версии Python/Tk
+  # определяются закреплённой ревизией homebrew/core. Следующие шаги используют
+  # абсолютный путь к выбранному интерпретатору.
+  MACOS_PYTHON_SERIES: "3.13"
+  # На macOS используются Python/Tk из Homebrew: дистрибутив setup-python
+  # сейчас содержит Tk 8.6. Сборке Aqua нужен Tk 9 для надёжного переключения
+  # между светлым и тёмным оформлением системы на лету.
+  MACOS_TK_SERIES: "9.0"
+  # Библиотеки Python и Tcl/Tk обеих архитектур требуют macOS 15.0 или новее.
+  MACOS_MINIMUM_VERSION: "15.0"
+  # Intel-окружение собирается под Rosetta и сохраняется целиком с зависимостями.
+  # Для обновления формул меняем ревизию: она входит в ключ кэша.
+  MACOS_INTEL_BREW_VERSION: "7.0.7"
+  MACOS_INTEL_CORE_REVISION: "146dcd3798d82b3e916ae27a08956e8ca4e08715"
+  # После истечения Actions Cache этот архив позволяет восстановить проверенное
+  # окружение до резервной установки Homebrew.
+  MACOS_INTEL_TOOLCHAIN_RELEASE_TAG: "toolchain-macos-intel-2026-09"
+  MACOS_INTEL_TOOLCHAIN_ARCHIVE: "macos-intel-toolchain-python-3.13.15-tk-9.0-brew-7.0.7-core-146dcd3798d82b3e916ae27a08956e8ca4e08715-ffmpeg-9.0.2.tar.gz"
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-2025-vs2026
+            target_arch: x86_64
+            app_name: SileroTTS_Studio_Windows
+            portable_name: SileroTTS_Studio_Windows_Portable
+            artifact_name: SileroTTS_Studio_Windows.zip
+            portable_artifact_name: SileroTTS_Studio_Windows_Portable.exe
+            pyinstaller: .venv/Scripts/pyinstaller.exe
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            target_arch: x86_64
+            app_name: SileroTTS_Studio_Linux_x86_64
+            portable_name: SileroTTS_Studio_Linux_x86_64_Portable
+            artifact_name: SileroTTS_Studio_Linux_x86_64.zip
+            portable_artifact_name: SileroTTS_Studio_Linux_x86_64_Portable.zip
+            pyinstaller: .venv/bin/pyinstaller
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+            target_arch: arm64
+            app_name: SileroTTS_Studio_Linux_arm64
+            portable_name: SileroTTS_Studio_Linux_arm64_Portable
+            artifact_name: SileroTTS_Studio_Linux_arm64.zip
+            portable_artifact_name: SileroTTS_Studio_Linux_arm64_Portable.zip
+            pyinstaller: .venv/bin/pyinstaller
+          - name: macOS Apple Silicon ARM64
+            os: macos-15
+            app_name: SileroTTS_Studio_macOS_arm64
+            artifact_name: SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip
+            pyinstaller: .venv/bin/pyinstaller
+            target_arch: arm64
+          - name: macOS Intel x86_64
+            os: macos-15
+            app_name: SileroTTS_Studio_macOS_x86_64
+            artifact_name: SileroTTS_Studio_macOS_Intel_x86_64.zip
+            pyinstaller: .venv/bin/pyinstaller
+            target_arch: x86_64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve application version
+        shell: bash
+        run: |
+          # APP_VERSION содержит три компонента для метаданных бинарника.
+          # В публичном теге опускается только завершающий нулевой патч;
+          # в остальных случаях версия совпадает с ним полностью.
+          source_version="$(sed -nE 's/^APP_VERSION = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' SileroTTS_Studio.py)"
+          if [[ ! "$source_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Не удалось однозначно прочитать APP_VERSION из SileroTTS_Studio.py"
+            exit 1
+          fi
+          IFS=. read -r version_major version_minor version_patch <<< "$source_version"
+          if [[ "$version_patch" == "0" ]]; then
+            public_version="$version_major.$version_minor"
+          else
+            public_version="$source_version"
+          fi
+          expected_tag="v$public_version"
+          version="$source_version"
+
+          # Не публикуем сборку под тегом, который не совпадает с версией
+          # исходника. Это проверяет только контракт запуска workflow и не
+          # проверяет внутренние метаданные уже собранного бинарника.
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "::error::Ожидался точный тег $expected_tag, получен $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
+          echo "PUBLIC_VERSION=$public_version" >> "$GITHUB_ENV"
+          echo "Application version: $version; public release: $expected_tag"
+
+      - name: Set up Python on Windows and Linux
+        if: runner.os != 'macOS'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Prepare Rosetta and Intel Homebrew directories
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64'
+        shell: bash
+        run: |
+          if ! /usr/bin/arch -x86_64 /usr/bin/true; then
+            sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+          fi
+          /usr/bin/arch -x86_64 /usr/bin/uname -m
+          # ARM Homebrew остаётся в /opt/homebrew; Intel использует отдельный префикс.
+          # Подготавливаем также вложенные каталоги из проверки Homebrew:
+          # смена владельца share не делает существующий share/man доступным.
+          # Права меняются только у перечисленных каталогов одноразового runner.
+          for relative_directory in Homebrew Cellar opt bin sbin lib include share etc var Frameworks \
+            etc/bash_completion.d lib/cps lib/pkgconfig "lib/python$MACOS_PYTHON_SERIES" \
+            "lib/python$MACOS_PYTHON_SERIES/site-packages" \
+            share/aclocal share/doc share/info share/locale share/cps share/man \
+            share/man/man1 share/man/man2 share/man/man3 share/man/man4 \
+            share/man/man5 share/man/man6 share/man/man7 share/man/man8 \
+            share/zsh share/zsh/site-functions share/fish share/fish/vendor_completions.d \
+            share/fish/vendor_functions.d share/pwsh share/pwsh/completions \
+            var/log var/homebrew var/homebrew/linked var/homebrew/locks; do
+            directory="/usr/local/$relative_directory"
+            sudo mkdir -p "$directory"
+            sudo chown "$(id -un):$(id -gn)" "$directory"
+            sudo chmod u+rwx "$directory"
+            test -w "$directory"
+          done
+          # Homebrew определяет Intel-префикс по стандартной ссылке brew.
+          # Без неё репозиторий в /usr/local/Homebrew ошибочно становится префиксом.
+          ln -sfn /usr/local/Homebrew/bin/brew /usr/local/bin/brew
+
+      - name: Restore Intel Python and Tk
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64'
+        id: intel-toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /usr/local/Homebrew
+            /usr/local/Cellar
+            /usr/local/opt
+            /usr/local/lib/python${{ env.MACOS_PYTHON_SERIES }}
+            /usr/local/etc/openssl@3
+            /usr/local/etc/ca-certificates
+          key: macos-15-x86_64-python-${{ env.PYTHON_VERSION }}-tk-${{ env.MACOS_TK_SERIES }}-brew-${{ env.MACOS_INTEL_BREW_VERSION }}-core-${{ env.MACOS_INTEL_CORE_REVISION }}-v1
+
+      - name: Restore Intel toolchain from technical Release
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64' && steps.intel-toolchain.outputs.cache-hit != 'true'
+        id: intel-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TOOLCHAIN_RELEASE_TAG: ${{ env.MACOS_INTEL_TOOLCHAIN_RELEASE_TAG }}
+          TOOLCHAIN_ARCHIVE: ${{ env.MACOS_INTEL_TOOLCHAIN_ARCHIVE }}
+        run: |
+          archive_path="$RUNNER_TEMP/$TOOLCHAIN_ARCHIVE"
+          release_api="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TOOLCHAIN_RELEASE_TAG"
+          release_json=""
+          if ! release_json="$(curl --fail --silent --show-error --location \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$release_api")"; then
+            echo "::warning::Технический релиз $TOOLCHAIN_RELEASE_TAG недоступен; используется Homebrew."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          asset_url=""
+          if ! asset_url="$(jq -er --arg name "$TOOLCHAIN_ARCHIVE" \
+            '.assets[] | select(.name == $name) | .url' <<< "$release_json")"; then
+            echo "::warning::В техническом релизе нет архива $TOOLCHAIN_ARCHIVE; используется Homebrew."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! curl --fail --silent --show-error --location --retry 3 \
+            --header "Accept: application/octet-stream" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$asset_url" -o "$archive_path"; then
+            echo "::warning::Не удалось скачать архив технического релиза; используется Homebrew."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Проверяем архив до изменения префикса, чтобы повреждённая загрузка
+          # могла безопасно перейти к резервной установке Homebrew.
+          if ! tar -tzf "$archive_path" ./usr/local >/dev/null; then
+            echo "::warning::Архив Intel-окружения повреждён или не содержит префикс; используется Homebrew."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Пропускаем заголовок /usr/local: его метаданные принадлежат системе.
+          if ! tar -xzf "$archive_path" -C /usr/local --strip-components 3 ./usr/local; then
+            # После частичной распаковки резервная установка не гарантирует
+            # целостность Cellar и ссылок opt; сборку такого окружения прерываем.
+            echo "::error::Не удалось восстановить Intel Homebrew-префикс из проверенного архива."
+            exit 1
+          fi
+
+          tools_root="$RUNNER_TEMP/intel-toolchain-tools"
+          mkdir -p "$tools_root"
+          if ! tar -xzf "$archive_path" -C "$tools_root" ./tools; then
+            echo "::warning::Не удалось извлечь Intel FFmpeg из архива; используется загрузка FFmpeg."
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+            echo "ffmpeg-restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tools_dir="$tools_root/tools"
+          test -x "$tools_dir/ffmpeg"
+          test -x "$tools_dir/ffprobe"
+          /usr/bin/lipo "$tools_dir/ffmpeg" -verify_arch x86_64
+          /usr/bin/lipo "$tools_dir/ffprobe" -verify_arch x86_64
+          echo "$tools_dir" >> "$GITHUB_PATH"
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg-restored=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Intel Python and Tk under Rosetta
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64'
+        timeout-minutes: 90
+        shell: /usr/bin/arch -x86_64 /bin/bash --noprofile --norc -eo pipefail {0}
+        env:
+          INTEL_CACHE_HIT: ${{ steps.intel-toolchain.outputs.cache-hit }}
+          INTEL_ARCHIVE_HIT: ${{ steps.intel-release.outputs.restored }}
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+          HOMEBREW_NO_PATH_SHADOW_CHECK: "1"
+        run: |
+          # Не допускаем ARM-компиляторы и библиотеки из /opt/homebrew в Intel-окружение.
+          export PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+          unset HOMEBREW_PREFIX HOMEBREW_CELLAR HOMEBREW_REPOSITORY
+          intel_brew=/usr/local/bin/brew
+          if [[ "$INTEL_CACHE_HIT" != "true" && "$INTEL_ARCHIVE_HIT" != "true" ]]; then
+            git clone --depth 1 --branch "$MACOS_INTEL_BREW_VERSION" \
+              https://github.com/Homebrew/brew.git /usr/local/Homebrew
+            core_dir=/usr/local/Homebrew/Library/Taps/homebrew/homebrew-core
+            git init "$core_dir"
+            git -C "$core_dir" remote add origin https://github.com/Homebrew/homebrew-core.git
+            git -C "$core_dir" fetch --depth 1 origin "$MACOS_INTEL_CORE_REVISION"
+            git -C "$core_dir" checkout --detach FETCH_HEAD
+            test "$("$intel_brew" --prefix)" = /usr/local
+            # Отдельная установка исключает конфликт bin/openssl со старой версией:
+            # Homebrew не передаёт --skip-link зависимостям устанавливаемой формулы.
+            if "$intel_brew" list --formula openssl@1.1 >/dev/null 2>&1; then
+              "$intel_brew" unlink openssl@1.1
+            fi
+            "$intel_brew" install --verbose --skip-link openssl@3
+            "$intel_brew" install --verbose --overwrite --skip-link "python@$MACOS_PYTHON_SERIES"
+            "$intel_brew" link --overwrite "python@$MACOS_PYTHON_SERIES"
+            "/usr/local/opt/python@$MACOS_PYTHON_SERIES/bin/python$MACOS_PYTHON_SERIES" -m pip --version
+            "$intel_brew" install --verbose --overwrite --skip-link "python-tk@$MACOS_PYTHON_SERIES"
+          fi
+          python_bin="/usr/local/opt/python@$MACOS_PYTHON_SERIES/bin/python$MACOS_PYTHON_SERIES"
+          "$python_bin" -m pip --version
+          "$python_bin" - <<'PY'
+          import os
+          import platform
+          import ssl
+          import tkinter
+          assert platform.machine() == "x86_64", platform.machine()
+          assert platform.python_version() == os.environ["PYTHON_VERSION"]
+          assert tkinter.TclVersion == 9.0 and tkinter.TkVersion == 9.0
+          assert str(tkinter.Tcl().call("info", "patchlevel")).startswith(os.environ["MACOS_TK_SERIES"] + ".")
+          print("Intel Python:", platform.python_version(), "Tk:", tkinter.TkVersion, ssl.OPENSSL_VERSION)
+          PY
+          echo "MACOS_PYTHON=$python_bin" >> "$GITHUB_ENV"
+          echo "MACOS_PYTHON_VERSION=$PYTHON_VERSION" >> "$GITHUB_ENV"
+
+      - name: Cache ready Intel Python and Tk
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64' && steps.intel-toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /usr/local/Homebrew
+            /usr/local/Cellar
+            /usr/local/opt
+            /usr/local/lib/python${{ env.MACOS_PYTHON_SERIES }}
+            /usr/local/etc/openssl@3
+            /usr/local/etc/ca-certificates
+          key: ${{ steps.intel-toolchain.outputs.cache-primary-key }}
+
+      - name: Set up Homebrew Python and Tk on Apple Silicon
+        if: runner.os == 'macOS' && matrix.target_arch == 'arm64'
+        timeout-minutes: 60
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+          # Все вызовы Python ниже используют абсолютный путь к выбранной формуле.
+          HOMEBREW_NO_PATH_SHADOW_CHECK: "1"
+        run: |
+          # Используем ту же ревизию формул, что и Intel: Python 3.13.15 и Tcl/Tk 9.0.
+          brew tap --force homebrew/core
+          core_dir="$(brew --repository homebrew/core)"
+          git -C "$core_dir" fetch --depth 1 origin "$MACOS_INTEL_CORE_REVISION"
+          git -C "$core_dir" checkout --force --detach FETCH_HEAD
+          python_series="$MACOS_PYTHON_SERIES"
+          # В одноразовом runner заменяем предустановленные версии этих формул:
+          # brew install может оставить более новый Python или Tcl/Tk в opt.
+          for formula in "python-tk@$python_series" "python@$python_series" tcl-tk; do
+            if brew list --formula "$formula" >/dev/null 2>&1; then
+              brew uninstall --formula --force --ignore-dependencies "$formula"
+            fi
+          done
+          # --skip-link не передаётся зависимостям; устанавливаем OpenSSL отдельно.
+          if brew list --formula openssl@1.1 >/dev/null 2>&1; then
+            brew unlink openssl@1.1
+          fi
+          brew install --verbose --skip-link openssl@3
+          brew install --verbose --skip-link tcl-tk
+          brew install --skip-link "python@$python_series"
+          # Python ищет pip в общем site-packages Homebrew. --skip-link не создаёт
+          # эти ссылки; сборка tkinter из исходников тогда падает с No module named pip.
+          # В одноразовом runner разрешаем заменить ссылки предустановленного Python.
+          brew link --overwrite "python@$python_series"
+          python_prefix="$(brew --prefix "python@$python_series")"
+          python_bin="$python_prefix/bin/python$python_series"
+          test -x "$python_bin"
+          "$python_bin" -m pip --version
+          brew install --verbose --skip-link "python-tk@$python_series"
+          echo "MACOS_PYTHON=$python_bin" >> "$GITHUB_ENV"
+          echo "Homebrew Python: $python_bin"
+          "$python_bin" --version
+          installed_python_version="$("$python_bin" -c 'import platform; print(platform.python_version())')"
+          if [[ "$installed_python_version" != "$PYTHON_VERSION" ]]; then
+            echo "::error::Homebrew installed Python $installed_python_version; expected $PYTHON_VERSION"
+            exit 1
+          fi
+          echo "MACOS_PYTHON_VERSION=$installed_python_version" >> "$GITHUB_ENV"
+          brew list --versions "python@$python_series" \
+            "python-tk@$python_series" tcl-tk
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk zip
+
+      - name: Verify Python and Tk build environment
+        shell: bash
+        env:
+          EXPECTED_TARGET_ARCH: ${{ matrix.target_arch }}
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            py="$MACOS_PYTHON"
+          else
+            py=python
+          fi
+          "$py" - <<'PY'
+          import os
+          import platform
+          import sys
+          import tkinter
+
+          tcl = tkinter.Tcl()
+          actual_python = sys.version_info[:3]
+
+          tk_patchlevel = str(tcl.call("info", "patchlevel"))
+          print("Python:", sys.version)
+          print("Architecture:", platform.machine())
+          print("Tcl/Tk:", tk_patchlevel)
+          print("_tkinter:", tkinter._tkinter.__file__)
+
+          architecture_aliases = {
+              "amd64": "x86_64",
+              "x86_64": "x86_64",
+              "arm64": "arm64",
+              "aarch64": "arm64",
+          }
+          actual_arch = architecture_aliases.get(platform.machine().lower())
+          expected_arch = os.environ["EXPECTED_TARGET_ARCH"]
+          if actual_arch != expected_arch:
+              raise SystemExit(
+                  f"Runner architecture {platform.machine()!r}; "
+                  f"expected {expected_arch!r}"
+              )
+
+          if sys.platform == "darwin":
+              expected_series = tuple(
+                  map(int, os.environ["MACOS_PYTHON_SERIES"].split("."))
+              )
+              if actual_python[:2] != expected_series:
+                  raise SystemExit(
+                      f"macOS Python {actual_python!r} is outside required "
+                      f"series {expected_series!r}"
+                  )
+              expected_tk = os.environ["MACOS_TK_SERIES"]
+              if tkinter.TclVersion != 9.0 or tkinter.TkVersion != 9.0:
+                  raise SystemExit(
+                      f"macOS release requires Tcl/Tk {expected_tk}.x; "
+                      f"got Tcl {tkinter.TclVersion}, Tk {tkinter.TkVersion}"
+                  )
+              if not tk_patchlevel.startswith(expected_tk + "."):
+                  raise SystemExit(
+                      f"macOS release requires Tcl/Tk {expected_tk}.x; "
+                      f"got {tk_patchlevel}"
+                  )
+          else:
+              expected_python = tuple(
+                  map(int, os.environ["PYTHON_VERSION"].split("."))
+              )
+              if actual_python != expected_python:
+                  raise SystemExit(
+                      f"Python {actual_python!r} does not match "
+                      f"required {expected_python!r}"
+                  )
+          PY
+
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            py="$MACOS_PYTHON"
+          else
+            py=python
+          fi
+          "$py" -m venv .venv
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            source .venv/Scripts/activate
+          else
+            source .venv/bin/activate
+          fi
+          # Устанавливаем только зафиксированные в репозитории зависимости,
+          # чтобы бинарники релиза не зависели от обновлений транзитивных зависимостей.
+          python -m pip install -r requirements-release.txt
+          python -m pip check
+
+      - name: Set up FFmpeg
+        if: runner.os != 'macOS' || matrix.target_arch != 'x86_64'
+        uses: AnimMouse/setup-ffmpeg@v1
+
+      - name: Set up Intel FFmpeg and FFprobe
+        if: runner.os == 'macOS' && matrix.target_arch == 'x86_64' && steps.intel-release.outputs.ffmpeg-restored != 'true'
+        shell: bash
+        run: |
+          # Обычный action выбирает архитектуру runner; здесь нужны Intel-бинарники.
+          tools_dir="$RUNNER_TEMP/ffmpeg-x86_64"
+          mkdir -p "$tools_dir"
+          ffmpeg_version="$(curl --fail --silent --show-error --location --retry 3 \
+            https://evermeet.cx/ffmpeg/info/ffmpeg/release | jq -er '.version')"
+          for tool in ffmpeg ffprobe; do
+            download_url="$(curl --fail --silent --show-error --location --retry 3 \
+              "https://evermeet.cx/ffmpeg/info/$tool/$ffmpeg_version" | jq -er '.download.zip.url')"
+            curl --fail --silent --show-error --location --retry 3 \
+              "$download_url" -o "$tools_dir/$tool.zip"
+            unzip -o -q "$tools_dir/$tool.zip" -d "$tools_dir"
+            chmod +x "$tools_dir/$tool"
+            /usr/bin/lipo "$tools_dir/$tool" -verify_arch x86_64
+            /usr/bin/arch -x86_64 "$tools_dir/$tool" -version
+          done
+          echo "$tools_dir" >> "$GITHUB_PATH"
+
+      - name: Verify Python runtime dependencies
+        shell: bash
+        env:
+          EXPECTED_TARGET_ARCH: ${{ matrix.target_arch }}
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            py=.venv/Scripts/python.exe
+          else
+            py=.venv/bin/python
+          fi
+          "$py" - <<'PY'
+          import audioop
+          import os
+          import ebooklib
+          import docx
+          import lxml
+          import pydub
+          import pydub.utils
+          import platform
+          import requests
+          import ru_normalizr
+          import sys
+          import tkinter
+          from bs4 import BeautifulSoup
+          from ebooklib import epub
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          assert pydub.utils.audioop is audioop
+          assert getattr(ru_normalizr, "__version__", None) == os.environ[
+              "RU_NORMALIZR_VERSION"
+          ]
+          if sys.version_info >= (3, 13):
+              assert getattr(audioop, "__file__", None), "Python 3.13 must load audioop-lts"
+          if sys.platform == "darwin":
+              assert platform.machine() == os.environ["EXPECTED_TARGET_ARCH"]
+              expected_series = tuple(
+                  map(int, os.environ["MACOS_PYTHON_SERIES"].split("."))
+              )
+              assert sys.version_info[:2] == expected_series
+              assert platform.python_version() == os.environ["MACOS_PYTHON_VERSION"]
+              assert tkinter.TclVersion == 9.0
+              assert tkinter.TkVersion == 9.0
+              assert str(tkinter.Tcl().call("info", "patchlevel")).startswith(
+                  os.environ["MACOS_TK_SERIES"] + "."
+              )
+
+          book = epub.EpubBook()
+          book.set_identifier("ci-smoke")
+          book.set_title("CI smoke test")
+          book.set_language("ru")
+          book.add_author("Автор")
+          chapter = epub.EpubHtml(title="Глава", file_name="chapter.xhtml", lang="ru")
+          chapter.content = "<h1>Глава</h1><p>Привет</p>"
+          book.add_item(chapter)
+          book.toc = (epub.Link("chapter.xhtml", "Глава", "chapter"),)
+          book.spine = ["nav", chapter]
+          book.add_item(epub.EpubNcx())
+          book.add_item(epub.EpubNav())
+          with TemporaryDirectory() as directory:
+              path = Path(directory) / "smoke.epub"
+              epub.write_epub(str(path), book)
+              loaded = epub.read_epub(str(path))
+              assert list(loaded.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+
+          print("audioop:", getattr(audioop, "__file__", "built-in"))
+          print("pydub:", pydub.__file__)
+          print("EbookLib EPUB smoke test: OK")
+          PY
+
+      - name: Verify required FFmpeg codecs
+        shell: bash
+        run: |
+          encoders="$(ffmpeg -hide_banner -encoders 2>&1)"
+          decoders="$(ffmpeg -hide_banner -decoders 2>&1)"
+          grep -q 'libopus' <<< "$encoders"
+          grep -q 'libvorbis' <<< "$encoders"
+          grep -Eq '[[:space:]]opus([[:space:]]|$)' <<< "$decoders"
+          grep -Eq '[[:space:]]vorbis([[:space:]]|$)' <<< "$decoders"
+
+      - name: Run regression tests
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            py=.venv/Scripts/python.exe
+          else
+            py=.venv/bin/python
+          fi
+          "$py" -m unittest discover -s tests -v
+
+      - name: Copy FFmpeg tools on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item (Get-Command ffmpeg).Source ffmpeg.exe
+          Copy-Item (Get-Command ffprobe).Source ffprobe.exe
+
+      - name: Copy FFmpeg tools on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cp "$(command -v ffmpeg)" ffmpeg
+          cp "$(command -v ffprobe)" ffprobe
+          chmod +x ffmpeg ffprobe
+
+      - name: Create Windows version resources
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $parts = $env:APP_VERSION.Split('.')
+          if ($parts.Count -ne 3) {
+            throw "APP_VERSION must contain three numeric components: $env:APP_VERSION"
+          }
+          $versionTuple = "$($parts[0]), $($parts[1]), $($parts[2]), 0"
+
+          function New-PyInstallerVersionFile {
+            param(
+              [Parameter(Mandatory = $true)][string] $Path,
+              [Parameter(Mandatory = $true)][string] $InternalName,
+              [Parameter(Mandatory = $true)][string] $OriginalFilename
+            )
+
+            $content = @"
+          # Кодировка UTF-8
+          VSVersionInfo(
+            ffi=FixedFileInfo(
+              filevers=($versionTuple),
+              prodvers=($versionTuple),
+              mask=0x3f,
+              flags=0x0,
+              OS=0x40004,
+              fileType=0x1,
+              subtype=0x0,
+              date=(0, 0)
+            ),
+            kids=[
+              StringFileInfo([
+                StringTable(
+                  '040904B0',
+                  [
+                    StringStruct('FileDescription', 'Silero TTS Studio'),
+                    StringStruct('FileVersion', '$env:APP_VERSION'),
+                    StringStruct('InternalName', '$InternalName'),
+                    StringStruct('OriginalFilename', '$OriginalFilename'),
+                    StringStruct('ProductName', 'Silero TTS Studio'),
+                    StringStruct('ProductVersion', '$env:APP_VERSION')
+                  ]
+                )
+              ]),
+              VarFileInfo([VarStruct('Translation', [1033, 1200])])
+            ]
+          )
+          "@
+            Set-Content -LiteralPath $Path -Value $content -Encoding utf8
+          }
+
+          New-PyInstallerVersionFile `
+            -Path "windows-full-version.txt" `
+            -InternalName "${{ matrix.app_name }}" `
+            -OriginalFilename "${{ matrix.app_name }}.exe"
+          New-PyInstallerVersionFile `
+            -Path "windows-portable-version.txt" `
+            -InternalName "${{ matrix.portable_name }}" `
+            -OriginalFilename "${{ matrix.portable_name }}.exe"
+
+      - name: Build Windows apps
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Полная сборка onedir со встроенными FFmpeg/FFprobe.
+          & "${{ matrix.pyinstaller }}" `
+            --noconfirm `
+            --clean `
+            --noconsole `
+            --onedir `
+            --hidden-import audioop `
+            --collect-data ru_normalizr `
+            --add-binary "ffmpeg.exe;." `
+            --add-binary "ffprobe.exe;." `
+            --version-file "windows-full-version.txt" `
+            --name "${{ matrix.app_name }}" `
+            SileroTTS_Studio.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Переносимая сборка onefile намеренно использует системные FFmpeg/FFprobe.
+          & "${{ matrix.pyinstaller }}" `
+            --noconfirm `
+            --clean `
+            --noconsole `
+            --onefile `
+            --hidden-import audioop `
+            --collect-data ru_normalizr `
+            --version-file "windows-portable-version.txt" `
+            --name "${{ matrix.portable_name }}" `
+            SileroTTS_Studio.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Linux apps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Полная сборка onedir со встроенными FFmpeg/FFprobe.
+          "${{ matrix.pyinstaller }}" \
+            --noconfirm \
+            --clean \
+            --noconsole \
+            --onedir \
+            --hidden-import audioop \
+            --collect-data ru_normalizr \
+            --add-binary "ffmpeg:." \
+            --add-binary "ffprobe:." \
+            --name "${{ matrix.app_name }}" \
+            SileroTTS_Studio.py
+
+          # Переносимая сборка onefile намеренно использует системные FFmpeg/FFprobe.
+          "${{ matrix.pyinstaller }}" \
+            --noconfirm \
+            --clean \
+            --noconsole \
+            --onefile \
+            --hidden-import audioop \
+            --collect-data ru_normalizr \
+            --name "${{ matrix.portable_name }}" \
+            SileroTTS_Studio.py
+
+      - name: Build macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          # Для macOS выпускается только полное приложение onedir со встроенными FFmpeg/FFprobe.
+          build_command=("${{ matrix.pyinstaller }}")
+          if [[ "${{ matrix.target_arch }}" == "x86_64" ]]; then
+            build_command=(/usr/bin/arch -x86_64 "${build_command[@]}")
+          fi
+          "${build_command[@]}" \
+            --noconfirm \
+            --clean \
+            --windowed \
+            --onedir \
+            --hidden-import audioop \
+            --collect-data ru_normalizr \
+            --add-binary "ffmpeg:." \
+            --add-binary "ffprobe:." \
+            --target-architecture "${{ matrix.target_arch }}" \
+            --osx-bundle-identifier "ru.silero.tts-studio" \
+            --name "${{ matrix.app_name }}" \
+            SileroTTS_Studio.py
+
+          app_path="dist/${{ matrix.app_name }}.app"
+          find "$app_path" -type f \( -name ffmpeg -o -name ffprobe \) -exec chmod +x {} \;
+          plist="$app_path/Contents/Info.plist"
+          plutil -replace NSHighResolutionCapable -bool true "$plist" || \
+            plutil -insert NSHighResolutionCapable -bool true "$plist"
+          plutil -replace CFBundleShortVersionString -string "$APP_VERSION" "$plist" || \
+            plutil -insert CFBundleShortVersionString -string "$APP_VERSION" "$plist"
+          plutil -replace CFBundleVersion -string "$APP_VERSION" "$plist" || \
+            plutil -insert CFBundleVersion -string "$APP_VERSION" "$plist"
+          plutil -replace LSMinimumSystemVersion -string "$MACOS_MINIMUM_VERSION" "$plist" || \
+            plutil -insert LSMinimumSystemVersion -string "$MACOS_MINIMUM_VERSION" "$plist"
+          plutil -lint "$plist"
+          codesign --force --deep --sign - "$app_path"
+
+      - name: Package Windows full app
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd dist
+          7z a -tzip "${{ matrix.artifact_name }}" "${{ matrix.app_name }}"
+
+      - name: Package Linux apps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd dist
+          zip -r "${{ matrix.artifact_name }}" "${{ matrix.app_name }}"
+          zip "${{ matrix.portable_artifact_name }}" "${{ matrix.portable_name }}"
+
+      - name: Package macOS app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cd dist
+          export COPYFILE_DISABLE=1
+          ditto -c -k --keepParent "${{ matrix.app_name }}.app" "${{ matrix.artifact_name }}"
+
+      - name: Upload full build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Отдельное имя CI-артефакта делает загрузки матрицы однозначными;
+          # имя файла внутри сохраняет точное имя артефакта релиза.
+          name: ${{ matrix.artifact_name }}-artifact
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+      - name: Upload portable build artifact
+        if: runner.os == 'Windows' || runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.portable_artifact_name }}-artifact
+          path: dist/${{ matrix.portable_artifact_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: success() && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: "*-artifact"
+          merge-multiple: true
+
+      - name: Publish release only after every platform passed
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/SileroTTS_Studio_Windows.zip
+            release-assets/SileroTTS_Studio_Windows_Portable.exe
+            release-assets/SileroTTS_Studio_Linux_x86_64.zip
+            release-assets/SileroTTS_Studio_Linux_x86_64_Portable.zip
+            release-assets/SileroTTS_Studio_Linux_arm64.zip
+            release-assets/SileroTTS_Studio_Linux_arm64_Portable.zip
+            release-assets/SileroTTS_Studio_macOS_AppleSilicon_ARM64.zip
+            release-assets/SileroTTS_Studio_macOS_Intel_x86_64.zip
