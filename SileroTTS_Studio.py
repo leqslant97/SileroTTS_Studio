@@ -8,6 +8,7 @@ import os
 import re
 import json
 import copy
+import inspect
 import time
 import uuid
 import base64
@@ -20,6 +21,7 @@ import requests
 import shutil
 import tempfile
 import platform
+import posixpath
 import subprocess
 import sys
 import urllib.parse
@@ -148,7 +150,7 @@ from collections import Counter, deque
 from collections.abc import Mapping
 from razdel import sentenize
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 # Нулевая третья компонента опускается только в публичном имени базового
 # релиза; у исправительных релизов сохраняются все три компонента.
 _APP_VERSION_PARTS = APP_VERSION.split(".")
@@ -274,7 +276,8 @@ SESSION_TEMP_DIR = Path(
 # всё ещё могут ждать FFmpeg. Рекурсивная очистка тогда удаляла собственный
 # concat-манифест раньше, чем FFmpeg успевал его открыть. Каждая операция
 # удаляет принадлежащий ей манифест только после subprocess.run(); оставшийся
-# каталог находится в системной папке временных файлов и очищается самой ОС.
+# каталог находится в системной папке временных файлов. Отдельной временной
+# речью сеанса управляет SessionAudioStore, не затрагивая файлы других операций.
 
 SETTINGS_FILE = APP_DATA_DIR / "settings.json"
 EXPORT_PROJECT_FILE = APP_DATA_DIR / "export_project.json"
@@ -400,6 +403,103 @@ def _finite_nonnegative_float(value, default=0.0):
     if not math.isfinite(result) or result < 0:
         return float(default)
     return result
+
+
+def cache_policy_signature(config):
+    """Описывает действующие ограничения для согласия на повторные запросы."""
+    enabled = _config_bool(config.get("use_cache", True), default=True)
+    lru = enabled and _config_bool(config.get("enable_cache_lru", False))
+    ttl = enabled and _config_bool(config.get("enable_cache_ttl", False))
+    return (
+        enabled, lru, ttl,
+        _finite_nonnegative_float(config.get("cache_max_entries", 10000)) if lru else None,
+        _finite_nonnegative_float(config.get("cache_ttl_hours", 720)) if ttl else None,
+    )
+
+
+def cache_policy_resume_notice(config):
+    """Объясняет риск потери речи для незавершённых выходов между запусками."""
+    enabled, lru, ttl, *_limits = cache_policy_signature(config)
+    if not enabled:
+        return (
+            "Кэширование выключено. После «Стоп» полученная речь остаётся "
+            "доступной в текущем окне. При закрытии приложения, смене "
+            "исходников или параметров речи временные фрагменты "
+            "удаляются. Для завершения групп "
+            "после такой очистки потребуется повторный синтез, включая главы "
+            "с готовыми отдельными файлами. Это расходует лимит API."
+        )
+    if lru or ttl:
+        return (
+            "Ограничения кэша LRU/TTL могут удалить речевые фрагменты после "
+            "остановки или между запусками. Для завершения групп может "
+            "потребоваться повторный синтез с расходом лимита API. "
+            "Повторно запрашиваются только недостающие или повреждённые "
+            "фрагменты; сохранившаяся речь используется снова."
+        )
+    return ""
+
+
+def cache_stop_notice(config, *, finalized=False):
+    """Описывает судьбу речи при остановке по настройкам работающей задачи."""
+    if not isinstance(config, Mapping):
+        config = {}
+    enabled, lru, ttl, *_limits = cache_policy_signature(config)
+    if not enabled:
+        return "Кэш выключен. Временная речь остаётся в текущем окне."
+    text = "Кэш сохранён" if finalized else "Кэш сохраняется"
+    if lru or ttl:
+        text += " с учётом LRU/TTL"
+    return text + "."
+
+
+def source_output_file_is_ready(record, statuses, *, rebuild=False):
+    """Проверяет выход по файлу и журналу ошибок, без чтения TXT и кэша речи."""
+    if rebuild:
+        return False
+    try:
+        path = Path(record.get("path", "")).expanduser()
+        return path.is_file() and statuses.get(str(path.resolve()), "success") == "success"
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def source_groups_need_synthesis(config, skip_existing, statuses):
+    """Выделяет групповые выходы, для которых потребуется исходная речь."""
+    records = tuple(config.get("source_target_records") or ())
+    groups = tuple(record for record in records if record.get("kind") in {"group", "m4b"})
+    if not groups:
+        return False
+    if not skip_existing or statuses is None:
+        return True
+    regular_paths = set(config.get("source_targets_rebuild_paths") or ())
+    m4b_paths = set(config.get("source_m4b_rebuild_paths") or ())
+    unrelated_paths = set(config.get("source_unrelated_target_paths") or ())
+
+    def key(record):
+        return str(Path(record["path"]).expanduser().resolve())
+
+    def needs_rebuild(record):
+        m4b = record.get("kind") == "m4b"
+        return _config_bool(config.get(
+            "source_m4b_force_rebuild" if m4b else "source_targets_force_rebuild", False
+        )) or key(record) in (m4b_paths if m4b else regular_paths)
+
+    changed_files = set()
+    for record in records:
+        if record.get("kind") != "file":
+            continue
+        path_key = key(record)
+        # Новый независимый формат не требует пересборки уже готовой группы.
+        if path_key in unrelated_paths and statuses.get(path_key, "success") == "success":
+            continue
+        if not source_output_file_is_ready(record, statuses, rebuild=needs_rebuild(record)):
+            changed_files.update(str(value) for value in record.get("file_ids", ()))
+    return any(
+        not source_output_file_is_ready(record, statuses, rebuild=needs_rebuild(record))
+        or changed_files.intersection(str(value) for value in record.get("file_ids", ()))
+        for record in groups
+    )
 
 
 def _normalized_pause_milliseconds(value, default=0):
@@ -1466,7 +1566,7 @@ def split_export_file_ids(ordered_file_ids, durations, limit_seconds):
 
 
 def source_text_character_count(text):
-    """Считает символы исходного TXT для предварительного плана M4B.
+    """Считает символы исходного TXT для предварительного плана групп.
 
     Ведущий UTF-8 BOM не является содержимым книги. Остальные пробелы,
     переводы строк и внутренние U+FEFF считаются намеренно: лимит должен быть
@@ -1996,6 +2096,7 @@ _SYNTHESIS_STATUS_FORMAT_NAMES = {
     "m4a": "M4A",
     "m4b": "M4B",
 }
+SOURCE_WAITING_STATUS_TEXT = "⏳ Ожидание сборки..."
 
 # Обратные вызовы прогресса одновременно служат лёгким каналом активности и
 # статуса. Значение ``-1`` исторически означает неопределённую операцию
@@ -2081,6 +2182,17 @@ class SourceOutputStatusTracker:
         with self._lock:
             self._register(task_id, rows, activity_rows, output_format, status)
 
+    def initial_completed_rows(self):
+        """Возвращает только полностью готовые строки без промежуточного ожидания."""
+        with self._lock:
+            completed = []
+            for row, task_ids in self._rows.items():
+                statuses = [self._tasks[task_id]["status"] for task_id in task_ids]
+                if statuses and all(status in self._terminal_rank for status in statuses):
+                    status = max(statuses, key=self._terminal_rank.get)
+                    completed.append((row, status))
+            return tuple(completed)
+
     def _publish(self, rows):
         for row in dict.fromkeys(rows):
             tasks = [self._tasks[key] for key in self._rows.get(row, ())]
@@ -2094,9 +2206,13 @@ class SourceOutputStatusTracker:
                 if formats:
                     status = "encoding"
                 else:
-                    status = "processing" if any(
-                        task["status"] == "processing" for task in active
-                    ) else "waiting"
+                    status = (
+                        "processing" if any(
+                            task["status"] == "processing" for task in active
+                        ) else "preparing" if any(
+                            task["status"] == "preparing" for task in active
+                        ) else "waiting"
+                    )
             else:
                 status = max(
                     (task["status"] for task in tasks),
@@ -2312,9 +2428,9 @@ M4B_CHAPTER_TEMPLATE_FIELD_ORDER = (
 )
 M4B_CHAPTER_TEMPLATE_FIELDS = frozenset(M4B_CHAPTER_TEMPLATE_FIELD_ORDER)
 
-# Шаблон виртуального плана исходников намеренно отделён от шаблона
-# универсального экспортёра.  Иначе изменение имени M4B во вкладке
-# «Экспорт и сборка» неожиданно меняло бы ещё не подготовленный план книги.
+# Шаблон имени группы исходников отделён от шаблона универсального экспорта.
+# Иначе изменение имени M4B во вкладке «Экспорт и сборка» меняло бы ещё не
+# подготовленный план групп исходников.
 DEFAULT_SOURCE_M4B_TEMPLATE = "{book} Главы {range}"
 # Диалог плана исходников хранит шаблон имени отдельно от универсальной
 # вкладки экспорта. ``{book}`` — явная форма без диапазона, выбранная при
@@ -5001,8 +5117,8 @@ def _source_synthesis_group_members(groups, file_records):
         except (OSError, RuntimeError, TypeError, ValueError):
             return None
 
-    # Пустой план имеет явный полезный смысл: цель M4B становится одной книгой
-    # со всеми выбранными TXT. Непустой (в том числе устаревший или неполный)
+    # Пустой план объединяет выбранные TXT в одну группу для целей с режимом
+    # «Один файл». Непустой (в том числе устаревший или неполный)
     # план обрабатывается ниже, а непокрытые файлы остаются отдельными группами,
     # чтобы повреждённый план не мог молча потерять главы.
     if isinstance(groups, dict):
@@ -5936,20 +6052,35 @@ def _call_source_target_status(callback, fmt, output_path, status):
     """Вызывает необязательный обработчик статуса с совместимыми резервными сигнатурами."""
     if callback is None:
         return
+    args = (fmt, Path(output_path), status)
     try:
-        callback(fmt, Path(output_path), status)
-    except TypeError:
-        # Небольшие интеграции, написанные до расширения контракта статуса,
-        # часто принимают только ``(format, status)``. Сохраняем их работу, не
-        # меняя публичные обратные вызовы TTSProcessor.
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        # Для расширений без доступной сигнатуры сохраняем новый контракт и
+        # не повторяем вызов после TypeError из тела обратного вызова: такой TypeError
+        # означает ошибку самого обработчика, а не несовместимую арность.
+        callback(*args)
+        return
+
+    # Небольшие интеграции, написанные до расширения контракта статуса, часто
+    # принимают только ``(format, status)`` или ``(status,)``. Выбираем
+    # совместимую арность до вызова, чтобы TypeError внутри обработчика не
+    # повторял побочный эффект до трёх раз.
+    for candidate in (args, (fmt, status), (status,)):
         try:
-            callback(fmt, status)
+            signature.bind(*candidate)
         except TypeError:
-            callback(status)
+            continue
+        callback(*candidate)
+        return
+
+    # Сигнатура может быть динамической/неполной. Один вызов нового контракта
+    # даёт диагностическую ошибку без скрытого повторного выполнения.
+    callback(*args)
 
 
-def _source_synthesis_cache_profiles(audio_files):
-    """Построить быстрые профили ffprobe для канонических файлов кэша.
+def _source_synthesis_cache_profiles(audio_files, *, cancelled=None):
+    """Строит быстрые профили канонических речевых фрагментов кэша или сеанса.
 
     Один TXT может содержать сотни фрагментов, и все цели вывода используют
     один и тот же набор. Запуск ``ffprobe`` для каждого фрагмента каждого
@@ -5964,6 +6095,8 @@ def _source_synthesis_cache_profiles(audio_files):
     """
     profiles = []
     for path in audio_files or ():
+        if cancelled and cancelled():
+            raise InterruptedError("Синтез остановлен пользователем")
         codec, channels, identity = _inspect_ogg_audio_header_details(path)
         if codec != CACHE_AUDIO_CODEC or not channels or identity is None:
             profiles.append(None)
@@ -6006,17 +6139,29 @@ def run_source_synthesis_target_chain(
     M4B обрабатывает ``run_source_synthesis_m4b_target`` после готовности всех
     глав соответствующей группы; здесь его записи не кодируются.
     """
+    def is_cancelled():
+        return bool(
+            getattr(processor, "is_stopped", False)
+            or (cancelled and cancelled())
+        )
+
+    if is_cancelled():
+        raise InterruptedError("Синтез остановлен пользователем")
     source_files = tuple(Path(path).expanduser() for path in (audio_files or ()))
     # Используем один снимок заголовков для всех форматов. Это исключает
     # отдельный запуск ffprobe для каждой пары «цель × предложение» и не
     # добавляет промежуточное кодирование с потерями.
-    source_profiles = _source_synthesis_cache_profiles(source_files)
+    source_profiles = _source_synthesis_cache_profiles(
+        source_files, cancelled=is_cancelled
+    )
     result_rows = []
     failures = 0
     deferred = 0
     for record in sorted(
         tuple(records or ()), key=lambda item: int(item.get("target_index", 0))
     ):
+        if is_cancelled():
+            raise InterruptedError("Синтез остановлен пользователем")
         target = normalize_output_target(record.get("target", {}))
         fmt = str(target.get("format", "")).lower()
         output_path = Path(record.get("path", "")).expanduser()
@@ -6032,10 +6177,6 @@ def run_source_synthesis_target_chain(
                 {"format": fmt, "path": output_path, "status": "deferred"}
             )
             continue
-        if cancelled and cancelled():
-            raise InterruptedError("Синтез остановлен пользователем")
-        if getattr(processor, "is_stopped", False):
-            raise InterruptedError("Синтез остановлен пользователем")
         if not source_files:
             failures += 1
             _call_source_target_status(status_callback, fmt, output_path, "error")
@@ -6334,11 +6475,10 @@ def reflow_source_m4b_target_records(
 
     Возвращает словарь с ``records`` (новый неизменяемый снимок), картой
     ``durations`` и диагностикой. Каждая цель перестраивается независимо,
-    но порядок TXT внутри него сохраняется. Если лимит отсутствует, старые
+    но порядок TXT внутри неё сохраняется. Если лимит отсутствует, старые
     границы сохраняются, а измеренные длительности всё равно возвращаются для
     точных метаданных глав. При любой ошибке измерения выбрасывается
-    исключение, чтобы вызывающий код мог безопасно продолжить со старым
-    планом.
+    исключение, чтобы сборщик не публиковал части с непроверенными границами.
 
     Эта функция не обращается к Tkinter и подходит для фонового потока.
     """
@@ -6880,7 +7020,7 @@ def run_source_synthesis_m4b_target(
                 "title": title or f"Глава {index + 1}",
                 "file_index": index + 1,
             }
-            # Необязательный второй проход уже измерил каждый TXT в каноническом кэше.
+            # Необязательный второй проход уже измерил подготовленную речь каждого TXT.
             # Передача значения через существующий контракт метаданных главы избавляет
             # от второго ffprobe и сохраняет целостность TXT, даже если он содержит
             # много фрагментов.
@@ -8540,7 +8680,7 @@ def write_cache_index_atomic(cache_dir, cache):
     )
     try:
         with open(temp_path, "w", encoding="utf-8") as file:
-            json.dump(cache, file, ensure_ascii=False, indent=4)
+            json.dump(cache, file, ensure_ascii=False, indent=4, allow_nan=False)
             file.flush()
             os.fsync(file.fileno())
         os.replace(temp_path, index_path)
@@ -8560,6 +8700,13 @@ def write_cache_index_atomic(cache_dir, cache):
 
 def unreferenced_cache_audio_paths(cache_dir, removed_entries, retained_cache):
     """Возвращает безопасные файлы, на которые больше не ссылается индекс."""
+    audio_dir = Path(cache_dir) / "audio"
+    if audio_dir.is_symlink():
+        logging.warning(
+            "Аудиофайлы кэша не удалены: %s является символической ссылкой",
+            audio_dir,
+        )
+        return []
     retained_names = {
         info.get("file_name")
         for info in retained_cache.values()
@@ -8594,11 +8741,20 @@ def clear_cache_storage(cache_dir):
     чтобы удалить кэш и сохранить посторонние файлы вместе с glossary.json.
     """
     cache_dir = Path(cache_dir)
+    audio_dir = cache_dir / "audio"
+    silence_dir = cache_dir / "silences"
+    if audio_dir.is_symlink() or silence_dir.is_symlink():
+        raise ValueError(
+            "Очистка отменена: audio или silences в папке кэша является "
+            "символической ссылкой"
+        )
+    if audio_dir.exists() and not audio_dir.is_dir():
+        raise ValueError(
+            "Очистка отменена: audio в папке кэша не является каталогом"
+        )
     # Сначала убираем индекс: даже частичный сбой последующего rmtree не
     # оставит JSON, указывающий на уже удалённые аудиофайлы.
     remove_cache_index_files(cache_dir)
-    audio_dir = cache_dir / "audio"
-    silence_dir = cache_dir / "silences"
     owned_patterns = (
         "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"
         "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]"
@@ -9124,7 +9280,7 @@ def _select_book_audio_profile(
     channels="auto",
     bitrate="128k",
 ):
-    """Разрешает профиль финальной книги из канонического 48 kHz mono-кэша."""
+    """Выбирает профиль книги для подготовленной речи 48 кГц, моно."""
     output_format = str(output_format).strip().lower()
     if output_format not in AUDIO_PROFILE_FORMATS:
         raise ValueError("Выбран неподдерживаемый формат финальной книги.")
@@ -13124,8 +13280,8 @@ DEFAULT_CONFIG = {
     "export_m4b_max_duration_hours": DEFAULT_M4B_MAX_DURATION_HOURS,
     "export_m4b_max_chapters": 0,
     "export_m4b_bitrate": "64k",
-    # Имена и метаданные M4B исходников независимы от универсальной вкладки
-    # экспорта. Имя по умолчанию сохраняет исторический адаптивный диапазон;
+    # Имя группы исходников и метаданные M4B независимы от вкладки экспорта.
+    # Имя по умолчанию сохраняет исторический адаптивный диапазон;
     # при необходимости пользователь может заменить его на ``{book}`` или
     # другой допустимый шаблон. Все части получают один альбом по умолчанию.
     "synthesis_m4b_template": DEFAULT_SOURCE_M4B_TEMPLATE,
@@ -13210,7 +13366,7 @@ DEFAULT_CONFIG = {
     "fx_echo_delay": 300,
     "fx_echo_decay": 0.3,
 
-    "default_group_name": "Том {num}",
+    "default_group_name": "Группа {num}",
     "default_group_pause": 1000,
 
     "ui_font_size": 10,
@@ -13323,9 +13479,12 @@ def normalize_config(config):
             normalized[key] = DEFAULT_CONFIG[key]
 
     try:
-        normalized["silence_threshold"] = float(
+        silence_threshold = float(
             normalized.get("silence_threshold", DEFAULT_CONFIG["silence_threshold"])
         )
+        if not math.isfinite(silence_threshold):
+            raise ValueError
+        normalized["silence_threshold"] = silence_threshold
     except (TypeError, ValueError, OverflowError):
         normalized["silence_threshold"] = DEFAULT_CONFIG["silence_threshold"]
 
@@ -13620,7 +13779,7 @@ def normalize_config(config):
                 "поле export_m4b_template."
             )
 
-    # Шаблоны M4B исходников нормализуются после приведения к строке, поэтому
+    # Шаблон имени группы исходников нормализуется после приведения к строке, поэтому
     # пустое поле остаётся явной формой без диапазона ``{book}``. Проверяем
     # импортированные настройки заранее: повреждённый переносимый профиль не
     # должен дожить до запуска фонового обработчика, который начнёт писать файлы.
@@ -13802,6 +13961,174 @@ class RateLimiter:
             if sleep_time > 0:
                 time.sleep(min(sleep_time, 0.1) if cancelled else sleep_time)
 
+class SessionAudioStore:
+    """Хранит готовую речь текущего сеанса отдельно от постоянного кэша."""
+
+    def __init__(self, directory=None):
+        self.directory = Path(directory) if directory is not None else SESSION_TEMP_DIR / "speech"
+        self.lock = threading.RLock()
+        self.inflight = {}
+        self._entries = {}
+        self._owners = {}
+        self._pending_owners = {}
+        self._leases = {}
+        self._retired_scopes = set()
+        self._closed = False
+
+    @staticmethod
+    def config_key(config):
+        """Разделяет речь, полученную с разными параметрами API и обрезки."""
+        trim = _config_bool(config.get("auto_trim_silence", True), default=True)
+        return (
+            str(config.get("speaker", DEFAULT_CONFIG["speaker"])),
+            resolve_api_steps(config),
+            str(config.get("api_url", DEFAULT_CONFIG["api_url"])).strip(),
+            trim,
+            float(config.get("silence_threshold", DEFAULT_CONFIG["silence_threshold"])) if trim else None,
+        )
+
+    def acquire(self, scope):
+        """Защищает выданные пути до завершения всех потребителей процессора."""
+        with self.lock:
+            if self._closed:
+                raise RuntimeError("Хранилище временной речи уже закрыто")
+            self._retired_scopes.discard(scope)
+            self._leases[scope] = self._leases.get(scope, 0) + 1
+
+    def release(self, scope):
+        """Снимает одну защиту и удаляет ставшие ненужными версии фрагментов."""
+        with self.lock:
+            count = self._leases.get(scope, 0)
+            if count > 1:
+                self._leases[scope] = count - 1
+            elif count:
+                self._leases.pop(scope, None)
+            return self._prune_locked()
+
+    def get(self, key, scope):
+        """Возвращает исправный фрагмент и запоминает использующий его контекст."""
+        with self.lock:
+            path = self._entries.get(key)
+            if path is None or self._closed:
+                return None
+            try:
+                _require_opus_audio_file(path)
+            except Exception as exc:
+                logging.warning("Временный речевой фрагмент недоступен: %s", exc)
+                return None
+            if scope not in self._retired_scopes:
+                self._owners[path].add(scope)
+            return path
+
+    def register_request(self, key, scope):
+        """Связывает ожидающий запрос с речью до публикации её первым потребителем."""
+        with self.lock:
+            if self._closed or scope in self._retired_scopes:
+                return None
+            token = object()
+            self._pending_owners.setdefault(key, {})[token] = scope
+            path = self._entries.get(key)
+            if path in self._owners:
+                self._owners[path].add(scope)
+            return token
+
+    def release_request(self, key, token):
+        """Снимает ожидание завершённого или отменённого запроса."""
+        with self.lock:
+            pending = self._pending_owners.get(key)
+            if pending is not None:
+                pending.pop(token, None)
+                if not pending:
+                    self._pending_owners.pop(key, None)
+
+    def publish(self, key, prepared_path, scope):
+        """Публикует новый неизменяемый файл, не заменяя пути активных читателей."""
+        prepared_path = Path(prepared_path)
+        with self.lock:
+            if self._closed and not self._leases:
+                raise RuntimeError("Хранилище временной речи уже закрыто")
+            self.directory.mkdir(parents=True, exist_ok=True)
+            filename = f"synth_{uuid.uuid4().hex}.ogg"
+            destination = self.directory / filename
+            staging = self.directory / f".{filename}.tmp"
+            try:
+                # Папка постоянного кэша может быть на другом томе. Копируем
+                # рядом с итоговым файлом, чтобы атомарная публикация не давала EXDEV.
+                shutil.copyfile(prepared_path, staging)
+                _require_opus_audio_file(staging)
+                os.replace(staging, destination)
+            finally:
+                staging.unlink(missing_ok=True)
+            previous = self._entries.get(key)
+            owners = set(self._owners.get(previous, ()))
+            owners.update(
+                value for value in self._pending_owners.get(key, {}).values()
+                if value not in self._retired_scopes
+            )
+            if scope not in self._retired_scopes:
+                owners.add(scope)
+            self._owners[destination] = set() if self._closed else owners
+            if not self._closed:
+                self._entries[key] = destination
+            try:
+                prepared_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logging.warning("Не удалось удалить подготовленный речевой фрагмент: %s", exc)
+            self._prune_locked()
+            return destination
+
+    def discard_scope(self, scope):
+        """Освобождает речь контекста, сохраняя фрагменты других книг и вкладок."""
+        with self.lock:
+            # Ответ уже отправленного запроса может прийти после смены книги.
+            # Он остаётся доступен активным сборкам, но не возвращает старого владельца.
+            self._retired_scopes.add(scope)
+            for key, pending in tuple(self._pending_owners.items()):
+                for token, value in tuple(pending.items()):
+                    if value == scope:
+                        pending.pop(token, None)
+                if not pending:
+                    self._pending_owners.pop(key, None)
+            for owners in self._owners.values():
+                owners.discard(scope)
+            for key, path in tuple(self._entries.items()):
+                if not self._owners.get(path):
+                    self._entries.pop(key, None)
+            return self._prune_locked()
+
+    def close(self):
+        """Освобождает собственную речь; активные читатели задерживают удаление."""
+        with self.lock:
+            self._closed = True
+            self._pending_owners.clear()
+            self._entries.clear()
+            for owners in self._owners.values():
+                owners.clear()
+            return self._prune_locked()
+
+    def _prune_locked(self):
+        """Удаляет только собственные устаревшие файлы после последней защиты."""
+        if self._leases:
+            return False
+        self._retired_scopes.clear()
+        for key, path in tuple(self._entries.items()):
+            if not self._owners.get(path):
+                self._entries.pop(key, None)
+        current_paths = set(self._entries.values())
+        success = True
+        for path, owners in tuple(self._owners.items()):
+            if owners and path in current_paths:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                success = False
+                logging.warning("Не удалось удалить временный речевой фрагмент: %s", exc)
+            else:
+                self._owners.pop(path, None)
+        return success
+
+
 class TTSProcessor:
     """Главный процессор для обработки текста и взаимодействия с API Silero."""
     def __init__(
@@ -13814,6 +14141,8 @@ class TTSProcessor:
         shared_processing_statuses=None,
         shared_cache_eviction_state=None,
         shared_synthesis_inflight=None,
+        shared_session_audio=None,
+        session_audio_scope=None,
     ):
         # Основной UI уже хранит нормализованный конфиг, но TTSProcessor также
         # создаётся напрямую оптимизатором кэша и может использоваться отдельно
@@ -13878,10 +14207,13 @@ class TTSProcessor:
         self.cache = shared_cache if shared_cache is not None else self._load_cache()
         self.unsaved_cache_items = 0
         self.cache_metadata_dirty = False
-        # При выключенном постоянном кэше ответы API всё равно нужны всем
-        # кодировщикам текущего запуска. Храним только принадлежащие этому
-        # процессору временные пути и удаляем их после завершения потребителей.
+        # Отдельный процессор удаляет собственную временную речь после сборок.
+        # В интерфейсе общее хранилище сеанса удерживает её для продолжения
+        # незавершённой книги без повторных запросов.
         self._transient_audio_paths = set()
+        self.session_audio_store = shared_session_audio
+        self.session_audio_scope = session_audio_scope
+        self._session_audio_lease_active = False
         self.active_threads = []
         # Снимок последней команды полезен для диагностики ошибок FFmpeg и
         # регрессионных тестов. До первой сборки у него есть явное значение.
@@ -13918,13 +14250,21 @@ class TTSProcessor:
                 except Exception as exc:
                     logging.error(f"Ошибка загрузки processing_statuses.json: {exc}")
 
-        # Не оставляем устаревший файл со статусом ``success`` или пустым объектом
+            # Не оставляем устаревший файл со статусом ``success`` или пустым объектом
             # до следующего синтеза. Непустые ошибки останутся для возобновления.
             if not self.processing_statuses_ram:
                 try:
                     status_file.unlink(missing_ok=True)
                 except OSError as exc:
                     logging.error(f"Не удалось удалить пустой processing_statuses.json: {exc}")
+
+        # При ошибке инициализации защита ещё не приобретена. Завершившийся
+        # запуск отдаёт её после присоединения кодировщиков в cleanup_transient_audio_files.
+        if self.session_audio_store is not None and not _config_bool(
+            self.cfg.get("use_cache", True), default=True
+        ):
+            self.session_audio_store.acquire(self.session_audio_scope)
+            self._session_audio_lease_active = True
 
     def _mark_output_status(self, out_filepath, status):
         """Запоминает только проблемные результаты для корректного возобновления."""
@@ -13989,10 +14329,11 @@ class TTSProcessor:
         return data
 
     def stop(self):
-        """Сигнализирует остановку и закрывает текущие сетевые соединения."""
+        """Сигнализирует остановку и освобождает пул HTTP-сессии."""
         self.is_stopped = True
         try:
-            self.session.close()  # Закрывает активные HTTP-запросы.
+            # Уже выполняющийся запрос может завершиться после закрытия сессии.
+            self.session.close()
         except Exception as exc:
             logging.debug("Ошибка закрытия HTTP-сессии при остановке: %s", exc)
 
@@ -14155,10 +14496,15 @@ class TTSProcessor:
         return self._save_cache(force=True)
 
     def cleanup_transient_audio_files(self):
-        """Удаляет временные ответы API после завершения всех кодировщиков запуска."""
+        """Освобождает пути завершённого запуска, сохраняя речь общего сеанса."""
         with self.cache_lock:
+            release_session = getattr(self, "_session_audio_lease_active", False)
+            self._session_audio_lease_active = False
             paths = tuple(self._transient_audio_paths)
             self._transient_audio_paths.clear()
+
+        if release_session:
+            self.session_audio_store.release(self.session_audio_scope)
 
         failed = []
         for path in paths:
@@ -15084,7 +15430,7 @@ class TTSProcessor:
         return filepath
 
     def _run_ffmpeg_concat(self, audio_files, *, cancelled=None):
-        """Склеивает только канонические Opus-фрагменты внутреннего кэша."""
+        """Склеивает подготовленные Opus-фрагменты во временный Ogg/Opus-файл."""
         SESSION_TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
         list_path = None
@@ -15159,41 +15505,63 @@ class TTSProcessor:
             if list_path is not None:
                 list_path.unlink(missing_ok=True)
 
-    def synthesize_sentence(self, normalized_text, original_text, force_new=False):
-        """Синтезирует фрагмент, объединив совпадающие запросы к общему кэшу."""
+    def synthesize_sentence(
+        self, normalized_text, original_text, force_new=False, request_callback=None
+    ):
+        """Объединяет совпадающие запросы и повторно использует доступную речь."""
         use_cache = _config_bool(self.cfg.get("use_cache", True), default=True)
-        if not use_cache:
+        session_store = getattr(self, "session_audio_store", None) if not use_cache else None
+        if not use_cache and session_store is None:
             return self._synthesize_sentence_owned(
-                normalized_text, original_text, force_new=force_new
+                normalized_text, original_text, force_new=force_new,
+                request_callback=request_callback,
             )
 
-        text_hash = self.get_hash(normalized_text)
-        owned_event = None
-        while not self.is_stopped:
-            with self.cache_lock:
-                current_event = self.synthesis_inflight.get(text_hash)
-                if current_event is None:
-                    owned_event = threading.Event()
-                    self.synthesis_inflight[text_hash] = owned_event
-                    break
-            # Event.wait с коротким интервалом сохраняет отзывчивость кнопки
-            # остановки, даже если владелец ждёт сеть или лимитер API.
-            current_event.wait(0.1)
-
-        if owned_event is None:
+        text_hash = (
+            (normalized_text,) + session_store.config_key(self.cfg)
+            if session_store is not None
+            else self.get_hash(normalized_text)
+        )
+        inflight = session_store.inflight if session_store is not None else self.synthesis_inflight
+        inflight_lock = session_store.lock if session_store is not None else self.cache_lock
+        if self.is_stopped:
             return None, False
+        request_token = (
+            session_store.register_request(text_hash, self.session_audio_scope)
+            if session_store is not None else None
+        )
+        owned_event = None
         try:
-            return self._synthesize_sentence_owned(
-                normalized_text, original_text, force_new=force_new
-            )
+            while not self.is_stopped:
+                with inflight_lock:
+                    current_event = inflight.get(text_hash)
+                    if current_event is None:
+                        owned_event = threading.Event()
+                        inflight[text_hash] = owned_event
+                        break
+                # Event.wait с коротким интервалом сохраняет отзывчивость кнопки
+                # остановки, даже если владелец ждёт сеть или лимитер API.
+                current_event.wait(0.1)
+
+            if owned_event is None:
+                return None, False
+            try:
+                return self._synthesize_sentence_owned(
+                    normalized_text, original_text, force_new=force_new,
+                    request_callback=request_callback,
+                )
+            finally:
+                with inflight_lock:
+                    if inflight.get(text_hash) is owned_event:
+                        inflight.pop(text_hash, None)
+                    owned_event.set()
         finally:
-            with self.cache_lock:
-                if self.synthesis_inflight.get(text_hash) is owned_event:
-                    self.synthesis_inflight.pop(text_hash, None)
-                owned_event.set()
+            if request_token is not None:
+                session_store.release_request(text_hash, request_token)
 
     def _synthesize_sentence_owned(
-        self, normalized_text, original_text, force_new=False
+        self, normalized_text, original_text, force_new=False,
+        request_callback=None,
     ):
         text_hash = self.get_hash(normalized_text)
         file_name = f"{text_hash}.ogg"
@@ -15201,6 +15569,14 @@ class TTSProcessor:
 
         steps = resolve_api_steps(self.cfg)
         use_cache = _config_bool(self.cfg.get("use_cache", True), default=True)
+        session_store = getattr(self, "session_audio_store", None) if not use_cache else None
+        session_key = None
+        if session_store is not None:
+            session_key = (normalized_text,) + session_store.config_key(self.cfg)
+            if not force_new:
+                session_path = session_store.get(session_key, self.session_audio_scope)
+                if session_path is not None:
+                    return session_path, True
         cache_hit_info = None
         with self.cache_lock:
             if (
@@ -15260,6 +15636,19 @@ class TTSProcessor:
                 return None, False
             if self.is_stopped:
                 return None, False
+            # Уведомление о новом запросе не является частью сетевой операции.
+            # Ошибка обновления UI не должна отменять запрос, запускать повторы
+            # или заменять речь резервной тишиной.
+            if request_callback is not None:
+                try:
+                    request_callback(normalized_text)
+                except Exception:
+                    logging.exception(
+                        "Не удалось обновить статус перед запросом API; "
+                        "запрос всё равно будет выполнен"
+                    )
+                if self.is_stopped:
+                    return None, False
             try:
                 r = self.session.post(self.cfg["api_url"], json=payload, timeout=30)
                 r.raise_for_status()
@@ -15287,6 +15676,10 @@ class TTSProcessor:
                     with self.cache_lock:
                         os.replace(prepared_ogg, cache_file)
                     result_file = cache_file
+                elif session_store is not None:
+                    result_file = session_store.publish(
+                        session_key, prepared_ogg, self.session_audio_scope
+                    )
                 else:
                     # При выключенном кэше результат всё ещё нужен сборщику,
                     # но он не должен попадать ни в индекс, ни под стабильное
@@ -15431,6 +15824,7 @@ class TTSProcessor:
         encoding_callback=None,
         output_path=None,
         return_audio_files=False,
+        request_callback=None,
     ):
         # ``output_path`` необязателен, поэтому старые вызовы сохраняют
         # исходный контракт ``output_dir``/``basename``. Рекурсивный синтез дерева
@@ -15440,7 +15834,7 @@ class TTSProcessor:
             if output_path is not None
             else Path(self.cfg["output_dir"]) / out_filename
         )
-        # Запуск сборщика возвращает только канонические фрагменты кэша и не
+        # Запуск сборщика возвращает подготовленные речевые фрагменты и не
         # должен создавать каталог назначения, пока планировщик целей не
         # выбрал и не проверил реальные пути вывода. Старые вызовы,
         # сохраняющие на диск, сохраняют прежнее нетерпеливое создание каталога.
@@ -15603,6 +15997,11 @@ class TTSProcessor:
         successful_speech_count = 0
         total_tasks = len(tasks)
 
+        if progress_callback:
+            # Процент считает завершённые фрагменты, а request_callback
+            # показывает текущий запрос до получения ответа API.
+            progress_callback(0, total_tasks, "")
+
         for i, task in enumerate(tasks):
             if self.is_stopped:
                 self._save_cache()
@@ -15624,15 +16023,31 @@ class TTSProcessor:
                 if f: audio_files.append(f)
                 if progress_callback: progress_callback(i + 1, total_tasks, "[ПАУЗА РАЗДЕЛИТЕЛЯ]")
             else:
-                if progress_callback: progress_callback(i + 1, total_tasks, clean_text)
                 speech_task_count += 1
-                filepath, success = self.synthesize_sentence(clean_text, raw_text_or_duration, force_new)
+                filepath, success = self.synthesize_sentence(
+                    clean_text, raw_text_or_duration, force_new,
+                    request_callback=request_callback,
+                )
                 if filepath:
                     audio_files.append(filepath)
                 if success:
                     successful_speech_count += 1
                 else:
                     file_has_errors = True
+                if progress_callback and (success or not self.is_stopped):
+                    progress_callback(i + 1, total_tasks, clean_text)
+
+            if self.is_stopped:
+                # Последний запрос тоже может быть остановлен: следующей
+                # итерации уже не будет, поэтому не собираем неполную главу.
+                self._save_cache()
+                if save_to_disk:
+                    self._mark_output_status(resolved_output_path, "error")
+                if completion_callback:
+                    completion_callback(out_filename, "error", None)
+                if return_audio_files:
+                    return collector_result("error", audio_files, has_errors=True)
+                return
 
         # При частичном сбое тишина вместо одной фразы сохраняет порядок и
         # длительность остальных фрагментов. Но файл, в котором не удалось
@@ -16145,6 +16560,7 @@ class TTSProcessor:
         encoding_callback=None,
         output_path=None,
         return_audio_files=False,
+        request_callback=None,
     ):
         filepath = Path(filepath)
         try:
@@ -16178,6 +16594,7 @@ class TTSProcessor:
             else None,
             output_path=resolved_output_path,
             return_audio_files=return_audio_files,
+            request_callback=request_callback,
         )
 
 
@@ -16402,7 +16819,7 @@ TEMPLATE_HELPER_CONTEXTS = {
         "presets": (
             ("Тома", "Том {num}"),
             ("Части", "Часть {num}"),
-            ("Начать с 10", "Том {num:10}"),
+            ("Начать с 10", "Группа {num:10}"),
         ),
     },
     "output_file": {
@@ -16561,6 +16978,37 @@ TEMPLATE_HELPER_CONTEXTS = {
 TEMPLATE_HELPER_CONTEXTS["m4b_album"]["fields"] = TEMPLATE_HELPER_CONTEXTS[
     "m4b_part"
 ]["fields"]
+# Имя группы использует тот же рендерер, что имя части M4B, но сама группа
+# может служить любому выходному формату с режимом «Один файл».
+_SOURCE_GROUP_HELPER_LABELS = {
+    "name": ("Имя книги", "Имя книги при расчёте группы"),
+    "group": ("Имя книги (алиас)", "То же значение, что и {name}"),
+    "title": ("Название книги (алиас)", "То же значение, что и {name}"),
+    "source_name": ("Имя источника", "Имя книги до разбиения"),
+    "source_title": ("Название источника", "Имя книги до разбиения"),
+    "filename": ("Первый TXT", "Имя первого TXT в группе без расширения"),
+    "part": ("Номер группы", "Позиция группы в плане"),
+    "parts": ("Всего групп", "Общее число групп в плане"),
+    "volume": ("Номер группы (алиас)", "То же значение, что и {part}"),
+    "num": ("Номер группы (кратко)", "То же значение, что и {part}"),
+    "index": ("Номер группы (совместимость)", "То же значение, что и {part}"),
+    "profile": ("Профиль", "Пусто при подготовке плана"),
+    "author": ("Автор", "Пусто при подготовке плана"),
+    "format": ("Совместимость M4B", "Служебное значение m4b, не формат выхода"),
+    "ext": ("Расширение M4B", "Служебное значение m4b, не формат выхода"),
+}
+TEMPLATE_HELPER_CONTEXTS["source_group"] = {
+    **TEMPLATE_HELPER_CONTEXTS["m4b_part"],
+    "fields": tuple(
+        (field, *_SOURCE_GROUP_HELPER_LABELS.get(field, (label, description)))
+        for field, label, description in TEMPLATE_HELPER_CONTEXTS["m4b_part"]["fields"]
+    ),
+    "presets": (
+        ("Книга и диапазон", "{book} Главы {range}"),
+        ("Книга и группа", "{book} Группа {part}"),
+        ("Только книга", "{book}"),
+    ),
+}
 
 
 def template_helper_context(context_kind):
@@ -16861,7 +17309,7 @@ def render_template_helper_preview(
             )
         return tuple(results)
 
-    if context_kind in {"m4b_part", "m4b_album"}:
+    if context_kind in {"m4b_part", "m4b_album", "source_group"}:
         allowed = SOURCE_M4B_TEMPLATE_FIELDS
         validate_filename_template(value, allowed)
         supplied_contexts = tuple(
@@ -16877,11 +17325,11 @@ def render_template_helper_preview(
             last_index = part * 10
             context = {
                 "book": "Моя книга",
-                "name": f"Том {part}",
-                "group": f"Том {part}",
-                "title": f"Том {part}",
-                "source_name": f"Том {part}",
-                "source_title": f"Исходный том {part}",
+                "name": f"Группа {part}" if context_kind == "source_group" else f"Том {part}",
+                "group": f"Группа {part}" if context_kind == "source_group" else f"Том {part}",
+                "title": f"Группа {part}" if context_kind == "source_group" else f"Том {part}",
+                "source_name": f"Группа {part}" if context_kind == "source_group" else f"Том {part}",
+                "source_title": f"Исходная группа {part}" if context_kind == "source_group" else f"Исходный том {part}",
                 "index": part,
                 "chapter": first_index,
                 "group_index": part,
@@ -16935,7 +17383,7 @@ def render_template_helper_preview(
                 fallback=f"Моя книга Часть {part}",
                 max_length=180,
             )
-            results.append(rendered + ".m4b")
+            results.append(rendered if context_kind == "source_group" else rendered + ".m4b")
         return tuple(results)
 
     if context_kind == "m4b_chapter":
@@ -17342,28 +17790,83 @@ class BookExtractor:
             return items
 
         links = parse_toc(book.toc)
-        if links:
-            for link in links:
-                href = link.href.split('#')[0]
-                for item in book.get_items():
-                    if item.file_name == href:
-                        if BookExtractor._is_epub_cover_document(item, link):
-                            break
-                        html_content = item.get_content().decode('utf-8', errors='ignore')
-                        soup = BeautifulSoup(html_content, 'html.parser')
-                        text = BookExtractor._clean_html_text(soup, epub_blocks)
-                        if text: chapters.append((link.title, text))
-                        break
-        else:
-            for item_id in book.spine:
-                item = book.get_item_with_id(item_id[0])
-                if item.get_type() == ebooklib.ITEM_DOCUMENT:
-                    if BookExtractor._is_epub_cover_document(item):
-                        continue
-                    html_content = item.get_content().decode('utf-8', errors='ignore')
-                    soup = BeautifulSoup(html_content, 'html.parser')
-                    text = BookExtractor._clean_html_text(soup, epub_blocks)
-                    if text: chapters.append(("Глава", text))
+        # EPUB TOC href может содержать percent-encoding, ``./`` и якорь. В
+        # памяти EbookLib путь манифеста обычно уже декодирован, поэтому
+        # сравнение «как есть» теряло такие главы. Один документ также часто
+        # встречается в TOC несколько раз из-за ссылок на разные якоря; читаем
+        # его один раз, сохраняя подпись первой ссылки.
+        def normalized_href(value):
+            raw = urllib.parse.unquote(str(value or "").split("#", 1)[0])
+            raw = raw.replace("\\", "/")
+            while raw.startswith("./"):
+                raw = raw[2:]
+            if not raw:
+                return ""
+            normalized = posixpath.normpath(raw)
+            return normalized[2:] if normalized.startswith("./") else normalized
+
+        items = tuple(book.get_items())
+        items_by_href = {
+            normalized_href(getattr(item, "file_name", "")): item
+            for item in items
+            if normalized_href(getattr(item, "file_name", ""))
+        }
+        toc_documents = {}
+        cover_documents = set()
+        for link in links:
+            href = normalized_href(getattr(link, "href", ""))
+            item = items_by_href.get(href)
+            if item is None:
+                continue
+            item_type = getattr(item, "get_type", None)
+            if callable(item_type) and item_type() != ebooklib.ITEM_DOCUMENT:
+                continue
+            item_key = normalized_href(getattr(item, "file_name", "")) or str(
+                getattr(item, "id", "") or href
+            )
+            if item_key in toc_documents:
+                continue
+            toc_documents[item_key] = (item, link.title)
+            if BookExtractor._is_epub_cover_document(item, link):
+                cover_documents.add(item_key)
+
+        # Spine задаёт порядок чтения, а оглавление — подписи документов.
+        # Предисловие и другие главы могут отсутствовать в оглавлении;
+        # такой текст сохраняем вместе с главами, найденными по ссылкам.
+        documents = []
+        seen_documents = set()
+        try:
+            spine = tuple(getattr(book, "spine", ()) or ())
+        except TypeError:
+            spine = ()
+        for item_id in spine:
+            spine_id = item_id[0] if isinstance(item_id, (tuple, list)) else item_id
+            item = book.get_item_with_id(spine_id)
+            if item is None or item.get_type() != ebooklib.ITEM_DOCUMENT:
+                continue
+            item_key = normalized_href(getattr(item, "file_name", "")) or str(spine_id)
+            if item_key in seen_documents:
+                continue
+            seen_documents.add(item_key)
+            title = toc_documents.get(item_key, (item, "Глава"))[1]
+            documents.append((item_key, item, title))
+
+        # Ссылки вне spine встречаются в старых и неполных EPUB. Сохраняем
+        # доступный текст, не меняя порядок основных документов книги.
+        for item_key, (item, title) in toc_documents.items():
+            if item_key not in seen_documents:
+                documents.append((item_key, item, title))
+
+        for item_key, item, title in documents:
+            if (item_key in cover_documents
+                    or isinstance(item, epub.EpubNav)
+                    or BookExtractor._is_epub_cover_document(item)):
+                continue
+            html_content = item.get_content().decode('utf-8', errors='ignore')
+            soup = BeautifulSoup(html_content, 'html.parser')
+            text = BookExtractor._clean_html_text(soup, epub_blocks)
+            if text:
+                chapters.append((title, text))
 
         return chapters, author
 
@@ -17417,7 +17920,17 @@ class BookExtractor:
 
         # DOCX не подвержен проблеме тегов: python-docx выдаёт чистый текст параграфа.
         for p in doc.paragraphs:
-            if p.style.name.startswith('Heading'):
+            # Пользовательские стили могут называться «Заголовок 1», тогда как
+            # ``style_id`` в шаблоне остаётся английским. Проверяем оба признака,
+            # чтобы такие DOCX сохраняли границы глав.
+            style = getattr(p, "style", None)
+            style_name = str(getattr(style, "name", "") or "").strip().casefold()
+            style_id = str(getattr(style, "style_id", "") or "").strip().casefold()
+            is_heading = (
+                style_name.startswith(("heading", "заголовок"))
+                or style_id.startswith("heading")
+            )
+            if is_heading:
                 if current_text:
                     chapters.append((current_title, "\n".join(current_text)))
                     current_text = []
@@ -17685,6 +18198,9 @@ class TTSApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Silero TTS Studio")
+        self._playback_lock = threading.Lock()
+        self._playback_generation = 0
+        self.current_playback_process = None
 
         # Фоновые потоки не должны обращаться к Tcl/Tk напрямую. Они складывают
         # вызовы сюда, а главный поток регулярно исполняет их в цикле Tk.
@@ -17753,6 +18269,8 @@ class TTSApp:
         self._shared_processing_statuses = None
         self._shared_cache_lock = threading.RLock()
         self._shared_synthesis_inflight = {}
+        self._session_audio_store = None
+        self._session_audio_scopes = {}
         # Защита со счётчиком ссылок общая для пакетного и прямого процессоров.
         # Запуск источника с несколькими выходами может удерживать пути кэша
         # для отложенного этапа M4B, пока прямому синтезу всё ещё разрешено
@@ -17783,7 +18301,7 @@ class TTSApp:
         self._restoring_export_project_session = False
         self._export_project_explicitly_cleared = False
 
-        # Виртуальный предварительный план M4B для вкладки «Синтез из папки».
+        # Виртуальный план групп для вкладки «Синтез из папки».
         # Он группирует TXT только в Treeview и никогда не меняет файлы на
         # диске. Фактические длительности появятся лишь после синтеза.
         self._source_plan_groups = {}
@@ -17798,6 +18316,7 @@ class TTSApp:
             self.config.get("synthesis_m4b_album_template")
         )
         self._source_plan_reload_pending = False
+        self._source_reload_after_processing = False
         self._source_plan_snapshot = None
         self._source_plan_dirty = False
         self._source_plan_revision = 0
@@ -17910,8 +18429,8 @@ class TTSApp:
 
         if sys.platform == "darwin":
             # Tk 9 сообщает эффективное оформление Aqua напрямую. Tk 8.6 не
-        # предоставляет этот API, поэтому резервный путь через RGB ниже сохраняет
-        # совместимость.
+            # предоставляет этот API, поэтому резервный путь через RGB ниже
+            # сохраняет совместимость.
             self._appearance_check_after_id = self.root.after(1000, self._check_system_appearance)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -17941,7 +18460,9 @@ class TTSApp:
 
     def _post_to_ui(self, callback, *args, **kwargs):
         """Потокобезопасно ставит вызов Tkinter в очередь главного потока."""
-        if getattr(self, "_is_closing", False):
+        if getattr(self, "_is_closing", False) and getattr(
+            self, "_closing_wait_popup", None
+        ) is None and not getattr(self, "_closing_ui_barrier_pending", False):
             return
         self._ui_queue.put((callback, args, kwargs))
 
@@ -17983,10 +18504,8 @@ class TTSApp:
                 target.focus_set()
 
                 # Нативные Progressbar/Scale Aqua иногда продолжают выглядеть
-                # неактивными, хотя клик уже вернул NSWindow приложению. Тот же
-                # Отложенная перерисовка с объединением повторов используется после
-                # Map/Activate и не меняет
-                # выбранную тему или значения виджетов.
+                # неактивными, хотя клик уже вернул NSWindow приложению. Отложенная
+                # перерисовка объединяет повторные события Map/Activate.
                 if (
                     sys.platform == "darwin"
                     and not getattr(self, "_mac_window_active", False)
@@ -18010,6 +18529,13 @@ class TTSApp:
         ``focus_force`` намеренно не используется: он мог бы перехватить фокус,
         если пользователь переключился в другое приложение.
         """
+        # После подтверждения закрытия финальные сообщения фоновых задач
+        # не должны перекрывать окно ожидания и требовать второго подтверждения.
+        if getattr(self, "_is_closing", False) and (
+            getattr(self, "_closing_wait_popup", None) is not None
+            or getattr(self, "_closing_ui_barrier_pending", False)
+        ):
+            return None
         try:
             previous_focus = self.root.focus_get()
         except tk.TclError:
@@ -18064,8 +18590,104 @@ class TTSApp:
             messagebox.askyesnocancel, title, message, **options
         )
 
-    def _create_synthesis_processor(self, config):
-        """Создаёт процессор и делит RAM-кэш между одновременно активными вкладками."""
+    def _session_audio_scope(self, config, kind, text=None):
+        """Отделяет временную речь разных книг и настроек подготовки текста."""
+        keys = (
+            "synthesis_mode", "normalizer_enabled", "normalizer_mode",
+            "normalizer_options", "glossary_enabled", "auto_abbreviations",
+            "auto_short_words", "separator_symbols",
+        )
+        preparation = {
+            key: config.get(key, DEFAULT_CONFIG.get(key)) for key in keys
+        }
+        if _config_bool(preparation.get("glossary_enabled", True), default=True):
+            glossary = Path(config.get("cache_dir", DEFAULT_CACHE_DIR)).expanduser() / "glossary.json"
+            try:
+                stat = glossary.stat()
+                preparation["glossary"] = (str(glossary.resolve()), stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                preparation["glossary"] = None
+        if kind == "source":
+            paths = config.get("source_path_by_id", getattr(self, "_source_path_by_id", {}))
+            content = (
+                str(Path(config.get("input_dir", DEFAULT_INPUT_DIR)).expanduser().resolve()),
+                self._source_input_signatures(paths),
+            )
+        else:
+            content = text or ""
+        payload = json.dumps((content, preparation), ensure_ascii=False, sort_keys=True, default=str)
+        return (
+            kind, hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            SessionAudioStore.config_key(config),
+            _config_bool(config.get("text_is_prepared", False)),
+        )
+
+    def _discard_session_audio(self, kind):
+        """Снимает принадлежность временной речи после смены источника или его завершения."""
+        store = getattr(self, "_session_audio_store", None)
+        scopes = getattr(self, "_session_audio_scopes", {})
+        scope = scopes.pop(kind, None)
+        if store is not None and scope is not None:
+            store.discard_scope(scope)
+
+    def _prepare_session_audio(self, config, kind, text=None):
+        """Переиспользует речь только внутри текущего приложения без записи индекса."""
+        if _config_bool(config.get("use_cache", True), default=True):
+            self._discard_session_audio(kind)
+            return None, None
+        store = getattr(self, "_session_audio_store", None)
+        if store is None:
+            store = self._session_audio_store = SessionAudioStore()
+        if not hasattr(self, "_session_audio_scopes"):
+            self._session_audio_scopes = {}
+        scope = self._session_audio_scope(config, kind, text)
+        if self._session_audio_scopes.get(kind) != scope:
+            self._discard_session_audio(kind)
+            self._session_audio_scopes[kind] = scope
+        return store, scope
+
+    def _sync_source_session_audio(self):
+        """Очищает старую временную речь при изменении загруженной папки или TXT."""
+        previous = getattr(self, "_session_audio_scopes", {}).get("source")
+        if previous is not None and (
+            _config_bool(self.config.get("use_cache", True), default=True)
+            # «Текст уже подготовлен» относится к запуску, а не к глобальным
+            # настройкам. Его смену проверит новый процессор после чтения флажка.
+            or previous[:3] != self._session_audio_scope(self.config, "source")[:3]
+        ):
+            self._discard_session_audio("source")
+
+    def _discard_processor_session_audio(self, processor):
+        """Освобождает завершённый источник, сохраняя речь соседней активной вкладки."""
+        store = getattr(self, "_session_audio_store", None)
+        if store is None or getattr(processor, "session_audio_store", None) is not store:
+            return
+        scope = processor.session_audio_scope
+        store.discard_scope(scope)
+        scopes = getattr(self, "_session_audio_scopes", {})
+        if scopes.get(scope[0]) == scope:
+            scopes.pop(scope[0], None)
+
+    def _create_synthesis_processor(self, config, *, session_kind="source", session_text=None):
+        """Создаёт процессор с общим кэшем и временной речью работающих вкладок."""
+        # После ошибки сохранения последний обработчик ещё может хранить
+        # несохранённые данные. Публикуем их до загрузки нового снимка кэша.
+        pending_processors = tuple(getattr(self, "_closing_processors", ()))
+        if pending_processors:
+            try:
+                for pending_processor in pending_processors:
+                    if pending_processor.flush_cache() is False:
+                        raise OSError("не удалось записать индекс кэша")
+                    if pending_processor._save_processing_statuses() is False:
+                        raise OSError("не удалось записать статусы обработки")
+            except Exception as exc:
+                raise RuntimeError(
+                    "Не удалось сохранить данные предыдущего запуска. "
+                    "Проверьте доступность папки кэша и свободное место "
+                    "на диске, затем повторите запуск."
+                ) from exc
+            self._closing_processors = ()
+            self._closing_workers = ()
         cache_dir = Path(config["cache_dir"]).expanduser().resolve()
         active_processors = tuple(
             processor
@@ -18075,6 +18697,7 @@ class TTSApp:
         if active_processors and any(processor.cache_dir.resolve() != cache_dir for processor in active_processors):
             raise RuntimeError("Нельзя одновременно синтезировать с разными папками кэша")
         shared_cache = self._shared_cache if self._shared_cache_dir == cache_dir else None
+        session_store, session_scope = self._prepare_session_audio(config, session_kind, session_text)
         processor = TTSProcessor(
             config,
             shared_rate_limiter=self.shared_rate_limiter,
@@ -18088,6 +18711,8 @@ class TTSApp:
             ),
             shared_cache_eviction_state=self._shared_cache_eviction_state,
             shared_synthesis_inflight=self._shared_synthesis_inflight,
+            shared_session_audio=session_store,
+            session_audio_scope=session_scope,
         )
         # Первый процессор загружает индекс штатным _load_cache(); следующие
         # получают уже тот же объект dict.
@@ -18102,6 +18727,24 @@ class TTSApp:
             self._shared_cache_dir = None
             self._shared_cache = None
             self._shared_processing_statuses = None
+
+    def _retain_unsaved_synthesis_processor(self, processor):
+        """Удерживает данные неудачной записи до повторного запуска или закрытия."""
+        self._closing_processors = tuple({
+            id(value): value
+            for value in tuple(getattr(self, "_closing_processors", ()))
+            + (processor,)
+            if value is not None
+        }.values())
+
+    @staticmethod
+    def _synthesis_save_failure_message():
+        return (
+            "Не удалось сохранить данные синтеза или статусы обработки. Данные оставлены "
+            "в памяти приложения. Проверьте доступность папки и свободное место "
+            "на диске. При следующем запуске синтеза или закрытии приложения "
+            "сохранение будет повторено."
+        )
 
     def _drain_ui_queue(self):
         """Исполняет UI-вызовы порциями, не монополизируя цикл Tk."""
@@ -18159,6 +18802,9 @@ class TTSApp:
 
         self._mac_startup_focus_done = False
         self._mac_window_active = False
+        self._mac_restore_progress_pending = False
+        self._mac_restore_activation_refresh_pending = False
+        self._mac_restore_idle_flush_in_progress = False
         self._mac_startup_focus_after_id = None
         self._mac_startup_map_bind_id = self.root.bind("<Map>", self._on_mac_initial_map, add="+")
         # Повторный Map корневого toplevel после сворачивания не должен снова
@@ -18189,18 +18835,44 @@ class TTSApp:
         self._schedule_mac_startup_focus()
 
     def _on_mac_restore_map(self, event):
-        """Перерисовывает Aqua после восстановления, не отбирая фокус."""
-        if event.widget is not self.root or not self._mac_startup_focus_done:
+        """Завершает отрисовку потомков при восстановлении главного окна."""
+        if (
+            event.widget is not self.root
+            or not self._mac_startup_focus_done
+            or getattr(self, "_is_closing", False)
+            or getattr(self, "_mac_restore_idle_flush_in_progress", False)
+        ):
             return
-        self._schedule_mac_restore_refresh()
+        try:
+            if not self.root.winfo_exists() or self.root.state() != "normal":
+                return
+            self._mac_restore_progress_pending = True
+            self._mac_restore_activation_refresh_pending = False
+            self._schedule_mac_restore_refresh()
+
+            # На Aqua Map главного окна приходит раньше отображения потомков.
+            # Завершаем их геометрию и отрисовку в том же событии, чтобы Tk
+            # успел наполнить нативный слой перед его показом после анимации Dock.
+            self._mac_restore_idle_flush_in_progress = True
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+        finally:
+            self._mac_restore_idle_flush_in_progress = False
 
     def _on_mac_restore_activate(self, event):
         """Повторяет перерисовку, когда восстановленное Aqua-окно стало активным."""
         if event.widget is not self.root:
             return
+        was_active = getattr(self, "_mac_window_active", False)
         self._mac_window_active = True
         if not self._mac_startup_focus_done:
             return
+        # Dock иногда возвращает Activate без Map корневого окна. Если полосы
+        # уже были видны на вкладке источников, им нужен локальный сброс Aqua-состояния.
+        if not was_active or getattr(self, "_mac_restore_activation_refresh_pending", False):
+            self._mac_restore_progress_pending = True
+            self._mac_restore_activation_refresh_pending = False
         self._schedule_mac_restore_refresh()
 
     def _on_mac_restore_deactivate(self, event):
@@ -18216,18 +18888,17 @@ class TTSApp:
                 self.root.after_cancel(after_id)
             except tk.TclError:
                 pass
+        delay = 150 if getattr(self, "_mac_restore_progress_pending", False) else 25
         self._mac_restore_refresh_after_id = self.root.after(
-            25, self._refresh_mac_after_restore
+            delay, self._refresh_mac_after_restore
         )
 
     def _invalidate_mac_aqua_widgets(self):
         """Просит все ttk-потомки перечитать нативное состояние Aqua."""
-        # ttk::ThemeChanged — штатный механизм Tk, который рассылает
-        # <<ThemeChanged>> всем потомкам. Некоторые версии Aqua не
-        # инвалидируют нативное состояние отрисовки Scale/Progressbar только от
-        # виртуального события, поэтому дополнительно переустанавливаем уже
-        # выбранную тему: это не меняет оформление или значения виджетов, но
-        # заставляет движок темы пересоздать системные элементы управления.
+        # ttk::ThemeChanged рассылает обновление потомкам. Повторная установка
+        # текущей темы помогает перерисовать Aqua после реальной смены оформления;
+        # обычное восстановление окна использует отдельный сброс состояния ниже
+        # и сюда не попадает.
         theme_reloaded = False
         try:
             style = ttk.Style(self.root)
@@ -18252,24 +18923,57 @@ class TTSApp:
             pass
 
     def _refresh_mac_after_restore(self):
-        """Даёт Aqua один цикл простоя и инвалидирует отрисовку всех потомков."""
+        """Обновляет Aqua-индикаторы после восстановления окна.
+
+        Обычное восстановление сбрасывает локальное состояние ``background``
+        у существующих Progressbar/Checkbutton. Полное обновление оформления
+        через ``_check_system_appearance`` требуется только при действительной
+        смене системной темы.
+        """
         self._mac_restore_refresh_after_id = None
         try:
             if not self.root.winfo_exists() or self.root.state() != "normal":
                 return
-            # На Tk 9 явный режим auto заставляет NSWindow повторно применить
-            # текущее оформление. На Tk 8.6 опция отсутствует и безопасно
-            # пропускается, после чего Expose обновляет обычные виджеты.
-            try:
-                self.root.tk.call(
-                    "wm", "attributes", self.root._w, "-appearance", "auto"
-                )
-            except tk.TclError:
-                pass
-            self._invalidate_mac_aqua_widgets()
             self._check_system_appearance(reschedule=False)
+            if getattr(self, "_mac_restore_progress_pending", False):
+                # Возврат через миниатюру Dock может дать Map без Tk Activate
+                # или клавиатурного фокуса даже у активного NSWindow.
+                # Меняем только состояние существующих контролов: пересоздание
+                # дочерних окон здесь могло вызвать лишнюю перерисовку во время
+                # системной анимации. Поздний Activate повторит лёгкое обновление,
+                # если Map пришёл до активации.
+                self._refresh_mac_aqua_widget_states()
+                self._mac_restore_activation_refresh_pending = not getattr(
+                    self, "_mac_window_active", False
+                )
+                self._mac_restore_progress_pending = False
         except tk.TclError:
             pass
+
+    def _refresh_mac_aqua_widget_states(self):
+        """Снимает устаревший флаг состояния окна без пересоздания виджетов.
+
+        Aqua/Tk рисует Progressbar и Checkbutton серыми, пока у них остаётся
+        состояние ``background``. Сброс состояния сохраняет существующие
+        виджеты, их размещение, значения и отложенные обратные вызовы.
+        Если Tk уже снял флаг при активации, дополнительная перерисовка не нужна.
+        """
+        for name in (
+            "file_progress",
+            "total_progress",
+            "export_progress",
+            "chk_auto_scroll",
+        ):
+            widget = getattr(self, name, None)
+            if widget is None:
+                continue
+            try:
+                # ttk state планирует перерисовку даже при неизменном состоянии.
+                # Проверка исключает лишний проход после штатного Activate.
+                if widget.winfo_exists() and widget.instate(["background"]):
+                    widget.state(["!background"])
+            except (AttributeError, tk.TclError):
+                pass
 
     def _schedule_mac_startup_focus(self):
         """Планирует единственную активацию после завершения отрисовки окна."""
@@ -18298,11 +19002,11 @@ class TTSApp:
         if sys.platform != "darwin":
             return
 
-        # Finder-сборке иногда нужна явная активация процесса. Не вызываем
-        # objc_msgSend через ctypes: на разных ABI неверная сигнатура такого
-        # вызова приводит к нативному SIGSEGV, который Python поймать не может.
-        # Системный `open` выполняет активацию вне процесса Tk.
         if is_frozen_mac:
+            # Finder-сборке иногда нужна явная активация процесса. Не вызываем
+            # objc_msgSend через ctypes: на разных ABI неверная сигнатура такого
+            # вызова приводит к нативному SIGSEGV, который Python поймать не может.
+            # Системный `open` выполняет активацию вне процесса Tk.
             try:
                 subprocess.Popen(
                     ["/usr/bin/open", "-a", str(Path(sys.executable).resolve().parents[2])],
@@ -19733,7 +20437,11 @@ class TTSApp:
         """Обновляет статусные цвета при смене темы macOS на лету."""
         if reschedule:
             self._appearance_check_after_id = None
-        if self._is_closing:
+        if (
+            self._is_closing
+            and getattr(self, "_closing_wait_popup", None) is None
+            and not getattr(self, "_closing_ui_barrier_pending", False)
+        ):
             return
 
         is_dark = self._detect_dark_appearance()
@@ -20137,6 +20845,9 @@ class TTSApp:
 
     def _setup_mac_hotkeys(self):
         """Обработка горячих клавиш macOS и безопасное исправление первого клика."""
+        # Системное «Завершить» и ⌘Q проходят то же подтверждение и сохранение,
+        # что и закрытие окна; иначе Tk завершает процесс сразу.
+        self.root.createcommand("::tk::mac::Quit", self.on_closing)
         # Универсальные хоткеи для работы с буфером обмена
         for widget_cls in ("Text", "Entry", "TEntry"):
             self.root.bind_class(
@@ -20357,7 +21068,7 @@ class TTSApp:
         )
         try:
             with open(temp_path, "w", encoding="utf-8") as file:
-                json.dump(data, file, indent=4, ensure_ascii=False)
+                json.dump(data, file, indent=4, ensure_ascii=False, allow_nan=False)
                 file.flush()
                 os.fsync(file.fileno())
             if backup and path.exists():
@@ -20494,10 +21205,35 @@ class TTSApp:
         tree.selection_set(get_all())
         return "break"
 
+    def _active_closing_workers(self):
+        """Проверяет реальные потоки, а не отложенные флаги интерфейса."""
+        return tuple(
+            (name, worker)
+            for name, worker in (
+                ("batch", getattr(self, "processing_thread", None)),
+                ("direct", getattr(self, "direct_thread", None)),
+                ("export", getattr(self, "_export_thread", None)),
+            )
+            if worker is not None and worker.is_alive()
+        )
+
     def on_closing(self):
-        """Безопасно останавливает работу и закрывает главное окно."""
-        if self._is_closing:
+        """Запрашивает подтверждение и закрывает окно после сохранения задач."""
+        if getattr(self, "_is_closing", False) or getattr(
+            self, "_close_request_in_progress", False
+        ):
             return
+
+        # Системный диалог запускает вложенный цикл Tk. Повторное событие
+        # закрытия в этом цикле не должно создавать второй такой же диалог.
+        self._close_request_in_progress = True
+        try:
+            self._request_application_close()
+        finally:
+            self._close_request_in_progress = False
+
+    def _request_application_close(self):
+        """Проверяет операции и несохранённые правки до команды остановки."""
 
         # Операции, которые атомарно публикуют/удаляют индекс и аудиофайлы,
         # нельзя обрывать вместе с фоновым потоком-демоном. В отличие от синтеза у них
@@ -20516,7 +21252,7 @@ class TTSApp:
             self._show_warning(
                 "Импорт выполняется",
                 "Дождитесь завершения импорта книги перед закрытием приложения, "
-                "чтобы не получить неполный набор глав.",
+                "чтобы сохранить полный результат импорта.",
             )
             return
         if getattr(self, "_export_lock", False):
@@ -20524,13 +21260,6 @@ class TTSApp:
                 "Чтение аудиофайлов выполняется",
                 "Дождитесь завершения добавления аудиофайлов в проект перед "
                 "закрытием приложения.",
-            )
-            return
-        if getattr(self, "_export_running", False):
-            self._show_warning(
-                "Экспорт выполняется",
-                "Сначала нажмите «Стоп» и дождитесь завершения текущего файла, "
-                "затем закройте приложение.",
             )
             return
         if getattr(self, "_normalizer_batch_running", False):
@@ -20541,6 +21270,91 @@ class TTSApp:
                 "сохранения текущего файла.",
             )
             return
+
+        processors_before_dialog = tuple(
+            processor
+            for processor in (
+                getattr(self, "batch_processor", None),
+                getattr(self, "direct_processor", None),
+            )
+            + tuple(getattr(self, "_closing_processors", ()))
+            if processor is not None
+        )
+        workers = self._active_closing_workers()
+        if workers:
+            synthesis_active = any(name != "export" for name, _worker in workers)
+            export_active = any(name == "export" for name, _worker in workers)
+            if synthesis_active and export_active:
+                activity = "Сейчас выполняются синтез и обработка аудиофайлов."
+            elif synthesis_active:
+                activity = "Сейчас выполняется синтез или сборка его результатов."
+            else:
+                activity = "Сейчас выполняется обработка аудиофайлов."
+            cache_outcomes = []
+            active_cache_policies = []
+            # Текущие настройки могли измениться после запуска очередей.
+            # Текст описывает режимы, с которыми работают сами процессоры.
+            for name, _worker in workers:
+                if name == "export":
+                    continue
+                processor = getattr(
+                    self, "batch_processor" if name == "batch" else "direct_processor", None
+                )
+                active_config = getattr(processor, "cfg", None)
+                if not isinstance(active_config, Mapping):
+                    active_config = getattr(self, "config", {})
+                if not isinstance(active_config, Mapping):
+                    active_config = {}
+                active_cache_policies.append(cache_policy_signature(active_config))
+            cache_enabled = any(policy[0] for policy in active_cache_policies)
+            cache_disabled = any(not policy[0] for policy in active_cache_policies)
+            if cache_enabled:
+                fragment_text = (
+                    "Для задач с включённым кэшированием полученные фрагменты "
+                    if cache_disabled else "Кэширование включено. Полученные фрагменты "
+                )
+                cache_outcomes.append(
+                    fragment_text + "будут сохранены"
+                    + (" с учётом ограничений кэша. "
+                       if any(policy[1] or policy[2] for policy in active_cache_policies)
+                       else ". ")
+                )
+            if cache_disabled:
+                cache_outcomes.append(
+                    ("Для задач с выключенным кэшированием " if cache_enabled
+                     else "Кэширование выключено. При закрытии приложения ")
+                    + "временные речевые фрагменты будут удалены. "
+                )
+            cache_notice = ""
+            if any(name == "batch" for name, _worker in workers):
+                processor = getattr(self, "batch_processor", None)
+                active_config = getattr(processor, "cfg", None)
+                statuses = getattr(processor, "processing_statuses_ram", None)
+                if isinstance(active_config, Mapping) and source_groups_need_synthesis(
+                    active_config,
+                    _config_bool(active_config.get("skip_existing", True), default=True),
+                    statuses if isinstance(statuses, Mapping) else None,
+                ):
+                    # Настройки в окне могли измениться после запуска; последствия
+                    # остановки определяются сохранённым снимком работающей очереди.
+                    notice = cache_policy_resume_notice(active_config)
+                    if not cache_policy_signature(active_config)[0]:
+                        notice = (
+                            "Для продолжения сборки групп после перезапуска "
+                            "потребуется повторный синтез, включая главы с готовыми "
+                            "отдельными файлами. Это расходует лимит API."
+                        )
+                    if notice:
+                        cache_notice = "\n\n" + notice
+            if not self._ask_yes_no(
+                "Закрыть приложение?",
+                activity + "\n\nОстановить работу и закрыть приложение?\n"
+                + "".join(cache_outcomes) + "Готовые аудиофайлы останутся."
+                + cache_notice,
+                icon="warning",
+                default="no",
+            ):
+                return
 
         glossary_dirty = bool(getattr(self, "_glossary_dirty", False))
         glossary_editor = getattr(self, "txt_glossary", None)
@@ -20563,12 +21377,95 @@ class TTSApp:
             if save_glossary and not self.save_glossary_ui(show_popup=False):
                 return
 
+        # Задача могла закончиться, а её UI-вызов очистить ссылки, пока был
+        # открыт системный диалог. Отмена не меняет состояние этих обработчиков.
+        self._closing_processors = tuple({
+            id(processor): processor
+            for processor in processors_before_dialog
+            + (self.batch_processor, self.direct_processor)
+            if processor is not None
+        }.values())
+        workers = self._active_closing_workers()
+        if workers:
+            self._begin_application_close_wait(workers)
+        elif hasattr(self, "_ui_queue") and not self._ui_queue.empty():
+            # Поток уже завершён, но его итоговые изменения дерева ещё могут
+            # ждать обработки. Удерживаем кэш до сохранения этих изменений.
+            self._closing_ui_barrier_pending = True
+            self._is_closing = True
+            self._post_to_ui(self._finish_application_close_wait)
+        else:
+            self._complete_application_close()
+
+    def _begin_application_close_wait(self, workers):
+        """Мягко останавливает задачи, сохраняя отзывчивость главного окна."""
+        self._closing_workers = tuple(worker for _name, worker in workers)
+        self._closing_processors = tuple({
+            id(processor): processor
+            for processor in (self.batch_processor, self.direct_processor)
+            + tuple(getattr(self, "_closing_processors", ()))
+            if processor is not None
+        }.values())
+        popup = self._create_wait_popup(
+            "Завершение работы",
+            "Останавливаем задачи и сохраняем данные.\n"
+            "Дождитесь завершения текущего запроса\n"
+            "или обработки аудиофайла.",
+        )
+        popup.protocol("WM_DELETE_WINDOW", lambda: None)
+        popup.bind("<Escape>", lambda _event: "break")
+        self._closing_wait_popup = popup
+        self._closing_ui_barrier_posted = False
+        self._is_closing = True
+
+        # Не закрываем HTTP-сессию до конца текущего запроса: полученный ответ
+        # ещё должен пройти обработку и атомарную запись в кэш.
+        for processor in self._closing_processors:
+            processor.is_stopped = True
+        if any(name == "export" for name, _worker in workers):
+            self.is_export_stopped = True
+        self._poll_application_close_wait()
+
+    def _poll_application_close_wait(self):
+        """Ждёт завершения рабочих потоков через таймер, не блокируя Tk."""
+        if any(worker.is_alive() for worker in self._closing_workers):
+            self.root.after(100, self._poll_application_close_wait)
+            return
+
+        if getattr(self, "_closing_ui_barrier_posted", False):
+            return
+        self._closing_ui_barrier_posted = True
+        # Последние статусы и готовые группы уже стоят в очереди перед этим
+        # вызовом. Сохраняем сессию после их обработки в порядке поступления.
+        self._post_to_ui(self._finish_application_close_wait)
+
+    def _finish_application_close_wait(self):
+        """Проходит финальный барьер после последних обновлений интерфейса."""
+        popup = getattr(self, "_closing_wait_popup", None)
+        self._closing_wait_popup = None
+        if popup is not None:
+            self._close_popup_safely(popup)
+        self._closing_ui_barrier_pending = False
+        self._is_closing = False
+        self._complete_application_close()
+
+    def _complete_application_close(self):
+        """Сохраняет итоговые данные после завершения фоновых обработчиков."""
         # Сначала проходим барьер сохранения. При ошибке окно и его таймеры
         # остаются рабочими, а остановленные обработчики завершаются штатно.
         save_errors = []
-        for processor in (self.batch_processor, self.direct_processor):
+        processors = (self.batch_processor, self.direct_processor) + tuple(
+            getattr(self, "_closing_processors", ())
+        )
+        saved_processors = set()
+        retained_processors = []
+        for processor in processors:
             if processor is None:
                 continue
+            if id(processor) in saved_processors:
+                continue
+            saved_processors.add(id(processor))
+            retained_processors.append(processor)
             try:
                 if not processor.is_stopped:
                     processor.stop()
@@ -20611,6 +21508,7 @@ class TTSApp:
             save_errors.append(f"Разбиение исходников: {exc}")
         if save_errors:
             self._is_closing = False
+            self._closing_processors = tuple(retained_processors)
             self._export_session_save_after_id = export_session_after_id
             self._source_session_save_after_id = source_session_after_id
             self._show_error(
@@ -20659,7 +21557,18 @@ class TTSApp:
                 pass
             self._settings_save_after_id = None
 
+        if hasattr(self, "_playback_lock"):
+            self.stop_audio_playback()
         self._discard_last_direct_preview()
+        self._closing_processors = ()
+        self._closing_workers = ()
+
+        store = getattr(self, "_session_audio_store", None)
+        if store is not None:
+            # Все синтезы прошли барьер завершения. Удаляем только собственную
+            # речь: манифесты и предпросмотры соседних операций здесь не затрагиваем.
+            store.close()
+            self._session_audio_scopes.clear()
 
         # Не удаляем ``SESSION_TEMP_DIR``: фоновые задачи этого экземпляра могут
         # ещё ждать FFmpeg. Каждая операция ``concat`` удалит только собственный
@@ -21214,6 +22123,9 @@ class TTSApp:
             # Представление предустановки/«Другое» является деталью интерфейса и заново
             # строится из единственного сохраняемого значения ``api_steps``.
             self._load_api_steps_widgets_from_config()
+            if hasattr(self, "api_token_visible_var"):
+                self.api_token_visible_var.set(False)
+                self.api_token_entry.configure(show="*")
 
             # 3. Поля на вкладке "Экспорт"
             if hasattr(self, 'export_outdir_var'):
@@ -21282,7 +22194,7 @@ class TTSApp:
                         )
                     )
                 )
-            # Имена M4B исходников редактируются в асинхронном диалоге плана,
+            # Имена групп исходников редактируются в асинхронном диалоге плана,
             # а не в ``settings_vars``. После импорта/сброса настроек приводим
             # снимок в памяти в соответствие, чтобы следующий план/запуск
             # использовал сохранённое значение, а не устаревшее значение сеанса.
@@ -21419,8 +22331,8 @@ class TTSApp:
     def import_config(self):
         if getattr(self, "_source_plan_running", False):
             self._show_warning(
-                "План M4B выполняется",
-                "Дождитесь завершения расчёта частей M4B перед импортом "
+                "План групп выполняется",
+                "Дождитесь завершения расчёта плана групп перед импортом "
                 "настроек, чтобы не смешать старый план с новой папкой TXT.",
             )
             return
@@ -21557,8 +22469,8 @@ class TTSApp:
         """Сброс рабочих настроек с сохранением темы оформления и размера шрифта"""
         if getattr(self, "_source_plan_running", False):
             self._show_warning(
-                "План M4B выполняется",
-                "Дождитесь завершения расчёта частей M4B перед сбросом "
+                "План групп выполняется",
+                "Дождитесь завершения расчёта плана групп перед сбросом "
                 "настроек.",
             )
             return
@@ -21576,6 +22488,16 @@ class TTSApp:
                 # Если диск недоступен, прежние конфигурация и интерфейс остаются целыми.
                 self._persist_settings_snapshot(candidate_config)
                 self.config = candidate_config
+
+                try:
+                    self.shared_rate_limiter.update_limits(
+                        self.config.get("api_max_requests", 15),
+                        self.config.get("api_time_window", 15.0),
+                    )
+                except Exception:
+                    logging.exception(
+                        "Настройки сброшены, но runtime-лимитер не обновлён"
+                    )
 
                 # 4. Полный проход для чистой перерисовки интерфейса
                 self.full_ui_refresh()
@@ -21622,6 +22544,7 @@ class TTSApp:
         )
         if sys.platform == "darwin":
             self._bind_mac_treeview_clicks(self.tree)
+        self.tree.bind("<Map>", self._on_source_tree_map, add="+")
         self.tree.heading("#0", text="Имя файла")
         self.tree.heading("status", text="Статус")
         # Статус включает текущий формат фоновой сборки FFmpeg, поэтому ему
@@ -21865,7 +22788,7 @@ class TTSApp:
 
         btn_frame.bind("<Configure>", resize_source_actions, add="+")
 
-        # План M4B — отдельное подготовительное действие. Вынос в собственную
+        # План групп — отдельное подготовительное действие. Вынос в собственную
         # строку не сжимает основные кнопки «Старт/Стоп» на небольших окнах и
         # подчёркивает, что это оценочная организация TXT до синтеза, а не
         # отдельный параллельный режим кодирования.
@@ -21873,7 +22796,7 @@ class TTSApp:
         plan_frame.pack(fill=tk.X)
         self.btn_prepare_m4b_plan = ttk.Button(
             plan_frame,
-            text="🧩 Подготовить оценочный план M4B…",
+            text="🧩 Подготовить план групп…",
             command=self.prepare_m4b_source_plan,
         )
         self.btn_prepare_m4b_plan.pack(side=tk.LEFT, padx=2)
@@ -21882,10 +22805,11 @@ class TTSApp:
                 plan_frame,
                 (
                     "Группирует целые TXT по символам и приблизительной "
-                    "длительности; после синтеза при выбранном M4B точные "
-                    "длительности и таймкоды считаются автоматически."
+                    "длительности. Группы используются всеми целями с режимом "
+                    "«Один файл»; для M4B точные длительности и таймкоды "
+                    "считаются после синтеза."
                 ),
-                title="О плане M4B",
+                title="О плане групп",
                 wraplength=560,
                 initially_open=False,
             )
@@ -21944,7 +22868,7 @@ class TTSApp:
         )
 
         def resize_manual_plan_actions(event=None):
-            """Оставляет действия плана M4B доступными на узких окнах."""
+            """Оставляет действия плана групп доступными на узких окнах."""
             width = int(
                 getattr(event, "width", 0) or manual_plan_frame.winfo_width()
             )
@@ -22026,7 +22950,7 @@ class TTSApp:
             widget.pack(side=tk.BOTTOM, fill=tk.X)
         list_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        # Виртуальные M4B-части не являются файлами на диске, поэтому
+        # Виртуальные группы не являются файлами на диске, поэтому
         # стандартное редактирование Treeview к ним не применяется. Двойной
         # щелчок по строке части открывает тот же безопасный диалог, что и
         # явная кнопка «Переименовать часть».
@@ -22125,7 +23049,7 @@ class TTSApp:
         self._render_compact_label(
             label,
             (
-                f"Книга: {book_name} · готовые: {skip} · дерево: {include} · "
+                f"Книга: {book_name} · пропуск готовых: {skip} · дерево: {include} · "
                 f"подготовленный текст: {prepared} · {reflow_text}"
             ),
             reserve=reserve,
@@ -22382,8 +23306,9 @@ class TTSApp:
                     "публикуются после проверки всей книги, но измерение и "
                     "AAC-подготовка идут в фоне. Без этих проверок фиксированные "
                     "непересекающиеся части сразу собираются в готовые файлы. "
-                    "При пропуске готовых файлов неизменённые успешные M4B "
-                    "повторно не подготавливаются даже с включённым переразбиением. "
+                    "При пропуске готовых файлов полностью неизменённая книга "
+                    "не измеряется и не подготавливается повторно; если отсутствует "
+                    "соседний том, может понадобиться чтение кэша всей книги. "
                     "Нестандартный шаблон альбома "
                     "имеет приоритет над тегом из настроек; стандартный "
                     "{book} используется как запасной вариант."
@@ -22642,19 +23567,30 @@ class TTSApp:
             variable=self.direct_prepared_text_var,
         )
         self.chk_direct_prepared_text.pack(side=tk.RIGHT, padx=5)
-        self._register_palette_widget(
+        self.lbl_direct_options_hint = self._register_palette_widget(
             ttk.Label(
                 direct_options_frame,
-                text=(
-                    "Без флажка книжные теги и обложка к direct_output "
-                    "не применяются."
-                ),
+                text="",
                 foreground=self.get_status_color("muted"),
                 anchor=tk.W,
                 justify=tk.LEFT,
+                wraplength=700,
             ),
             "muted",
-        ).pack(fill=tk.X, padx=5, pady=(1, 0))
+        )
+        self.lbl_direct_options_hint.pack(fill=tk.X, padx=5, pady=(1, 0))
+        self.lbl_direct_options_hint.bind(
+            "<Configure>",
+            lambda event: self.lbl_direct_options_hint.configure(
+                wraplength=max(180, event.width - 4)
+            ),
+            add="+",
+        )
+        for key in ("direct_save", "direct_apply_tags"):
+            self.settings_vars[key].trace_add(
+                "write", self._refresh_direct_options_hint
+            )
+        self._refresh_direct_options_hint()
 
         fx_frame = ttk.LabelFrame(frame, text="Локальные эффекты (только для этой вкладки)", padding=5)
         fx_frame.grid(row=5, column=0, sticky="ew", pady=5)
@@ -22711,8 +23647,18 @@ class TTSApp:
 
         ttk.Button(bot_fx, text="💾 Сделать глобальными", command=apply_to_global).pack(side=tk.RIGHT, padx=5)
         ttk.Button(bot_fx, text="🔄 Сбросить эффекты", command=self.reset_direct_fx).pack(side=tk.RIGHT, padx=5)
-        self.lbl_direct_status = ttk.Label(frame, text="", foreground=self.get_status_color("info"))
-        self.lbl_direct_status.grid(row=6, column=0, sticky="w")
+        self.lbl_direct_status = ttk.Label(
+            frame, text="", foreground=self.get_status_color("info"),
+            justify=tk.LEFT, wraplength=700,
+        )
+        self.lbl_direct_status.grid(row=6, column=0, sticky="ew")
+        frame.bind(
+            "<Configure>",
+            lambda event: self.lbl_direct_status.configure(
+                wraplength=max(180, event.width - 20)
+            ),
+            add="+",
+        )
         self._status_label_kinds[self.lbl_direct_status] = "info"
 
         btn_frame = ttk.Frame(frame)
@@ -22732,20 +23678,47 @@ class TTSApp:
         self.btn_direct_stop_audio = ttk.Button(btn_frame, text="🔇", width=3, command=self.stop_audio_playback)
         self.btn_direct_stop_audio.pack(side=tk.LEFT, padx=2)
 
-    def stop_audio_playback(self):
-        """Принудительно останавливает текущее воспроизведение аудио"""
-        if platform.system() == "Windows":
-            try:
-                winsound.PlaySound(None, winsound.SND_PURGE)
-            except RuntimeError as exc:
-                logging.debug("Не удалось остановить winsound: %s", exc)
+    def _refresh_direct_options_hint(self, *_args):
+        label = getattr(self, "lbl_direct_options_hint", None)
+        if label is None:
+            return
+        try:
+            save_file = _config_bool(self.settings_vars["direct_save"].get())
+            apply_tags = _config_bool(self.settings_vars["direct_apply_tags"].get())
+        except (KeyError, AttributeError, tk.TclError, TypeError, ValueError):
+            return
+        if not save_file:
+            text = (
+                "Создаётся временный результат для прослушивания. "
+                "Книжные теги и обложка применяются только при сохранении файла."
+            )
+        elif apply_tags:
+            text = (
+                "К сохранённому файлу применяются книжные теги из настроек "
+                "и обложка, если выбранный формат её поддерживает."
+            )
         else:
-            if hasattr(self, 'current_playback_process') and self.current_playback_process:
+            text = "Сохранённый файл не получает книжные теги и обложку."
+        label.configure(text=text)
+
+    def stop_audio_playback(self):
+        """Отменяет текущую подготовку и останавливает запущенный проигрыватель."""
+        with self._playback_lock:
+            self._playback_generation += 1
+            generation = self._playback_generation
+            process = self.current_playback_process
+            self.current_playback_process = None
+            if process is not None:
                 try:
-                    self.current_playback_process.terminate()
+                    process.terminate()
                 except OSError as exc:
                     logging.debug("Не удалось остановить аудиопроцесс: %s", exc)
-                self.current_playback_process = None
+            if platform.system() == "Windows":
+                try:
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                except RuntimeError as exc:
+                    logging.debug("Не удалось остановить winsound: %s", exc)
+        return generation
 
     def _discard_last_direct_preview(self):
         """Удаляет заменяемый временный результат прямого предпросмотра."""
@@ -22771,15 +23744,23 @@ class TTSApp:
         except (AttributeError, tk.TclError):
             pass
 
-    def play_audio_segment(self, audio_segment):
-        """Проигрывает аудиосегмент с защитой от наложения (останавливает предыдущий)"""
-        self.stop_audio_playback()
+    def play_audio_segment(self, audio_segment, *, generation=None):
+        """Проигрывает только актуальный запрос, включая время подготовки WAV."""
+        if getattr(self, "_is_closing", False):
+            return
+        if generation is None:
+            generation = self.stop_audio_playback()
+        else:
+            with self._playback_lock:
+                if generation != self._playback_generation:
+                    return
 
         def _play():
             # У каждого запуска собственный WAV. Иначе старый рабочий поток мог
             # одновременно читать файл, который новый поток уже перезаписывает.
             SESSION_TEMP_DIR.mkdir(parents=True, exist_ok=True)
             temp_path = SESSION_TEMP_DIR / f"playback_{uuid.uuid4().hex}.wav"
+            process = None
 
             try:
                 exported = audio_segment.export(str(temp_path), format="wav")
@@ -22788,20 +23769,26 @@ class TTSApp:
                 if hasattr(exported, "close"):
                     exported.close()
 
-                if platform.system() == "Windows":
-                    # ``SND_ASYNC`` позволяет интерфейсу не зависать, пока играет звук.
-                    # winsound продолжает читать файл после возврата, поэтому временный
-                    # каталог сеанса оставляем операционной системе.
-                    winsound.PlaySound(str(temp_path), winsound.SND_FILENAME | winsound.SND_ASYNC)
-                elif platform.system() == "Darwin":
-                    self.current_playback_process = subprocess.Popen(["afplay", str(temp_path)])
-                    self.current_playback_process.wait()
-                else:
-                    self.current_playback_process = subprocess.Popen(["aplay", str(temp_path)])
-                    self.current_playback_process.wait()
+                with self._playback_lock:
+                    if generation != self._playback_generation:
+                        return
+                    if platform.system() == "Windows":
+                        # SND_ASYNC возвращает управление до завершения чтения WAV.
+                        winsound.PlaySound(
+                            str(temp_path), winsound.SND_FILENAME | winsound.SND_ASYNC
+                        )
+                    else:
+                        player = "afplay" if platform.system() == "Darwin" else "aplay"
+                        process = subprocess.Popen([player, str(temp_path)])
+                        self.current_playback_process = process
+                if process is not None:
+                    process.wait()
             except Exception as e:
                 logging.error(f"Ошибка воспроизведения: {e}")
             finally:
+                with self._playback_lock:
+                    if self.current_playback_process is process and process is not None:
+                        self.current_playback_process = None
                 # На Unix subprocess уже завершился и файл никому не нужен.
                 if platform.system() != "Windows":
                     temp_path.unlink(missing_ok=True)
@@ -22817,9 +23804,10 @@ class TTSApp:
 
     def play_audio_file(self, filepath):
         if not os.path.exists(filepath): return
+        generation = self.stop_audio_playback()
         try:
             seg = _load_audio_segment(filepath)
-            self.play_audio_segment(seg)
+            self.play_audio_segment(seg, generation=generation)
         except Exception as e:
             logging.error(f"Ошибка чтения файла для плеера: {e}")
 
@@ -22838,6 +23826,7 @@ class TTSApp:
             self.dir_echo_delay_var.get(),
             self.dir_echo_decay_var.get(),
         )
+        generation = self.stop_audio_playback()
 
         def _prepare_and_play():
             try:
@@ -22851,7 +23840,7 @@ class TTSApp:
                         echo_delay=effect_settings[3],
                         echo_decay=effect_settings[4],
                     )
-                self.play_audio_segment(segment)
+                self.play_audio_segment(segment, generation=generation)
             except Exception:
                 logging.exception("Ошибка подготовки последнего аудио к воспроизведению")
 
@@ -23104,6 +24093,7 @@ class TTSApp:
                 initially_open=False,
             )
         )
+        self.lbl_import_template_hint = _import_template_hint_body
         import_template_hint.grid(
             row=2,
             column=1,
@@ -23137,7 +24127,7 @@ class TTSApp:
         )
         ttk.Checkbutton(
             split_frame,
-            text="Не делить на главы (сохранить как один файл)",
+            text="Не делить на главы (один TXT на каждую книгу)",
             variable=self.settings_vars["import_single_file"],
         ).grid(
             row=4,
@@ -23155,6 +24145,9 @@ class TTSApp:
 
         self.btn_import_start = ttk.Button(frame, text="⚡ Извлечь и нарезать", command=self.start_import)
         self.btn_import_start.pack(pady=(3, 2))
+        self.settings_vars["import_single_file"].trace_add(
+            "write", lambda *_args: self._update_import_queue_actions()
+        )
         self._update_import_queue_actions()
 
     def _refresh_import_files_listbox(self, selected_indices=()):
@@ -23378,15 +24371,47 @@ class TTSApp:
         for widget, enabled in widget_states:
             if widget is not None:
                 widget.config(state=tk.NORMAL if enabled else tk.DISABLED)
+        single_var = getattr(self, "settings_vars", {}).get("import_single_file")
+        try:
+            single_file = _config_bool(single_var.get()) if single_var is not None else False
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            single_file = False
+        start_button = getattr(self, "btn_import_start", None)
+        if start_button is not None:
+            start_button.configure(
+                text="⚡ Извлечь в TXT" if single_file else "⚡ Извлечь и нарезать"
+            )
+        regex_entry = getattr(self, "import_regex_entry", None)
+        if regex_entry is not None:
+            regex_entry.configure(
+                state=tk.DISABLED if single_file or running else tk.NORMAL
+            )
+        template_hint = getattr(self, "lbl_import_template_hint", None)
+        if template_hint is not None:
+            chapter_fields = (
+                "{title} — «Книга»; {num} — стартовый номер для каждого TXT."
+                if single_file
+                else "{title} — заголовок главы; {num} — номер главы внутри книги."
+            )
+            template_hint.configure(
+                text=(
+                    "{name}/{book} — имя исходной книги без расширения; "
+                    "{author} — автор из EPUB/FB2 (или «Автор»).\n"
+                    + chapter_fields
+                    + " {book_index} — позиция книги в очереди.\n"
+                    ":N задаёт начальный номер: {num:15}, {book_index:8}. "
+                    "Для серии одним TXT: Серия {book_index}."
+                )
+            )
 
     def start_import(self):
         if getattr(self, "_import_running", False):
             return
         if getattr(self, "_source_plan_running", False):
             self._show_warning(
-                "План M4B выполняется",
-                "Дождитесь завершения расчёта частей M4B перед импортом "
-                "глав в папку исходников.",
+                "План групп выполняется",
+                "Дождитесь завершения расчёта плана групп перед импортом "
+                "TXT в папку исходников.",
             )
             return
         template = self.settings_vars["import_template"].get().strip()
@@ -23415,7 +24440,7 @@ class TTSApp:
         regex_pattern = self.settings_vars["import_regex"].get()
         single_file = self.settings_vars["import_single_file"].get()
         if not out_dir:
-            self._show_error("Ошибка", "Укажите папку для сохранения глав.")
+            self._show_error("Ошибка", "Укажите папку для сохранения TXT.")
             return
         self._import_running = True
         self._update_import_queue_actions()
@@ -23430,7 +24455,7 @@ class TTSApp:
             if stage == "extract":
                 message, status = f"{prefix} — извлечение текста…", "text"
             elif stage == "save":
-                message, status = f"{prefix} — сохранение глав: {value}", "warning"
+                message, status = f"{prefix} — сохранение TXT: {value}", "warning"
             elif stage == "complete":
                 message, status = f"{prefix} — сохранено файлов: {value}", "success"
             else:
@@ -24240,7 +25265,7 @@ class TTSApp:
         tmpl_frame.pack(fill=tk.X, pady=(2, 5))
         ttk.Label(tmpl_frame, text="Шаблон группы:").pack(side=tk.LEFT)
         self.settings_vars["default_group_name"] = tk.StringVar(
-            value=self.config.get("default_group_name", "Том {num}")
+            value=self.config.get("default_group_name", "Группа {num}")
         )
         self.settings_vars["default_group_name"].trace_add(
             "write", self._schedule_settings_save
@@ -24281,7 +25306,7 @@ class TTSApp:
                     "Вариант {num:00d} включает адаптивные ведущие нули: "
                     "после группы 10 вся серия станет 01, 02, …, 10, "
                     "а после 100 — 001, 002, …, 100. "
-                    "Например: «Том {num:10}». Другие поля в этом поле "
+                    "Например: «Группа {num:10}». Другие поля в этом поле "
                     "не подставляются."
                 ),
                 title="Поля шаблона группы",
@@ -24328,6 +25353,9 @@ class TTSApp:
 
         self.grp_subfolder_var = tk.BooleanVar(value=True)
         self.grp_subfolder_var.trace_add("write", self.save_export_item_settings)
+        self.grp_subfolder_var.trace_add(
+            "write", lambda *_args: self._sync_group_subfolder_state()
+        )
         self.chk_subfolder = ttk.Checkbutton(
             flags_row,
             text="Сохранять в подпапку",
@@ -24535,6 +25563,17 @@ class TTSApp:
         label = getattr(self, "lbl_export_audio_profile_summary", None)
         if label is None:
             return
+        tags_only_var = getattr(self, "export_tags_only_var", None)
+        try:
+            tags_only = _config_bool(tags_only_var.get()) if tags_only_var is not None else False
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            tags_only = False
+        if tags_only:
+            self._set_export_profile_summary(
+                "Обновление тегов и обложек в исходных файлах; "
+                "конвертация, склейка и эффекты не применяются."
+            )
+            return
         targets = [
             target for target in getattr(self, "export_targets", ())
             if isinstance(target, dict) and target.get("enabled", True)
@@ -24564,6 +25603,23 @@ class TTSApp:
                 )
             return
         summaries = []
+        common_dir_var = getattr(self, "export_outdir_var", None)
+        try:
+            common_dir = str(
+                common_dir_var.get()
+                if common_dir_var is not None
+                else self.config.get("export_dir", "")
+            ).strip()
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            common_dir = str(self.config.get("export_dir", "") or "").strip()
+        try:
+            planned_targets = plan_output_targets(
+                normalize_output_target_directories(targets),
+                common_dir or BASE_DIR,
+                legacy_single_dir=common_dir or BASE_DIR,
+            )
+        except (TypeError, ValueError, OSError):
+            planned_targets = ()
         profile_names = {}
         try:
             profile_names = {
@@ -24572,7 +25628,7 @@ class TTSApp:
             }
         except (TypeError, ValueError, KeyError):
             profile_names = {}
-        for item in targets:
+        for target_index, item in enumerate(targets):
             fmt = str(item.get("format", "")).upper()
             bitrate = str(item.get("bitrate", "auto"))
             if fmt == "WAV":
@@ -24603,12 +25659,21 @@ class TTSApp:
                     explicit_dir, max_chars=46
                 )
             else:
-                common_dir = str(self.config.get("export_dir", "") or "").strip()
-                destination = "общая: " + (
-                    middle_ellipsize(common_dir, max_chars=46)
-                    if common_dir
-                    else "не задана"
-                )
+                if len(targets) > 1:
+                    subdirectory = (
+                        Path(planned_targets[target_index]["output_dir"]).name
+                        if target_index < len(planned_targets)
+                        else output_target_directory_name(item)
+                    )
+                    destination = f"подпапка {subdirectory} в общей папке"
+                    if not common_dir:
+                        destination += " (не задана)"
+                else:
+                    destination = "общая: " + (
+                        middle_ellipsize(common_dir, max_chars=46)
+                        if common_dir
+                        else "не задана"
+                    )
             assembly_mode = (
                 "merge"
                 if fmt == "M4B"
@@ -24622,23 +25687,10 @@ class TTSApp:
             summaries.append(
                 f"{fmt} {detail} · {assembly_label}"
                 + (f" · {profile_label}" if profile_label else "")
-                + f" → {destination}"
+                + (f" → {destination}" if len(targets) > 1 else "")
             )
         names = ", ".join(summaries)
-        self._set_export_profile_summary(
-            f"Выход: {names}. "
-            + (
-                "Цели одного TXT выполняются последовательно из одного "
-                "снимка; готовые цели разных TXT могут кодироваться "
-                "параллельно под общим лимитом FFmpeg; каталоги и "
-                "профили задаются в «Набор выходов…»."
-                if len(targets) > 1
-                else (
-                    "Одна активная цель всегда использует общую папку "
-                    "экспорта; все группы попадут туда."
-                )
-            )
-        )
+        self._set_export_profile_summary(f"Выход: {names}")
 
     def _set_export_profile_summary(self, text):
         """Сохраняет полную сводку и показывает её однострочную версию.
@@ -24743,7 +25795,7 @@ class TTSApp:
                 "подпапку формата, а заполненная строка задаёт осознанный "
                 "отдельный путь. Кнопка «↺ Общая папка для всех» сбрасывает "
                 "такие пути. В столбце «Сборка» каждый формат может наследовать "
-                "флажок группы, объединяться в один файл или сохранять главы "
+                "флажок группы, объединяться в один файл или сохранять исходные файлы "
                 "отдельно; M4B всегда объединяет главы книги."
             )
         dialog.transient(self.root)
@@ -24902,12 +25954,18 @@ class TTSApp:
                 # принудительной горизонтальной прокруткой.
                 narrow_viewport = viewport_width < 857
                 compact_layout = 1 < viewport_width < 900 or narrow_viewport
+                has_m4b_target = any(
+                    item["format"].get() == "m4b" for item in controls
+                )
                 visible_headers = (
                     ("", "Формат", "Профиль", "Сборка", "Том N/T", "Действия")
                     if compact_layout else headers
                 )
                 for column, header in enumerate(header_widgets):
-                    if column < len(visible_headers):
+                    volume_column = 4 if compact_layout else 6
+                    if column < len(visible_headers) and (
+                        column != volume_column or has_m4b_target
+                    ):
                         header.configure(text=visible_headers[column])
                         header.grid()
                     else:
@@ -25105,6 +26163,10 @@ class TTSApp:
                         options["sticky"] = tk.W
                     widget.grid(**options)
 
+            track_widget = row_control.get("track_widget")
+            if track_widget is not None and row_control["format"].get() != "m4b":
+                track_widget.grid_remove()
+
             detail = row_control.get("detail_widget")
             if detail is None:
                 return
@@ -25123,33 +26185,91 @@ class TTSApp:
                 else:
                     m4b_detail.grid_remove()
 
-        def _row_profile_changed(row_control, *, initial=False, format_changed=True):
+        def _update_target_filename_hint(row_control):
+            hint = row_control.get("filename_hint_widget")
+            if hint is None:
+                return
+            fmt = row_control["format"].get()
+            assembly = row_control["assembly"].get()
+            if source_context and fmt == "m4b":
+                text = (
+                    "Для синтеза из папки имя части задаётся в плане групп. "
+                    "Измените его там; это поле цели не используется."
+                )
+            elif fmt == "m4b":
+                text = (
+                    "Пусто — имя группы; при нескольких частях добавляется «Часть N». "
+                    "Поля: {book}, {part}, {range}, {first_name}, {last_name}, {filename}."
+                )
+            elif source_context:
+                if assembly == OUTPUT_TARGET_ASSEMBLY_LABELS["merge"]:
+                    fallback = "имя виртуальной группы, а без плана — имя книги"
+                else:
+                    fallback = "имя TXT"
+                text = (
+                    f"Пусто — {fallback}. Поля: "
+                    "{name}, {filename}, {index}, {book}, {group}, {range}."
+                )
+            else:
+                if assembly == OUTPUT_TARGET_ASSEMBLY_LABELS["merge"]:
+                    fallback = "имя группы"
+                elif assembly == OUTPUT_TARGET_ASSEMBLY_LABELS["files"]:
+                    fallback = "имя Title исходного файла"
+                else:
+                    fallback = "имя группы при склейке, иначе Title исходного файла"
+                text = (
+                    f"Пусто — {fallback}. Поля: "
+                    "{name}, {filename}, {index}, {book}, {group}, {source_name}, {range}."
+                )
+            hint.configure(text=text)
+
+        def _assembly_changed(row_control):
+            row_control["last_non_m4b_assembly"] = row_control["assembly"].get()
+            _update_target_filename_hint(row_control)
+
+        def _row_profile_changed(row_control, *, initial=False):
             # Изменение формата может сделать ранее выбранный профиль
             # несовместимым. Оставляем отсутствующий старый идентификатор видимым, но
             # заменяем похожее имя на «Текущие параметры», если оно больше
             # не подходит.
+            fmt = row_control["format"].get()
+            previous_format = row_control.get("last_format", fmt)
+            if not initial and fmt != previous_format:
+                drafts = row_control["format_drafts"]
+                drafts[previous_format] = {
+                    "old": row_control["old"],
+                    "filename_template": row_control["filename_template"].get(),
+                    "profile": row_control["profile"].get(),
+                    "initial_profile": row_control["initial_profile"],
+                    "audio_selection_changed": row_control["audio_selection_changed"],
+                }
+                restored = drafts.get(fmt)
+                if restored is None:
+                    # Снимок звука и шаблон прежнего кодека не подходят новой цели.
+                    row_control["old"] = {}
+                    row_control["filename_template"].set("")
+                    row_control["audio_selection_changed"] = False
+                else:
+                    row_control["old"] = restored["old"]
+                    row_control["filename_template"].set(
+                        restored["filename_template"]
+                    )
+                    row_control["profile"].set(restored["profile"])
+                    row_control["initial_profile"] = restored["initial_profile"]
+                    row_control["audio_selection_changed"] = restored[
+                        "audio_selection_changed"
+                    ]
             selected = row_control["profile"].get()
             profile_id = profile_label_to_id.get(selected, "")
-            fmt = row_control["format"].get()
             old_format = str(
                 (row_control.get("old") or {}).get("format", "")
             ).strip().lower()
-            if fmt != old_format and format_changed:
-                if not initial:
-                    # Новый формат должен начинаться с текущих полей/профиля,
-                    # а не со снимков (битрейта, шаблона имени или эффектов),
-                    # относящихся к прежнему кодеку/контейнеру.
-                    row_control["old"] = {}
-                    try:
-                        row_control["filename_template"].set("")
-                    except (AttributeError, tk.TclError):
-                        pass
-                if fmt == "m4b" and not profile_id:
-                    preferred_id = preferred_profile_for_format(fmt)
-                    preferred_label = profile_label_by_id.get(preferred_id)
-                    if preferred_label:
-                        row_control["profile"].set(preferred_label)
-                        profile_id = preferred_id
+            if fmt == "m4b" and fmt != old_format and not initial and not profile_id:
+                preferred_id = preferred_profile_for_format(fmt)
+                preferred_label = profile_label_by_id.get(preferred_id)
+                if preferred_label:
+                    row_control["profile"].set(preferred_label)
+                    profile_id = preferred_id
             if profile_id:
                 entry = profile_by_id.get(profile_id)
                 if entry is None or not audio_profile_target_compatible(
@@ -25176,22 +26296,33 @@ class TTSApp:
             assembly_var = row_control.get("assembly")
             if assembly_widget is not None and assembly_var is not None:
                 try:
+                    previous_format = row_control.get("last_format", fmt)
                     if fmt == "m4b":
+                        if previous_format != "m4b":
+                            row_control["last_non_m4b_assembly"] = assembly_var.get()
                         assembly_var.set(OUTPUT_TARGET_ASSEMBLY_LABELS["merge"])
                         assembly_widget.state(["disabled"])
-                    elif source_context:
-                        if assembly_var.get() not in (
-                            OUTPUT_TARGET_ASSEMBLY_LABELS["files"],
-                            OUTPUT_TARGET_ASSEMBLY_LABELS["merge"],
-                        ):
-                            assembly_var.set(OUTPUT_TARGET_ASSEMBLY_LABELS["files"])
-                        assembly_widget.state(["!disabled", "readonly"])
                     else:
-                        if assembly_var.get() not in OUTPUT_TARGET_ASSEMBLY_BY_LABEL:
-                            assembly_var.set(
-                                OUTPUT_TARGET_ASSEMBLY_LABELS["inherit"]
+                        allowed_assemblies = (
+                            (
+                                OUTPUT_TARGET_ASSEMBLY_LABELS["files"],
+                                OUTPUT_TARGET_ASSEMBLY_LABELS["merge"],
                             )
+                            if source_context
+                            else tuple(OUTPUT_TARGET_ASSEMBLY_BY_LABEL)
+                        )
+                        default_assembly = OUTPUT_TARGET_ASSEMBLY_LABELS[
+                            "files" if source_context else "inherit"
+                        ]
+                        if previous_format == "m4b":
+                            assembly_var.set(
+                                row_control.get("last_non_m4b_assembly", default_assembly)
+                            )
+                        if assembly_var.get() not in allowed_assemblies:
+                            assembly_var.set(default_assembly)
+                        row_control["last_non_m4b_assembly"] = assembly_var.get()
                         assembly_widget.state(["!disabled", "readonly"])
+                    row_control["last_format"] = fmt
                 except tk.TclError:
                     pass
             track_widget = row_control.get("track_widget")
@@ -25199,8 +26330,10 @@ class TTSApp:
                 try:
                     if fmt == "m4b":
                         track_widget.state(["!disabled"])
+                        track_widget.grid()
                     else:
                         track_widget.state(["disabled"])
+                        track_widget.grid_remove()
                 except tk.TclError:
                     pass
             detail = row_control.get("detail_widget")
@@ -25215,33 +26348,7 @@ class TTSApp:
                                 else "Шаблон имени файла:"
                             )
                         )
-                    hint = row_control.get("filename_hint_widget")
-                    if hint is not None:
-                        hint.configure(
-                            text=(
-                                (
-                                    "Для синтеза из папки имя части задаётся в плане M4B. "
-                                    "Измените его там; это поле цели не используется."
-                                    if source_context and fmt == "m4b"
-                                    else (
-                                        "Пусто — имя группы; при нескольких частях добавляется «Часть N». "
-                                        "Поля: {book}, {part}, {range}, {first_name}, {last_name}, {filename}."
-                                        if fmt == "m4b"
-                                        else (
-                                            "Пусто — имя виртуальной группы, а без плана — имя книги. "
-                                            "Поля: {name}, {filename}, {index}, {book}, {group}, {range}."
-                                            if source_context and assembly_var.get()
-                                            == OUTPUT_TARGET_ASSEMBLY_LABELS["merge"]
-                                            else (
-                                                "Пусто — имя TXT. Поля: {name}, {filename}, {index}, {book}, {group}, {range}."
-                                                if source_context
-                                                else "Пусто — имя Title. Поля: {name}, {filename}, {index}, {book}, {group}, {source_name}, {range}."
-                                            )
-                                        )
-                                    )
-                                )
-                            )
-                        )
+                    _update_target_filename_hint(row_control)
                     filename_entry = row_control.get("filename_template_widget")
                     filename_helper = row_control.get("filename_helper_widget")
                     for widget in (filename_entry, filename_helper):
@@ -25283,10 +26390,6 @@ class TTSApp:
                     continue
             allow_overrides = active_count >= 2
             for item in controls:
-                try:
-                    active = bool(item["enabled"].get())
-                except (KeyError, AttributeError, tk.TclError):
-                    active = False
                 entry_widget = item.get("directory_widget")
                 choose_widget = item.get("directory_choose_widget")
                 # Не очищаем подготовленный каталог только потому, что
@@ -25420,6 +26523,13 @@ class TTSApp:
                 "format": format_var,
                 "directory": directory,
                 "assembly": assembly_var,
+                "last_format": fmt,
+                "format_drafts": {},
+                "last_non_m4b_assembly": OUTPUT_TARGET_ASSEMBLY_LABELS[
+                    assembly_mode if fmt != "m4b" else (
+                        "files" if source_context else "inherit"
+                    )
+                ],
                 "profile": profile_var,
                 "initial_profile": profile_default,
                 "audio_selection_changed": False,
@@ -25518,7 +26628,7 @@ class TTSApp:
                 ttk.Label(
                     detail_shell,
                     text=(
-                        "Пусто — имя Title. Поля: {name}, {filename}, {index}, "
+                        "Пусто — имя группы при сборке в один файл, иначе Title. Поля: {name}, {filename}, {index}, "
                         "{book}, {group}, {source_name}, {range}."
                     ),
                     foreground=self.get_status_color("muted"),
@@ -25540,7 +26650,7 @@ class TTSApp:
                 filename_helper_button.state(["disabled"])
                 filename_hint.configure(
                     text=(
-                        "Для синтеза из папки имя части задаётся в плане M4B. "
+                        "Для синтеза из папки имя части задаётся в плане групп. "
                         "Измените его там; это поле цели не используется."
                     )
                 )
@@ -25630,9 +26740,7 @@ class TTSApp:
             )
             assembly_combo.bind(
                 "<<ComboboxSelected>>",
-                lambda _event, item=row_control: _row_profile_changed(
-                    item, format_changed=False
-                ),
+                lambda _event, item=row_control: _assembly_changed(item),
                 add="+",
             )
             # Обновляем подпись и подсказку сразу. Trace срабатывает только
@@ -25699,8 +26807,7 @@ class TTSApp:
                 return
             if not self._ask_yes_no(
                 "Использовать общую папку",
-                "Очистить индивидуальные папки у целей и передать их "
-                "планировщику?\n\n"
+                "Сбросить индивидуальные папки целей?\n\n"
                 "При одной цели будет использована общая папка; при "
                 "нескольких целях программа создаст отдельные подпапки "
                 "форматов. Файлы на диске не изменяются.",
@@ -26541,6 +27648,16 @@ class TTSApp:
 
     def _compact_export_settings_text(self):
         """Возвращает короткое описание параметров, видимое в основной вкладке."""
+        tags_only_var = getattr(self, "export_tags_only_var", None)
+        try:
+            tags_only = _config_bool(tags_only_var.get()) if tags_only_var is not None else False
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            tags_only = False
+        if tags_only:
+            return (
+                "Обновление тегов и обложек в исходных файлах; "
+                "конвертация, склейка и эффекты не применяются."
+            )
         def value(attr, fallback=""):
             variable = getattr(self, attr, None)
             if variable is None:
@@ -26803,7 +27920,7 @@ class TTSApp:
         # сборка», где он виден непосредственно перед запуском. Намеренно не
         # дублируем его в этом расширенном редакторе.
         output_section = make_section("Формат и параметры вывода")
-        format_combo = add_combo(
+        add_combo(
             output_section,
             0,
             "Формат:",
@@ -27005,6 +28122,11 @@ class TTSApp:
             pady=(5, 0),
         )
 
+        staged_format_state = {
+            "last_format": None,
+            "non_m4b_apply_fx": bool(staged["apply_fx"].get()),
+        }
+
         def refresh_staged_state(*_args):
             is_wav = staged["format"].get().lower() == "wav"
             is_m4b = staged["format"].get().lower() == "m4b"
@@ -27029,14 +28151,17 @@ class TTSApp:
                 )
             except (AttributeError, tk.TclError, TypeError):
                 pass
-            if is_m4b:
-                # Сохраняем подготовленные значения ``speed``/``pitch``/``echo`` на случай, если
-                # пользователь вернётся к другому формату, но никогда не фиксируем
-                # флаг эффектов для цели M4B.
-                try:
-                    staged["apply_fx"].set(False)
-                except (AttributeError, tk.TclError, TypeError, ValueError):
-                    pass
+            previous_format = staged_format_state["last_format"]
+            if is_m4b and previous_format != "m4b":
+                staged_format_state["non_m4b_apply_fx"] = bool(
+                    staged["apply_fx"].get()
+                )
+                staged["apply_fx"].set(False)
+            elif not is_m4b and previous_format == "m4b":
+                staged["apply_fx"].set(
+                    staged_format_state["non_m4b_apply_fx"]
+                )
+            staged_format_state["last_format"] = staged["format"].get().lower()
             # Явные ссылки нужны: поля M4B вложены в прокручиваемый раздел.
             for widget in m4b_control_widgets:
                 try:
@@ -27085,18 +28210,26 @@ class TTSApp:
                     raise ValueError("скорость и тон вне допустимого диапазона")
                 if delay < 50 or delay > 1000 or decay < 0.1 or decay > 0.8:
                     raise ValueError("параметры эхо вне допустимого диапазона")
-                hours = float(str(staged["m4b_hours"].get()).strip() or 0)
-                chapters = int(float(str(staged["m4b_chapters"].get()).strip() or 0))
-                m4b_bitrate = str(staged["m4b_bitrate"].get()).strip().lower()
-                if not math.isfinite(hours) or hours < 0 or chapters < 0:
-                    raise ValueError("лимиты M4B должны быть неотрицательными")
-                if not re.fullmatch(r"[1-9]\d*k", m4b_bitrate):
-                    raise ValueError("некорректный AAC-битрейт M4B")
-                m4b_kbps = int(m4b_bitrate[:-1])
-                if not 16 <= m4b_kbps <= 512:
-                    raise ValueError("AAC-битрейт M4B должен быть от 16 до 512 кбит/с")
-                template = str(staged["m4b_template"].get() or "").strip()
-                validate_filename_template(template, TEMPLATE_FIELDS_OUTPUT)
+                m4b_attrs = {}
+                if fmt == "m4b":
+                    hours = float(str(staged["m4b_hours"].get()).strip() or 0)
+                    chapters = int(float(str(staged["m4b_chapters"].get()).strip() or 0))
+                    m4b_bitrate = str(staged["m4b_bitrate"].get()).strip().lower()
+                    if not math.isfinite(hours) or hours < 0 or chapters < 0:
+                        raise ValueError("лимиты M4B должны быть неотрицательными")
+                    if not re.fullmatch(r"[1-9]\d*k", m4b_bitrate):
+                        raise ValueError("некорректный AAC-битрейт M4B")
+                    m4b_kbps = int(m4b_bitrate[:-1])
+                    if not 16 <= m4b_kbps <= 512:
+                        raise ValueError("AAC-битрейт M4B должен быть от 16 до 512 кбит/с")
+                    template = str(staged["m4b_template"].get() or "").strip()
+                    validate_filename_template(template, TEMPLATE_FIELDS_OUTPUT)
+                    m4b_attrs = {
+                        "export_m4b_template_var": template,
+                        "export_m4b_hours_var": hours,
+                        "export_m4b_chapters_var": chapters,
+                        "export_m4b_bitrate_var": m4b_bitrate,
+                    }
             except (TypeError, ValueError, OverflowError, TemplateError) as exc:
                 status.configure(text=str(exc))
                 return
@@ -27116,11 +28249,8 @@ class TTSApp:
                 "exp_echo_var": bool(staged["echo"].get()),
                 "exp_delay_var": delay,
                 "exp_decay_var": decay,
-                "export_m4b_template_var": template,
-                "export_m4b_hours_var": hours,
-                "export_m4b_chapters_var": chapters,
-                "export_m4b_bitrate_var": m4b_bitrate,
             }
+            attrs.update(m4b_attrs)
             old_values = {}
             old_config = copy.deepcopy(self.config)
             try:
@@ -27204,6 +28334,11 @@ class TTSApp:
         self.chk_export_tags_only.configure(state=tk.NORMAL)
         if hasattr(self, "chk_export_parallel"):
             self.chk_export_parallel.configure(state=normal_state)
+        self.btn_export_start.configure(
+            text="🏷 Обновить теги" if tags_only else "🚀 Начать сборку"
+        )
+        self._refresh_output_targets_summary()
+        self._sync_group_subfolder_state()
 
     def _refresh_export_tree_action_states(self):
         """Согласует действия над деревом с содержимым и выделением.
@@ -27310,17 +28445,42 @@ class TTSApp:
         enabled = (
             editable_group
             and not bool(self.grp_merge_var.get())
+            and not _config_bool(
+                getattr(self, "export_tags_only_var", None).get()
+                if getattr(self, "export_tags_only_var", None) is not None
+                else False
+            )
             and not getattr(self, "_export_running", False)
             and not getattr(self, "_export_lock", False)
         )
         self.chk_subfolder.configure(state=tk.NORMAL if enabled else tk.DISABLED)
         if hasattr(self, "lbl_subfolder_hint"):
+            targets = [
+                target for target in getattr(self, "export_targets", ())
+                if isinstance(target, dict)
+                and _config_bool(target.get("enabled", True), default=True)
+            ]
             if not editable_group:
                 hint = "Настройка доступна только для группы."
+            elif _config_bool(self.export_tags_only_var.get()):
+                hint = "Теги обновляются в исходных файлах; папки вывода не используются."
+            elif targets:
+                hint = (
+                    "Режим сборки цели может переопределять флажок группы. "
+                    "Подпапка используется только при выводе отдельных файлов."
+                )
+                if any(target.get("scope") == "group_subfolder" for target in targets):
+                    hint += " У части целей подпапка задана в наборе выходов."
+                else:
+                    hint += " Флажок подпапки " + (
+                        "включён." if _config_bool(self.grp_subfolder_var.get()) else "выключен."
+                    )
             elif bool(self.grp_merge_var.get()):
-                hint = "Недоступно: файлы группы склеиваются в один трек."
+                hint = "Файлы группы склеиваются в один трек; подпапка не используется."
+            elif _config_bool(self.grp_subfolder_var.get()):
+                hint = "Отдельные файлы будут сохранены в подпапку с именем группы."
             else:
-                hint = "Отдельные файлы будут сохранены в папку с именем группы."
+                hint = "Отдельные файлы будут сохранены прямо в общую папку."
             self.lbl_subfolder_hint.configure(text=hint)
 
     def _disable_export_settings(self):
@@ -27961,6 +29121,19 @@ class TTSApp:
         except (AttributeError, tk.TclError, TypeError):
             self._export_progress_indeterminate = active
 
+    def _set_export_progress_value(self, *, value, maximum=None):
+        """Применяет отложенное обновление к текущему индикатору экспорта."""
+        progressbar = getattr(self, "export_progress", None)
+        if progressbar is None:
+            return
+        try:
+            if maximum is None:
+                progressbar.configure(value=value)
+            else:
+                progressbar.configure(maximum=maximum, value=value)
+        except tk.TclError:
+            pass
+
     def _choose_export_destination(
         self,
         *,
@@ -28493,7 +29666,7 @@ class TTSApp:
 
     def add_export_folder(self):
         if getattr(self, '_export_lock', False) or getattr(self, '_export_running', False):
-             self._show_warning("Занято", "Дождитесь окончания предыдущего импорта файлов.")
+             self._show_warning("Занято", "Дождитесь завершения текущей обработки аудио.")
              return
 
         # Берём последний зафиксированный путь
@@ -28738,18 +29911,28 @@ class TTSApp:
         dialog.transient(self.root)
         dialog.grab_set()
 
-        ttk.Label(dialog, text="Максимальная длительность группы (минут):").pack(pady=(10, 0))
+        limit_label = ttk.Label(
+            dialog,
+            text="Максимальная длительность группы (минут):",
+            wraplength=420,
+            justify=tk.CENTER,
+            anchor=tk.CENTER,
+        )
+        limit_label.pack(fill=tk.X, padx=20, pady=(10, 0))
         limit_var = tk.IntVar(value=60)
         ttk.Entry(dialog, textvariable=limit_var, justify=tk.CENTER).pack(pady=5)
 
-        ttk.Label(
+        template_hint = ttk.Label(
             dialog,
             text=(
                 "Шаблон: {num}; {num:N}, где N — стартовый номер; "
                 "{num:00d} — адаптивные нули"
             ),
+            wraplength=420,
             justify=tk.CENTER,
-        ).pack(pady=(10, 0))
+            anchor=tk.CENTER,
+        )
+        template_hint.pack(fill=tk.X, padx=20, pady=(10, 0))
         template_var = tk.StringVar(value=self.settings_vars["default_group_name"].get())
         template_row = ttk.Frame(dialog)
         template_row.pack(fill=tk.X, padx=20, pady=5)
@@ -28758,7 +29941,6 @@ class TTSApp:
             textvariable=template_var,
             justify=tk.CENTER,
         )
-        auto_split_template_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(
             template_row,
             text="Помощник…",
@@ -28770,7 +29952,8 @@ class TTSApp:
                 title="Помощник имени группы",
                 existing_names=self._template_helper_existing_group_names(),
             ),
-        ).pack(side=tk.LEFT, padx=(6, 0))
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+        auto_split_template_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         def do_split():
             try:
@@ -28903,7 +30086,23 @@ class TTSApp:
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         dialog.bind("<Escape>", lambda _event: dialog.destroy())
 
-        self._center_popup(dialog, 350, 220)
+        def adapt_hint_width(event):
+            if event.widget != dialog:
+                return
+            available_width = max(240, event.width - 40)
+            if int(template_hint.cget("wraplength")) == available_width:
+                return
+            template_hint.configure(wraplength=available_width)
+            limit_label.configure(wraplength=available_width)
+            dialog.update_idletasks()
+            # При сужении подсказки занимают больше строк; кнопки остаются видимыми.
+            dialog.minsize(340, max(230, dialog.winfo_reqheight() + 8))
+
+        dialog.bind("<Configure>", adapt_hint_width, add="+")
+        dialog.update_idletasks()
+        requested_height = max(230, dialog.winfo_reqheight() + 8)
+        dialog.minsize(340, requested_height)
+        self._center_popup(dialog, 460, requested_height)
 
     # --- Процесс Экспорта ---
     def stop_export_process(self):
@@ -28930,7 +30129,9 @@ class TTSApp:
             self._set_export_status("Ожидание...", "info")
         self.is_export_stopped = False
 
-    def _update_file_tags_inplace(self, fp, f_tags, cov, title_for_status):
+    def _update_file_tags_inplace(
+        self, fp, f_tags, cov, title_for_status, *, cancelled=None
+    ):
         """Обновляет теги файла прямо в его исходной папке на диске без конвертации"""
         source_path = Path(fp)
         # Тестовые и внешние вызовы могут использовать вспомогательную функцию без полностью
@@ -29031,6 +30232,17 @@ class TTSApp:
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
         try:
+            if cancelled is not None:
+                _run_ffmpeg_checked(
+                    cmd,
+                    out_path=temp_file,
+                    cancelled=cancelled,
+                    error_prefix=f"FFmpeg не смог обновить теги {source_path.name}",
+                )
+                if cancelled():
+                    raise InterruptedError("Сборка остановлена пользователем")
+                os.replace(temp_file, source_path)
+                return True
             res = subprocess.run(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=startupinfo
             )
@@ -29045,6 +30257,8 @@ class TTSApp:
             )
             logging.error(f"Ошибка FFmpeg при обновлении тегов {fp}:\n{err_log}")
             return False
+        except InterruptedError:
+            raise
         except Exception:
             logging.exception("Ошибка запуска FFmpeg при обновлении тегов %s", fp)
             return False
@@ -29408,7 +30622,7 @@ class TTSApp:
                         return
                     # Дочерний обработчик имеет собственный локальный счётчик.
                     # Внешний счётчик фиксирует каждую успешно опубликованную
-                    # единицу один раз и выдаёт callbacks строго в порядке 1..N.
+                    # единицу один раз и выдаёт обратные вызовы строго в порядке 1..N.
                     if current_value.is_integer():
                         completed_subject = parallel_active.get(
                             job_token,
@@ -30414,6 +31628,7 @@ class TTSApp:
     def start_export_process(self):
         if getattr(self, "_export_running", False) or getattr(self, "_export_lock", False):
             return
+        tags_only = self.export_tags_only_var.get()
         items = self.export_tree.get_children()
         if not items:
             self._show_warning("Пусто", "Список пуст. Добавьте аудиофайлы или группы.")
@@ -30429,11 +31644,17 @@ class TTSApp:
                 break
 
         if not has_any_files:
-            self._show_warning("Нет файлов", "Добавьте аудиофайлы перед началом сборки.")
+            self._show_warning(
+                "Нет файлов",
+                (
+                    "Добавьте аудиофайлы перед началом сборки."
+                    if not tags_only
+                    else "Добавьте аудиофайлы перед обновлением тегов."
+                ),
+            )
             return
 
         # В режиме «Только теги» каталог вывода не требуется.
-        tags_only = self.export_tags_only_var.get()
         if tags_only and any(
             data.get("clip_start") is not None
             or data.get("clip_end") is not None
@@ -30633,9 +31854,8 @@ class TTSApp:
             )
             self._show_error(
                 "Структура списка повреждена",
-                "Некоторые элементы дерева потеряли внутренние настройки. "
-                "Очистите список и добавьте исходные файлы повторно.\n\n"
-                f"Элементы: {preview}{suffix}",
+                "Не удалось восстановить параметры некоторых элементов списка. "
+                "Очистите список и добавьте исходные файлы повторно.",
             )
             return
 
@@ -30927,7 +32147,7 @@ class TTSApp:
                             )
                             if not is_fractional:
                                 self._post_to_ui(
-                                    self.export_progress.configure,
+                                    self._set_export_progress_value,
                                     maximum=max(1, total),
                                     value=int(current_value),
                                 )
@@ -31066,7 +32286,7 @@ class TTSApp:
         self.save_settings()
         self._set_export_running_state(True)
         self._set_export_progress_indeterminate(False)
-        self.export_progress['value'] = 0
+        self._set_export_progress_value(value=0, maximum=100)
         self.is_export_stopped = False
 
         def run_export():
@@ -31105,19 +32325,20 @@ class TTSApp:
                                 fp = f_set["path"]  # Используем сохранённый исходный путь.
 
                                 f_tags = build_tags(f_set)
-                                for k in ["artist", "album", "album_artist", "genre", "composer", "date"]:
+                                for k in ["artist", "album", "album_artist", "genre", "composer", "date", "language"]:
                                     if k not in f_tags and g_tags.get(k):
                                         f_tags[k] = g_tags[k]
                                 cov = f_set.get("cover") or g_set.get("cover")
 
                                 if not self._update_file_tags_inplace(
-                                    fp, f_tags, cov, f_set.get("title", "")
+                                    fp, f_tags, cov, f_set.get("title", ""),
+                                    cancelled=lambda: self.is_export_stopped,
                                 ):
                                     failed_files += 1
 
                                 processed_files += 1
                                 pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
-                                self._post_to_ui(self.export_progress.config, value=pct)
+                                self._post_to_ui(self._set_export_progress_value, value=pct)
 
                         # Одиночный файл
                         elif item_id in export_files:
@@ -31128,13 +32349,14 @@ class TTSApp:
                             cov = f_set.get("cover")
 
                             if not self._update_file_tags_inplace(
-                                fp, f_tags, cov, f_set.get("title", "")
+                                fp, f_tags, cov, f_set.get("title", ""),
+                                cancelled=lambda: self.is_export_stopped,
                             ):
                                 failed_files += 1
 
                             processed_files += 1
                             pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
-                            self._post_to_ui(self.export_progress.config, value=pct)
+                            self._post_to_ui(self._set_export_progress_value, value=pct)
 
                 # Полный экспорт в выбранный каталог
                 else:
@@ -31204,7 +32426,7 @@ class TTSApp:
                                     else 0
                                 )
                                 self._post_to_ui(
-                                    self.export_progress.config, value=pct
+                                    self._set_export_progress_value, value=pct
                                 )
 
                             else:
@@ -31225,7 +32447,7 @@ class TTSApp:
 
                                     f_tags = build_tags(f_set)
                                     g_tags = build_tags(g_set)
-                                    for k in ["artist", "album", "album_artist", "genre", "composer", "date"]:
+                                    for k in ["artist", "album", "album_artist", "genre", "composer", "date", "language"]:
                                         if k not in f_tags and g_tags.get(k):
                                             f_tags[k] = g_tags[k]
 
@@ -31268,7 +32490,7 @@ class TTSApp:
 
                                     processed_files += 1
                                     pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
-                                    self._post_to_ui(self.export_progress.config, value=pct)
+                                    self._post_to_ui(self._set_export_progress_value, value=pct)
 
                         elif item_id in export_files:
                             f_id = item_id
@@ -31308,18 +32530,33 @@ class TTSApp:
 
                             processed_files += 1
                             pct = int((processed_files / total_files) * 100) if total_files > 0 else 0
-                            self._post_to_ui(self.export_progress.config, value=pct)
+                            self._post_to_ui(self._set_export_progress_value, value=pct)
 
                 if self.is_export_stopped:
                     outcome = "stopped"
-                    self._post_export_status("Сборка прервана!", "warning")
-                    self._post_to_ui(self._show_warning, "Остановлено", "Процесс сборки был прерван пользователем.")
+                    self._post_export_status(
+                        "Обновление тегов прервано!" if tags_only else "Сборка прервана!",
+                        "warning",
+                    )
+                    self._post_to_ui(
+                        self._show_warning,
+                        "Остановлено",
+                        (
+                            "Обновление тегов в исходных файлах было прервано."
+                            if tags_only
+                            else "Процесс сборки был прерван пользователем."
+                        ),
+                    )
                 else:
                     if failed_files:
                         outcome = "warning"
                         msg = (
-                            f"Обработка завершена с ошибками: {failed_files}.\n"
-                            "Подробности записаны в журнал."
+                            (
+                                f"Обновление тегов завершено с ошибками: {failed_files}.\n"
+                                if tags_only
+                                else f"Обработка завершена с ошибками: {failed_files}.\n"
+                            )
+                            + "Подробности записаны в журнал."
                         )
                         self._post_export_status(
                             "Готово с ошибками.", "warning"
@@ -31336,16 +32573,27 @@ class TTSApp:
                 # вспомогательная функция уже завершила дочерний процесс и удалила временный файл.
                 outcome = "stopped"
                 self.is_export_stopped = True
-                self._post_export_status("Сборка прервана!", "warning")
+                self._post_export_status(
+                    "Обновление тегов прервано!" if tags_only else "Сборка прервана!",
+                    "warning",
+                )
                 self._post_to_ui(
                     self._show_warning,
                     "Остановлено",
-                    "Процесс сборки был прерван пользователем.",
+                    (
+                        "Обновление тегов в исходных файлах было прервано."
+                        if tags_only
+                        else "Процесс сборки был прерван пользователем."
+                    ),
                 )
             except Exception as e:
                 outcome = "error"
                 logging.exception("Ошибка сборки")
-                error_message = f"Произошла ошибка при сборке:\n{e}"
+                error_message = (
+                    f"Произошла ошибка при обновлении тегов:\n{e}"
+                    if tags_only
+                    else f"Произошла ошибка при сборке:\n{e}"
+                )
                 self._post_export_status("Ошибка!", "error")
                 self._post_to_ui(self._show_error, "Ошибка", error_message)
             finally:
@@ -31357,10 +32605,18 @@ class TTSApp:
         except Exception as exc:
             self._export_thread = None
             self._set_export_running_state(False)
-            self._set_export_status("Ошибка запуска сборки.", "error")
+            self._set_export_status(
+                "Ошибка запуска обновления тегов." if tags_only else "Ошибка запуска сборки.",
+                "error",
+            )
             logging.exception("Не удалось запустить поток экспорта")
             self._show_error(
-                "Ошибка", f"Не удалось запустить сборку:\n{exc}"
+                "Ошибка",
+                (
+                    f"Не удалось запустить обновление тегов:\n{exc}"
+                    if tags_only
+                    else f"Не удалось запустить сборку:\n{exc}"
+                ),
             )
 
     def add_separator_row(self, initial_value=""):
@@ -31485,6 +32741,8 @@ class TTSApp:
         tab_folders = make_settings_tab("Папки")
         tab_pauses = make_settings_tab("Паузы")
         tab_cache = make_settings_tab("Кэш")
+        self.settings_notebook = set_notebook
+        self._cache_settings_page = set_notebook.tabs()[-1]
         tab_normalization = make_settings_tab("Нормализация")
         tab_effects = make_settings_tab("Эффекты")
         tab_output = make_settings_tab("Вывод и теги")
@@ -31535,7 +32793,31 @@ class TTSApp:
             ttk.Checkbutton(parent, text=label, variable=var).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=2, padx=5)
 
         # 1. Раздел API
-        add_entry(tab_api, "API Token:", "api_token", 0)
+        tab_api.columnconfigure(1, weight=1)
+        ttk.Label(tab_api, text="API Token:").grid(
+            row=0, column=0, sticky=tk.W, pady=2, padx=5
+        )
+        token_row = ttk.Frame(tab_api)
+        token_row.grid(row=0, column=1, sticky=tk.EW, pady=2, padx=5)
+        self.settings_vars["api_token"] = tk.StringVar(
+            value=self.config.get("api_token", "")
+        )
+        self.api_token_visible_var = tk.BooleanVar(value=False)
+        self.api_token_entry = ttk.Entry(
+            token_row,
+            textvariable=self.settings_vars["api_token"],
+            show="*",
+        )
+        self.api_token_show_check = ttk.Checkbutton(
+            token_row,
+            text="Показать",
+            variable=self.api_token_visible_var,
+            command=lambda: self.api_token_entry.configure(
+                show="" if self.api_token_visible_var.get() else "*"
+            ),
+        )
+        self.api_token_show_check.pack(side=tk.RIGHT, padx=(6, 0))
+        self.api_token_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         add_entry(tab_api, "API URL:", "api_url", 1)
         add_entry(tab_api, "Спикер (Голос):", "speaker", 2)
 
@@ -31604,7 +32886,7 @@ class TTSApp:
         )
         self.api_steps_cache_check = ttk.Checkbutton(
             steps_frame,
-            text="Учитывать steps в ключе кэша (рекомендуется)",
+            text="Учитывать steps в ключе постоянного кэша (рекомендуется)",
             variable=self.settings_vars["cache_include_steps"],
         )
         self.api_steps_cache_check.grid(
@@ -31747,12 +33029,29 @@ class TTSApp:
         add_check(tab_cache, "Авто-обрезка тишины от Silero", "auto_trim_silence", 0)
         add_entry(tab_cache, "Порог тишины (dBFS):", "silence_threshold", 1, tk.DoubleVar)
         ttk.Separator(tab_cache, orient=tk.HORIZONTAL).grid(row=2, column=0, columnspan=2, sticky="ew", pady=10)
-        add_check(tab_cache, "Включить кэширование", "use_cache", 3)
-        add_entry(tab_cache, "Сохранять кэш на диск каждые (фраз):", "cache_save_frequency", 4, tk.IntVar)
+        add_check(tab_cache, "Включить постоянное кэширование", "use_cache", 3)
+        add_entry(tab_cache, "Сохранять кэш каждые (фрагментов):", "cache_save_frequency", 4, tk.IntVar)
         add_check(tab_cache, "Ограничить количество записей (LRU):", "enable_cache_lru", 5)
         add_entry(tab_cache, "Макс. записей в кэше:", "cache_max_entries", 6, tk.IntVar)
         add_check(tab_cache, "Удалять старые записи по времени (TTL):", "enable_cache_ttl", 7)
         add_entry(tab_cache, "Время жизни кэша (часов):", "cache_ttl_hours", 8, tk.DoubleVar)
+        self.lbl_cache_policy_hint = self._register_palette_widget(
+            ttk.Label(tab_cache, text="", justify=tk.LEFT, wraplength=600), "warning"
+        )
+        self.lbl_cache_policy_hint.grid(
+            row=9, column=0, columnspan=2, sticky=tk.EW, padx=5, pady=(10, 2)
+        )
+
+        def resize_cache_hint(event):
+            self.lbl_cache_policy_hint.configure(wraplength=max(180, event.width - 30))
+
+        tab_cache.bind("<Configure>", resize_cache_hint, add="+")
+        for key in (
+            "use_cache", "enable_cache_lru", "enable_cache_ttl",
+            "cache_max_entries", "cache_ttl_hours",
+        ):
+            self.settings_vars[key].trace_add("write", self._refresh_cache_policy_hint)
+        self._refresh_cache_policy_hint()
 
         # 5. Нормализация. Полный редактор остаётся в песочнице, а здесь всегда
         # виден именно сохранённый глобальный снимок, а не локальные пробы.
@@ -31832,10 +33131,12 @@ class TTSApp:
             ttk.Label(
                 tab_effects,
                 text=(
-                    "Текущие эффекты книги и Прямого синтеза применяются ПОСЛЕ "
-                    "генерации (без затрат API). Применение аудиопрофиля к книге "
-                    "заменяет эти значения; последующая ручная правка не меняет "
-                    "сохранённый профиль. У вкладки «Экспорт и сборка» свои эффекты."
+                    "Эффекты применяются после генерации (без затрат API). "
+                    "Здесь задаются общие эффекты книги; у Прямого синтеза и "
+                    "«Экспорта и сборки» свои ползунки. Применение аудиопрофиля "
+                    "к книге копирует его эффекты сюда и в Прямой синтез. "
+                    "Последующая ручная правка не меняет сохранённый профиль. "
+                    "Для M4B эффекты не применяются."
                 ),
                 font=("", 9, "italic"),
                 foreground=self.get_status_color("muted"),
@@ -32930,7 +34231,7 @@ class TTSApp:
             editor_pane, text="Исходный текст (можно редактировать)", padding=5
         )
         result_frame = ttk.LabelFrame(
-            editor_pane, text="Результат полного pipeline синтеза", padding=5
+            editor_pane, text="Текст после выбранной подготовки", padding=5
         )
         editor_pane.add(source_frame, weight=1)
         editor_pane.add(result_frame, weight=1)
@@ -33046,12 +34347,15 @@ class TTSApp:
         self.lbl_normalizer_preview_status.pack(
             side=tk.LEFT, fill=tk.X, expand=True
         )
-        preview_status_row.bind(
-            "<Configure>",
-            lambda event: self.lbl_normalizer_preview_status.configure(
-                wraplength=max(180, event.width - 125)
-            ),
-            add="+",
+        def resize_normalizer_status(event):
+            # Поле шрифта занимает разную ширину в темах ОС. Перенос по
+            # фактической ширине подписи сохраняет длинные сообщения целиком.
+            wraplength = max(1, event.width - 4)
+            if int(self.lbl_normalizer_preview_status.cget("wraplength")) != wraplength:
+                self.lbl_normalizer_preview_status.configure(wraplength=wraplength)
+
+        self.lbl_normalizer_preview_status.bind(
+            "<Configure>", resize_normalizer_status, add="+"
         )
         self._status_label_kinds[self.lbl_normalizer_preview_status] = "info"
         editor_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -33090,23 +34394,44 @@ class TTSApp:
                 "Ударения при латинизации",
             ),
         )
-        for index, (key, label) in enumerate(stage_labels):
+        stage_checks = []
+        for key, label in stage_labels:
             variable = tk.BooleanVar()
             self.normalizer_preview_vars[key] = variable
-            ttk.Checkbutton(
+            stage_checks.append(ttk.Checkbutton(
                 stages_tab,
                 text=label,
                 variable=variable,
                 command=self._normalizer_option_changed,
-            ).grid(
-                row=index % 8,
-                column=index // 8,
-                sticky=tk.W,
-                padx=(0, 12),
-                pady=3,
-            )
+            ))
         stages_tab.columnconfigure(0, weight=1)
         stages_tab.columnconfigure(1, weight=1)
+
+        stage_layout = {"columns": None}
+
+        def layout_stages(event=None):
+            width = int(getattr(event, "width", 0) or stages_tab.winfo_width())
+            two_column_width = (
+                max(widget.winfo_reqwidth() for widget in stage_checks[:8])
+                + max(widget.winfo_reqwidth() for widget in stage_checks[8:])
+                + 28
+            )
+            columns = 1 if width < two_column_width else 2
+            if stage_layout["columns"] == columns:
+                return
+            stage_layout["columns"] = columns
+            for index, widget in enumerate(stage_checks):
+                widget.grid_forget()
+                widget.grid(
+                    row=index if columns == 1 else index % 8,
+                    column=0 if columns == 1 else index // 8,
+                    sticky=tk.W,
+                    padx=(0, 12),
+                    pady=1 if columns == 1 else 3,
+                )
+
+        stages_tab.bind("<Configure>", layout_stages, add="+")
+        layout_stages()
 
         advanced_tab.columnconfigure(1, weight=1)
 
@@ -33171,7 +34496,10 @@ class TTSApp:
             self.normalizer_preview_vars[key] = variable
             entry = ttk.Entry(advanced_tab, textvariable=variable)
             entry.grid(row=row, column=1, sticky=tk.EW, pady=3)
-            entry.bind("<KeyRelease>", lambda _event: self._normalizer_option_changed())
+            # StringVar отслеживает также вставку, вырезание и действия меню,
+            # которые не всегда порождают ``<KeyRelease>``. Это не позволяет
+            # сохранить предпросмотр, рассчитанный по прежнему значению.
+            variable.trace_add("write", self._normalizer_option_changed)
             return entry
 
         add_preview_entry(4, "Файл словаря латинизации:", "latin_dictionary_filename")
@@ -33191,9 +34519,7 @@ class TTSApp:
             dictionary_path_frame, textvariable=dictionary_path_var
         )
         dictionary_path_entry.grid(row=0, column=0, sticky=tk.EW)
-        dictionary_path_entry.bind(
-            "<KeyRelease>", lambda _event: self._normalizer_option_changed()
-        )
+        dictionary_path_var.trace_add("write", self._normalizer_option_changed)
 
         def choose_dictionary_path():
             selected = filedialog.askdirectory(
@@ -33203,7 +34529,6 @@ class TTSApp:
             )
             if selected:
                 dictionary_path_var.set(selected)
-                self._normalizer_option_changed()
 
         ttk.Button(
             dictionary_path_frame,
@@ -33717,11 +35042,17 @@ class TTSApp:
             text="Перезаписывать существующие TXT",
             variable=overwrite_var,
         ).pack(anchor=tk.W, pady=(3, 0))
+        try:
+            batch_config = self._collect_normalizer_preview_config()
+        except (AttributeError, KeyError, tk.TclError, TypeError, ValueError):
+            batch_config = self.config
+        batch_summary = describe_normalizer_settings(batch_config)
         ttk.Label(
             dialog,
             text=(
-                "Используются текущий профиль нормализации и глоссарий. "
-                "Исходные файлы не изменяются, API не используется."
+                "Используются локальные настройки вкладки «Нормализатор»: "
+                + batch_summary["details"]
+                + ". Исходные файлы не изменяются, API не используется."
             ),
             wraplength=520,
             justify=tk.LEFT,
@@ -33990,8 +35321,10 @@ class TTSApp:
         self._refresh_normalizer_scope_status()
         self._show_info(
             "Профиль применён",
-            "Настройки нормализатора сохранены глобально и будут "
-            "использоваться новым синтезом.",
+            "Настройки подготовки текста сохранены глобально:\n"
+            + describe_normalizer_settings(self.config)["details"]
+            + ".\n\nОни будут использоваться в новых запусках синтеза, "
+            "если не включён флажок «Текст уже подготовлен».",
         )
 
     def export_normalizer_profile(self):
@@ -34593,6 +35926,13 @@ class TTSApp:
         ):
             label = getattr(self, label_name, None)
             if label is None:
+                continue
+            if target == "export" and _config_bool(
+                getattr(self, "export_tags_only_var", None).get()
+                if getattr(self, "export_tags_only_var", None) is not None
+                else False
+            ):
+                self._refresh_output_targets_summary()
                 continue
             # После появления явного набора выходных данных его строки становятся неизменяемыми
             # снимками — именно эти настройки будут реально экспортированы.
@@ -36035,7 +37375,7 @@ class TTSApp:
         self.search_var.trace_add("write", self._schedule_cache_filter)
         ttk.Entry(search_frame, textvariable=self.search_var, width=50).pack(side=tk.LEFT, padx=5)
 
-        self.lbl_cache_count = ttk.Label(search_frame, text="Всего записей: 0", foreground=self.get_status_color("info"))
+        self.lbl_cache_count = ttk.Label(search_frame, text="Индекс не загружен", foreground=self.get_status_color("info"))
         self.lbl_cache_count.pack(side=tk.RIGHT, padx=5)
 
         # Подсказка использует системное обозначение клавиши-модификатора.
@@ -36132,7 +37472,7 @@ class TTSApp:
         t1.insert(tk.END, data.get("original_text", ""))
 
         ttk.Label(
-            body, text="Нормализованный текст (отправлен в API):"
+            body, text="Текст, отправленный в API:"
         ).pack(anchor=tk.W, padx=10, pady=(10, 0))
         t2 = tk.Text(
             body, height=4, wrap=tk.WORD, font=("Arial", self.font_size_var.get())
@@ -36261,6 +37601,7 @@ class TTSApp:
                 cache_echo_delay_var.get(),
                 cache_echo_decay_var.get(),
             )
+            generation = self.stop_audio_playback()
 
             def prepare_and_play():
                 try:
@@ -36273,7 +37614,9 @@ class TTSApp:
                         echo_delay=effect_settings[3],
                         echo_decay=effect_settings[4],
                     )
-                    self.play_audio_segment(processed_segment)
+                    self.play_audio_segment(
+                        processed_segment, generation=generation
+                    )
                 except Exception:
                     logging.exception("Ошибка подготовки файла кэша к воспроизведению")
 
@@ -37145,7 +38488,18 @@ class TTSApp:
                 # Для больших индексов это заметная операция, поэтому она
                 # должна выполняться в фоновом обработчике, а не до показа окна в Tk.
                 processor = TTSProcessor(processor_config)
-                txt_files = list(input_dir.glob("*.txt"))
+                if _config_bool(processor_config.get("include_subdirs", False)):
+                    txt_files = [
+                        Path(node.path)
+                        for node in flatten_source_tree(scan_source_tree(input_dir))
+                    ]
+                else:
+                    txt_files = [
+                        path for path in input_dir.iterdir()
+                        if path.is_file()
+                        and not path.name.startswith(".")
+                        and path.suffix.lower() == ".txt"
+                    ]
 
                 if not txt_files:
                     self._post_to_ui(
@@ -37209,6 +38563,7 @@ class TTSApp:
                             deleted_stale_count += 1
 
                 if keys_to_delete:
+                    keys_to_delete_set = set(keys_to_delete)
                     removed_entries = [
                         processor.cache[key]
                         for key in keys_to_delete
@@ -37217,7 +38572,7 @@ class TTSApp:
                     updated_cache = {
                         key: value
                         for key, value in processor.cache.items()
-                        if key not in set(keys_to_delete)
+                        if key not in keys_to_delete_set
                     }
                     files_to_delete = unreferenced_cache_audio_paths(
                         processor.cache_dir,
@@ -37374,7 +38729,7 @@ class TTSApp:
         popup.protocol("WM_DELETE_WINDOW", popup.withdraw)
 
         def run_zip():
-            error_message = None
+            archive_path = None
             try:
                 archive_path = create_zip_archive_atomic(cache_dir, out_zip)
                 if delete_after_zip:
@@ -37387,12 +38742,19 @@ class TTSApp:
                     None,
                 )
             except Exception as exc:
-                logging.exception("Не удалось создать архив кэша")
-                error_message = f"Не удалось создать архив:\n{exc}"
+                if archive_path is None:
+                    logging.exception("Не удалось создать архив кэша")
+                    error_message = f"Не удалось создать архив:\n{exc}"
+                else:
+                    logging.exception("Архив создан, но кэш не очищен")
+                    error_message = (
+                        f"Архив создан:\n{archive_path}\n\n"
+                        f"Не удалось очистить кэш:\n{exc}"
+                    )
                 self._post_to_ui(
                     self._finish_cache_archive,
                     popup,
-                    None,
+                    archive_path,
                     False,
                     error_message,
                 )
@@ -37447,7 +38809,7 @@ class TTSApp:
 
         self.help_text_widget.config(yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.help_text_widget.yview)
-        help_text = r"""Добро пожаловать в Silero TTS Studio v1.6!
+        help_text = r"""Добро пожаловать в Silero TTS Studio v1.6.1!
 
 Программа помогает озвучивать текст с помощью Silero, готовить аудиокниги, объединять и конвертировать аудиофайлы. Готовые речевые фрагменты можно повторно использовать из кэша.
 
@@ -37455,7 +38817,7 @@ class TTSApp:
 🚀 1. БЫСТРЫЙ СТАРТ
 ====================================================================
 1. Перейдите во вкладку "Настройки" -> "API" и введите API Token для создания новых речевых фрагментов. Параметр Steps можно оставить выключенным.
-2. На вкладке "Импорт книг" добавьте одну или несколько книг (EPUB, FB2, DOCX, TXT), при необходимости измените их порядок и нажмите "Извлечь и нарезать". Программа сохранит главы в выбранную папку — по умолчанию input_texts.
+2. На вкладке "Импорт книг" добавьте одну или несколько книг (EPUB, FB2, DOCX, TXT), при необходимости измените их порядок и нажмите "Извлечь и нарезать". Если включён режим одного TXT на книгу, кнопка называется "Извлечь в TXT". Результаты сохраняются в выбранную папку — по умолчанию input_texts.
 3. Перейдите во вкладку "Синтез из папки". В "🧩 Выходах для книги…" можно выбрать несколько форматов и сохранять отдельные главы или склеивать группы. Параметры очереди, подпапок и разбиения M4B находятся в "⚙ Настройках синтеза…". Для запуска всей очереди нажмите "▶ Старт (Все)".
 4. Готовые аудиофайлы появятся в папке аудио из настроек — по умолчанию output_audio. Для отдельных целей можно назначить свои папки.
 5. Флажок "Автопрокрутка" рядом с кнопкой "📍 К текущему файлу" можно переключать во время работы; сама кнопка сразу возвращает к активному файлу.
@@ -37480,7 +38842,7 @@ API Token нужен для создания новых речевых фраг�
 
 • Большими блоками (full): Программа объединяет текст главы в крупные аудиоблоки.
   - Плюсы: Число запросов обычно меньше; ритм и интонацию внутри блока определяет сервис синтеза.
-  - Защита: Если глава слишком большая для одного запроса, программа автоматически делит её по границам абзацев и вставляет паузу.
+  - Защита: Если глава слишком большая для одного запроса, программа делит её между абзацами и вставляет паузу. Один огромный абзац не режется внутри — при необходимости разбейте его вручную.
 
 ====================================================================
 ⚡ 3. ПРЯМОЙ СИНТЕЗ
@@ -37489,12 +38851,12 @@ API Token нужен для создания новых речевых фраг�
 
 • Поле ввода: Вставьте текст и нажмите "▶ Синтезировать". Пустая строка или строка только из знаков препинания не создаёт аудиофайл; для намеренной тишины используйте отдельную строку-разделитель.
 • Имя файла: Назовите итоговый трек (по умолчанию direct_output.mp3).
-• Папка: По умолчанию результат сохраняется в direct_audio. Путь можно изменить на самой вкладке.
+• Папка: При включённом «Сохранить» результат записывается в выбранную папку — по умолчанию direct_audio. Путь можно изменить на самой вкладке.
 • Чекбоксы управления:
-  - [x] Сохранить: Сохраняет аудиофайл на диск в выбранную папку прямого синтеза.
-  - [x] Игнорировать кэш: Принудительно генерирует речь заново через API.
+  - [x] Сохранить: Записывает итоговый аудиофайл в выбранную папку. Если флажок снят, итоговый файл не сохраняется; результат доступен для прослушивания.
+  - [ ] Игнорировать кэш: Принудительно генерирует речь заново через API.
   - [x] Авто-воспроизведение: Проигрывает готовый результат через системный плеер.
-  - [ ] Применить теги из настроек: По умолчанию выключено, поэтому результат прямого синтеза не получает книжные теги и обложку.
+  - [ ] Применить теги из настроек: Записывает книжные теги и поддерживаемую обложку только в сохраняемый файл. На прослушивание без сохранения не влияет. После перезапуска приложения флажок снова выключен.
   - [ ] Текст уже подготовлен: Для заранее нормализованного TXT или текста из внешнего редактора. Флажок не сохраняется, перед запуском требует подтверждения и автоматически снимается после завершения.
 • Плеер: Кнопка "🔊 Слушать" останавливает предыдущее воспроизведение перед запуском нового. Кнопка "🔇" останавливает звук.
 • Эффекты: Индивидуальные ползунки скорости, тона и эха. Кнопка "💾 Сделать глобальными" переносит эти значения в общие настройки программы.
@@ -37503,6 +38865,8 @@ API Token нужен для создания новых речевых фраг�
 ⏱ 4. ТОНКАЯ НАСТРОЙКА ПАУЗ И РАЗДЕЛИТЕЛЕЙ
 ====================================================================
 На вкладке "Настройки" -> "Паузы" можно настроить ритм повествования (длительность указывается в миллисекундах, 1000 мс = 1 сек):
+
+В режиме предложений действуют все правила пауз. В режиме абзацев — паузы между абзацами, перед репликой или мыслью и после двоеточия; ритм внутри абзаца определяет Silero. В режиме больших блоков заданные паузы действуют на разделителях и границах блоков. Паузы начала и конца файла и строки-разделители действуют во всех режимах, включая «Текст уже подготовлен».
 
 • Пауза в начале / конце файла: Задает тишину на старте и в самом финише трека (удобно для плееров).
 • Между предложениями: Базовая пауза между обычными предложениями внутри абзаца.
@@ -37516,7 +38880,7 @@ API Token нужен для создания новых речевых фраг�
 ====================================================================
 ⚙️ 5. ПОДГОТОВКА ТЕКСТА
 ====================================================================
-Перед синтезом программа приводит текст к удобному для озвучки виду: раскрывает числа и даты, учитывает правила глоссария, сохраняет ручные ударения и разбивает материал на фрагменты. Начальный BOM в UTF-8-файле удаляется автоматически. Самостоятельные фрагменты без поддерживаемых букв пропускаются и отмечаются в журнале с исходным и нормализованным текстом; неподдерживаемые символы внутри смешанной фразы сохраняются.
+В зависимости от включённых этапов подготовки программа раскрывает числа и даты, учитывает правила глоссария и сохраняет ручные ударения. Разбиение на фрагменты определяется выбранным режимом синтеза. Начальный BOM в UTF-8-файле удаляется автоматически. Самостоятельные фрагменты без поддерживаемых букв пропускаются и отмечаются в журнале с исходным и нормализованным текстом; неподдерживаемые символы внутри смешанной фразы сохраняются.
 
 ====================================================================
 🧪 5.1. ПЕСОЧНИЦА И ПРОФИЛИ НОРМАЛИЗАТОРА
@@ -37525,13 +38889,13 @@ API Token нужен для создания новых речевых фраг�
 
 • Слева вводится пример, справа показывается подготовленный результат. Изменения можно проверять без API-запросов.
 • Профили TTS/Safe и пользовательские профили помогают быстро менять набор правил. Пользовательский профиль можно добавить, изменить, удалить, импортировать или экспортировать.
-• Локальные изменения не становятся глобальными до нажатия кнопки «Применить глобально». Строка состояния показывает, какие настройки сохранены; «Вернуть глобальные» отменяет эксперимент.
+• Локальные изменения не становятся глобальными до нажатия кнопки «Применить глобально». Сводка в «Настройки → Нормализация» показывает включённые этапы; они используются в новых запусках синтеза, если не включён «Текст уже подготовлен». Строка состояния показывает, какие настройки сохранены; «Вернуть глобальные» отменяет эксперимент.
 • Изменения библиотеки профилей записываются после подтверждения. Если отменить удаление профиля, его выбор в песочнице сохраняется.
 • Размер шрифта исходного и подготовленного текста меняется в нижней панели.
 • Отдельные этапы подготовки и глоссарий можно временно отключить, чтобы найти правило, влияющее на результат.
 • «Сохранить TXT…» записывает проверенный результат в UTF-8. Если результат устарел после правки, сначала выполните новую проверку.
-• «Нормализовать папку…» применяет текущие настройки этой вкладки и глоссарий ко всем TXT в выбранной папке. Папка результатов должна находиться отдельно от исходной: вложенность в любую сторону не допускается. Подпапки можно включить или исключить, а существующие результаты — пропустить или перезаписать. Исходные файлы не меняются, API не используется. Остановить очередь можно после завершения текущего файла.
-• Флажок «Текст уже подготовлен» в синтезе использует сохранённый результат без повторной подготовки текста; разбиение и паузы продолжают работать.
+• «Нормализовать папку…» применяет текущие настройки этой вкладки ко всем TXT в выбранной папке; глоссарий используется, если включён. Папка результатов должна находиться отдельно от исходной: вложенность в любую сторону не допускается. Подпапки можно включить или исключить, а существующие результаты — пропустить или перезаписать. Исходные файлы не меняются, API не используется. Остановить очередь можно после завершения текущего файла.
+• Флажок «Текст уже подготовлен» пропускает пользовательские RegEx, глоссарий, автообработку Studio, ru-normalizr и финальную очистку для этого запуска. Разбиение, строки-разделители и паузы работают по выбранному режиму синтеза.
 
 ====================================================================
 📖 6. ИМПОРТ И НАРЕЗКА КНИГ (EPUB, FB2, DOCX, TXT)
@@ -37540,14 +38904,14 @@ API Token нужен для создания новых речевых фраг�
 
 • Поддерживаемые форматы: .epub, .fb2, .docx, .txt.
 • Пакетный импорт: выберите несколько книг, настройте общие параметры и запустите очередь. Она выполняется сверху вниз; выбранный путь можно исправить, книги — естественно отсортировать по имени или переставить стрелками. Сортировка понимает обычные числа и самостоятельные римские номера томов I, II, …, X. Эти действия меняют только очередь и не перемещают исходные файлы. Ошибка одного файла не мешает перейти к следующему.
-• Авто-структурирование: Программа читает оглавление (TOC) книги и использует его для выделения глав.
+• Структура EPUB: используется порядок чтения книги, названия берутся из оглавления. Предисловие и другие разделы вне оглавления тоже сохраняются.
 • Автоматическое извлечение автора: Извлекает метаданные автора из файлов EPUB и FB2.
 • Извлечение текста EPUB/FB2: сохраняются абзацы и текст внутри выделений и ссылок; оформление исходной книги в TXT не переносится.
 • Нарезка TXT по RegEx: Вы можете нарезать обычный текстовый файл по шаблону заголовков (например: ^Глава \d+ или ^Часть [I-V]+).
 • Переменные исходника: {name}, {book} и {filename} — имя исходной книги без расширения, {title} — заголовок извлечённой главы, {author} — автор из EPUB/FB2. Если автора в метаданных нет, подставляется «Автор».
 • Переменные нумерации: {num} — номер главы, который начинается заново в каждой книге; {book_index} — позиция книги в текущем порядке очереди и одинакова для всех её глав. Ошибка отдельной книги сохраняет её позицию, поэтому номера следующих книг не сдвигаются.
 • Нумерация: {num:N} и {book_index:N} начинают счёт с N, форма :03d задаёт фиксированную разрядность, а :00d (или :auto) включает адаптивную разрядность по всему диапазону. Оба параметра можно совместить: {book_index:8:03d} даёт 008, 009, 010 и далее. В обычных шаблонах без модификатора ведущие нули не добавляются; импорт книг сохраняет отдельное адаптивное правило.
-• Сохранение в один файл: галочка объединяет книгу в один TXT. В этом режиме {title} равно «Книга», а значение {num} всегда равно начальному номеру; различать книги следует через {book_index}, {name} или {book}. Шаблон «Название серии {book_index}» создаёт «Название серии 1.txt», «Название серии 2.txt» и далее.
+• Сохранение в один файл: галочка объединяет книгу в один TXT. Поле RegEx глав не используется, а кнопка называется «Извлечь в TXT». В этом режиме {title} равно «Книга», а значение {num} всегда равно начальному номеру; различать книги следует через {book_index}, {name} или {book}. Шаблон «Название серии {book_index}» создаёт «Название серии 1.txt», «Название серии 2.txt» и далее.
 • Безопасные имена: неизвестные переменные и неподдерживаемые параметры отклоняются до запуска. Готовый файл всегда получает расширение .txt; совпавшие имена не перезаписываются, а получают суффиксы «(2)», «(3)» и далее.
 
 ====================================================================
@@ -37563,7 +38927,7 @@ API Token нужен для создания новых речевых фраг�
 • Шрифт редактора можно изменить в нижней панели.
 • Импорт глоссария объединяет выбранные правила с текущими и по умолчанию сохраняет личные варианты при конфликте.
 • Кнопка «Удалить правила…» открывает поиск и вкладки для ударений, терминов и RegEx. Можно выбрать найденные строки, весь раздел или очистить глоссарий целиком.
-• Несохранённые изменения редактора сначала проверяются и записываются только после нажатия «Сохранить файл». При смене папки кэша приложение предложит решить, что делать с такими изменениями.
+• Предпросмотр использует текущие правки редактора. Обычный синтез с включённым глоссарием читает сохранённый glossary.json; перед запуском приложение предложит сохранить несохранённые правки, а отказ отменит запуск. При выключенном глоссарии или «Текст уже подготовлен» его правила не применяются. Сохранить правки также можно кнопкой «Сохранить файл»; при смене папки кэша и закрытии приложение предложит решить, что делать с ними.
 
 ====================================================================
 🎛 8. АУДИОЭФФЕКТЫ И ПОСТОБРАБОТКА (FFMPEG)
@@ -37586,14 +38950,15 @@ API Token нужен для создания новых речевых фраг�
 ====================================================================
 Вкладка "Экспорт и сборка" объединяет готовые аудиофайлы, конвертирует их и помогает привести метаданные к единому виду:
 
-• Добавляйте файлы в группы (тома) или прямо в корень списка. Колонки «Исходник / группа» и «Title» отдельно показывают физическое имя и редактируемый медиатег. Группы можно объединять, разгруппировывать и очищать кнопками «🔗 Объединить», «📤 Разгруппировать» и «🧹 Очистить всё»; эти действия не удаляют исходные файлы.
+• Добавляйте файлы в группы (для M4B — тома) или прямо в корень списка. Колонки «Исходник / группа» и «Title» отдельно показывают физическое имя и редактируемый медиатег. Группы можно объединять, разгруппировывать и очищать кнопками «🔗 Объединить», «📤 Разгруппировать» и «🧹 Очистить всё»; эти действия не удаляют исходные файлы.
 • При добавлении отдельных файлов или папки выберите назначение: текущая группа, корень проекта или новая группа. «Отмена», Escape и закрытие окна ничего не добавляют и не меняют сохранённый список.
 • Список, порядок, группы и изменения тегов автоматически восстанавливаются после перезапуска. Кнопка «🧹 Очистить всё» очищает сохранённый список; аудиофайлы на диске остаются нетронутыми.
 • Панель «Настройки группы» разделена на вкладки «Основные», «Теги», «Массово» и «Шаблон». Во вкладке «Массово» можно перенести параметры склейки, подпапок и пауз на все группы либо применить теги к нужному набору элементов.
 • Список сортируется естественно: «Глава 2» идёт перед «Глава 10». При последовательной работе статус показывает этап и текущий файл; при параллельной — общий счётчик, число активных заданий и одно короткое текущее имя.
 • Выберите склейку в один файл или сохранение отдельных дорожек, задайте паузу, профиль вывода и при необходимости примените скорость, тон или эхо.
 • Поля тегов и обложка можно задать для группы, файла, выделения или всего списка. Пустые поля группы заполняются данными первого исходного файла.
-• «Только обновить теги» меняет метаданные без перекодирования звука. Перед запуском приложение проверяет отсутствующие файлы и совпадающие имена результатов.
+• «Только обновить теги в исходных файлах» записывает теги и поддерживаемые обложки непосредственно в исходники без перекодирования звука. Папка и набор выходов, склейка, паузы и эффекты не используются; кнопка называется «Обновить теги».
+• Перед любой обработкой проверяется наличие исходных аудиофайлов; при сборке также проверяются совпадающие имена результатов.
 • Кнопка «📖 Разобрать M4B…» загружает главы готовой аудиокниги в дерево без предварительной нарезки на временные файлы. Главы можно переименовать, изменить их теги и сохранить в MP3, Opus, M4A или другом доступном формате. Режим обновления тегов в исходных файлах для таких виртуальных глав недоступен.
 
 🎚 9.1. НАБОРЫ ВЫВОДА, M4B И ДЕРЕВО ИСХОДНИКОВ
@@ -37612,11 +38977,12 @@ API Token нужен для создания новых речевых фраг�
 • Нумерация в шаблонах: обычное :N задаёт начальный номер счётчика, :03d — фиксированную разрядность, :00d (или :auto) — адаптивную по общему диапазону, а :N:03d совмещает старт и фиксированную ширину. Например, {global_index:10:03d} начинает сквозной счёт с 010, {volume_index:0:00d} подберёт ширину по числу глав тома, а {volume:1:02d}-{file_index:1:03d} даёт имена 01-001, 01-002 и далее. У общих количеств вроде {parts} и {chapter_count} число после двоеточия остаётся шириной форматирования. Поле {num} зависит от контекста: при импорте это номер главы внутри каждой книги, в имени части M4B — номер тома, а в метках глав M4B — сквозной номер главы.
 • Кнопка «Помощник…» рядом с полем шаблона показывает только доступные в этом месте переменные, позволяет независимо задать начальный номер, фиксированную или адаптивную разрядность и сразу выводит примеры имён. Флажок «Адаптивно» вставляет `:00d` и подбирает ширину по общему числу групп, файлов, глав или томов. Для обычного имени выходного файла доступны `{name}`/`{title}` (название элемента), `{filename}` (физическое имя исходного контейнера), `{index}`/`{chapter}` (номер в группе), а также `{book}`, `{group}`, `{source_name}`, `{source_title}`, `{range}`, `{format}`, `{ext}`, `{profile}` и `{author}`. Для поля имени части M4B помощник использует контекст тома и дополнительно показывает `{part}`, `{parts}`, `{first_index}`, `{last_index}`, `{first_name}` и `{last_name}`. Для виртуальных глав одного M4B используйте `{name}` или номер, потому что `{filename}` у них общий. Готовый вариант «Том и глава» создаёт метки вида «Том 1. Глава 1»; стартовые значения можно изменить перед вставкой переменных. Собственные варианты сохраняются отдельно для каждого вида шаблона после нажатия «Применить»; встроенные варианты нельзя изменить или удалить.
 • M4B можно разделить по длительности или количеству глав. Глава никогда не режется внутри; если она сама длиннее лимита, появится предупреждение. Для книг длиннее 24 часов по умолчанию используется предел 23 ч 50 мин на том. Проверка фактической длительности может уточнить границы частей после синтеза всех глав.
-• «Старт (Все)» собирает M4B из всей очереди TXT: без ручного плана это одна книга, которую программа при необходимости разделит на тома; с планом используются заданные границы. Если виртуальная группа создана, ход сборки виден в её строке; без группы имя собираемого M4B показывается в общей строке состояния, а результат отмечается у исходных глав. «Старт (Выбранные)» обрабатывает только выделенные файлы или ветки.
-• Пропуск готовых файлов действует отдельно для выходов: неизменённый успешный M4B не готовится и не кодируется заново даже при включённой перестройке по фактической длительности. Готовность частей сохраняется при обработке выбранных групп, следующих частей и после перезапуска. Успешно сохранённые части запоминаются и при незавершённом общем запуске. Восстановление соседнего тома и добавление или изменение одной цели сохраняют остальные успешные результаты, если их итоговые пути и параметры не изменились. Речевые фрагменты берутся из кэша, а отсутствующие запрашиваются у API. Изменённые тексты, параметры, теги, пути, границы частей и незавершённые выходы требуют обновления затронутых результатов.
+• «Старт (Все)» создаёт все включённые выходы для очереди TXT. Без предварительного плана обычная склейка даёт один файл, а M4B — одну книгу, которую программа при необходимости разделит на тома; с планом используются его группы. Если виртуальная группа создана, ход сборки виден в её строке; без группы имя собираемого файла показывается в общей строке состояния, а результат отмечается у исходных глав. «Старт (Выбранные)» обрабатывает только выделенные файлы или ветки.
+• Пропуск готовых файлов действует отдельно для выходов: неизменённый успешный M4B не кодируется заново, если его путь, параметры и план частей остались прежними. Полностью готовая книга не запускает повторное измерение даже при включённой перестройке по фактической длительности. Готовность частей сохраняется при обработке выбранных групп, следующих частей и после перезапуска. Успешно сохранённые части запоминаются и при незавершённом общем запуске. Восстановление соседнего тома и добавление или изменение одной цели сохраняют остальные успешные результаты, если их итоговые пути и параметры не изменились.
+• Когда недостающий M4B требует проверки длительности книги, при включённом кэшировании приложение читает сохранённые фрагменты глав, а готовые отдельные выходы сохраняют статус «Готово». Если проверка меняет границы томов, пересобираются только затронутые части. Изменённые тексты, параметры, теги, пути, границы частей и незавершённые выходы требуют обновления затронутых результатов.
 • Большие группы собираются потоково без временной несжатой копии всей книги. Большое число фрагментов не требует вручную делить группу из-за ограничения длины команды FFmpeg.
-• По умолчанию группы одной книги получают общий альбом и номера томов. Приоритет альбома: локальный тег части, нестандартный пользовательский шаблон альбома M4B, тег «Альбом» из настроек, затем стандартный шаблон {book} с именем книги или папки. Если одновременно оставить пустыми шаблон и тег, альбом не записывается. Разные значения альбома по томам могут разделить их в медиатеке. Для каждой части можно отдельно переопределить название, исполнителя, исполнителя альбома, альбом, жанр, композитора, год и обложку. Текстовые значения передаются всем выбранным форматам, где контейнер поддерживает соответствующее поле. Обложки JPEG/PNG записываются в MP3 (MP3), OGG (Vorbis), Ogg (Opus), MP4/M4A (AAC-LC) и M4B (AAC-LC); WAV (PCM) получает поддерживаемые текстовые теги, но не переносимую обложку.
-• На вкладке «Синтез из папки» флажок «Включать подпапки (дерево)» показывает TXT из вложенных каталогов. Их структура повторяется в выводе только при включённой настройке «Повторять структуру подпапок в выходной папке». В «Настройках синтеза» можно отдельно задать логическое название текущей книги для {book} и стандартного альбома; это значение связано с выбранной входной папкой и не переносится в другую книгу автоматически. Кнопка «🧩 Подготовить оценочный план M4B…» создаёт виртуальные группы TXT для M4B и обычной склейки. Соседние группы можно объединять и переименовывать, не меняя файлы на диске.
+• Для M4B группы одной книги по умолчанию получают общий альбом и номера томов. Приоритет альбома: локальный тег части, нестандартный пользовательский шаблон альбома M4B, тег «Альбом» из настроек, затем стандартный шаблон {book} с именем книги или папки. Если одновременно оставить пустыми шаблон и тег, альбом не записывается. Разные значения альбома по томам могут разделить их в медиатеке. Для каждой части можно отдельно переопределить название, исполнителя, исполнителя альбома, альбом, жанр, композитора, год и обложку. Текстовые значения передаются всем выбранным форматам, где контейнер поддерживает соответствующее поле. Обложки JPEG/PNG записываются в MP3 (MP3), OGG (Vorbis), Ogg (Opus), MP4/M4A (AAC-LC) и M4B (AAC-LC); WAV (PCM) получает поддерживаемые текстовые теги, но не переносимую обложку.
+• На вкладке «Синтез из папки» флажок «Включать подпапки (дерево)» показывает TXT из вложенных каталогов. Их структура повторяется в выводе только при включённой настройке «Повторять структуру подпапок в выходной папке». В «Настройках синтеза» можно отдельно задать логическое название текущей книги для {book} и стандартного альбома; это значение связано с выбранной входной папкой и не переносится в другую книгу автоматически. Кнопка «🧩 Подготовить план групп…» создаёт виртуальные группы TXT для всех выходов с режимом «Один файл», включая M4B. Соседние группы можно объединять и переименовывать, не меняя файлы на диске.
 • Очередь последней папки сохраняется между запусками: группы, порядок, имена, локальные теги, исключённые TXT и сведения о готовых файлах. «Обновить папку» сохраняет разбиение, добавляет новые TXT и убирает отсутствующие. При выборе другой папки прежние группы в неё не переносятся.
 • Кнопка «↩ Сбросить разбиение…» справа от «Обновить папку» после подтверждения возвращает структуру папки и ранее исключённые файлы, сбрасывая виртуальные группы и их локальные теги. Готовое аудио и исходные файлы остаются на диске. При включённом пропуске готовых файлов сам сброс не вызывает пересборку неизменённых результатов; изменение состава, порядка, тегов или других параметров выхода требует его обновления. Если ручные группы содержат TXT из подпапок, перед отключением подпапок нужно сбросить разбиение.
 • Статус виртуальной группы учитывает все её выходы. Пока хотя бы один формат собирается, группа показывает активные форматы; «Готово» появляется только после успешного завершения всех выходов. Ошибка или предупреждение одного формата не скрывается успешным завершением другого.
@@ -37625,12 +38991,19 @@ API Token нужен для создания новых речевых фраг�
 💾 10. УПРАВЛЕНИЕ КЭШЕМ И БЕЗОПАСНОСТЬ
 ====================================================================
 • Кэш ускоряет повторный запуск: уже готовые фрагменты используются снова и не требуют новых запросов. При включённом пропуске готовых файлов существующие успешные результаты не собираются повторно.
-• Статус «Предупреждение» означает, что часть речи могла быть заменена паузой после неудачных попыток. При повторном запуске такие файлы пересобираются; подробности ошибки доступны в журнале. Ошибка одного формата не отменяет успешные файлы других форматов.
+• В «Синтезе из папки» этап «Подготовка» означает обработку TXT до первого нового запроса к API: чтение, нормализацию при включённой настройке, разбиение на фрагменты и поиск готовой речи в постоянном кэше или временных фрагментах открытого приложения. Формируется список аудиофрагментов для сборки; подпись может показывать имя TXT. Поиск речи выполняется в обычном ходе обработки главы. Если все нужные фрагменты уже доступны, глава проходит подготовку без новых запросов и передаётся на необходимую сборку. Уже готовые неизменённые выходы при включённом пропуске сохраняют статус «Готово».
+• «Синтез» появляется перед первым новым запросом к API текущего TXT и сохраняется до окончания озвучки главы. Нижняя подпись показывает последний отправленный фрагмент и меняется перед следующим запросом. Шкала и проценты обновляются независимо от подписи, по мере обработки фрагментов. 100% означает, что все фрагменты текущего TXT обработаны; последующая сборка выходных аудиофайлов отображается отдельно. Следующий TXT начинает подготовку отдельно: полностью закэшированная глава не требует стадии новых запросов.
+• Статус «С ошибками» означает, что часть речи могла быть заменена паузой после неудачных попыток. При повторном запуске такие файлы пересобираются; подробности ошибки доступны в журнале. Ошибка одного формата не отменяет успешные файлы других форматов.
 • При включённом кэшировании новые речевые фрагменты хранятся в компактном Ogg/Opus. Небольшие служебные файлы пауз хранятся отдельно и могут переиспользоваться. Старый Vorbis-кэш можно перевести кнопкой «Перекодировать Vorbis → Opus»; операцию можно остановить и продолжить позже. Если миграцию не запускать, старые записи обновляются постепенно.
-• В разделе «Настройки → Кэш» можно ограничить число записей и срок их хранения. Фрагменты, необходимые текущей сборке, сохраняются до её завершения, поэтому кэш может временно превысить заданный предел.
-• Если кэширование выключено, сохранённые записи не используются; временные фрагменты текущего запуска удаляются после создания выбранных аудиофайлов.
+• В разделе «Настройки → Кэш» можно ограничить число записей и срок их хранения. LRU/TTL не удаляют нужные фрагменты во время текущей обработки; ограничения применяются после завершения всех выходов или остановки, поэтому кэш может временно превысить заданный предел.
+• При выключенном постоянном кэшировании сохранённые записи кэша не используются. Новые исправные речевые фрагменты хранятся в отдельной системной временной папке открытого приложения и используются всеми выбранными форматами: озвучивать ту же главу заново для каждого формата не нужно. «Стоп», принудительная остановка и ошибка обработки сохраняют эту речь; при возобновлении той же книги с прежним текстом и параметрами через API запрашиваются только недостающие или повреждённые фрагменты.
+• Временная речь не входит в индекс постоянного кэша, его просмотр или ZIP-архив. Она занимает место на диске и до очистки может содержать речь всей текущей книги. Фрагменты освобождаются после успешного завершения всей очереди, при смене папки или состава TXT, изменении текста, голоса, адреса API, Steps или параметров подготовки, а также при переходе на постоянное кэширование. Речь сеанса не переносится в постоянный кэш автоматически. Завершение выбранного поднабора, изменение порядка, разбиения на группы, тегов и выходных форматов сами по себе её не удаляют. В прямом синтезе временная речь очищается после успешного запуска либо при смене текста или параметров речи. При закрытии приложения файлы удаляются после завершения использующих их задач.
+• После перезапуска приложения без постоянного кэша для незавершённой группы нужную речь придётся снова получить через API. Готовые отдельные аудиофайлы не подставляются вместо речевых фрагментов автоматически. При автоматической проверке длительности M4B может понадобиться подготовка и других глав книги. Чтобы сохранить речь между запусками приложения, включите кэширование без ограничений LRU/TTL перед первоначальным синтезом.
+• Перед запуском незавершённых групп любого формата появляется предупреждение, если кэширование выключено или действуют ограничения LRU/TTL. Без постоянного кэша повторные запросы потребуются после закрытия приложения, смены исходников или параметров речи либо очистки временной речи; обычные остановка и возобновление сохраняют полученные фрагменты. При включённом кэшировании LRU/TTL могут удалить часть записей: повторно запрашиваются только недостающие или повреждённые фрагменты, а исправные сохранённые используются снова. Ограничения постоянного кэша не создают дополнительную временную копию речи. Готовые аудиофайлы остаются на диске. Отключение или ограничение кэша сокращает длительное хранение, но может увеличить расход лимита API после удаления фрагментов.
+• В подтверждении можно выбрать «Продолжить», «Настройки кэша…» или «Отмена». Переход к настройкам отменяет запуск; приложение не включает кэш автоматически. После согласия предупреждение не повторяется до изменения действующей политики кэша или нового запуска приложения. При включённом кэшировании без ограничений и при пропуске всех уже готовых выходов этого предупреждения нет. Подтверждение закрытия во время синтеза учитывает настройки запущенной обработки.
+• При включённом кэшировании для незавершённых выходов заново запрашиваются только недостающие или повреждённые речевые фрагменты; подходящие исправные записи используются повторно. После очистки кэша для таких выходов может понадобиться новая озвучка. Неизменённые успешные аудиофайлы при включённом пропуске готовых файлов сохраняются и не пересобираются из-за отсутствия кэша. Если все выбранные выходы готовы и неизменны, они пропускаются без новых API-запросов даже после очистки кэша.
 • Сборка M4B из готовых аудиофайлов на вкладке «Экспорт и сборка» кэш синтеза не использует.
-• Кнопка «Обновить» перечитывает список, а двойной щелчок открывает карточку фрагмента. «Оптимизировать кэш» удаляет записи, которые больше не нужны выбранным текстам, и перед очисткой показывает сводку.
+• Кнопка «Обновить» перечитывает список, а двойной щелчок открывает карточку фрагмента. Поле «Текст, отправленный в API» показывает текст запроса, который мог пройти без нормализации. «Оптимизировать кэш» удаляет записи, которые больше не нужны выбранным текстам, и перед очисткой показывает сводку.
 • Кэш можно сохранить в ZIP. При выборе очистки после архивации удаляются только аудиоданные и индекс; файл глоссария остаётся.
 
 ====================================================================
@@ -37638,7 +39011,7 @@ API Token нужен для создания новых речевых фраг�
 ====================================================================
 • В окне «Импорт/Экспорт настроек» выберите, какие группы переносить: папки, паузы, кэш, нормализатор, эффекты, вывод или параметры вкладок.
 • Нормализатор и аудиопрофили можно переносить отдельно из соответствующих менеджеров. Один профиль удобно передать другому пользователю, а всю библиотеку — сохранить для резервной копии.
-• API Token переносится только после отдельного явного разрешения и по умолчанию не включён.
+• API Token в настройках скрыт символами; флажок «Показать» временно открывает его в поле. При импорте и сбросе настроек поле снова скрывается. В файл переноса Token попадает только после отдельного явного разрешения и по умолчанию не включён.
 • При отмене или ошибке записи текущие настройки и профили остаются без изменений.
 
 ====================================================================
@@ -37646,11 +39019,13 @@ API Token нужен для создания новых речевых фраг�
 ====================================================================
 На вкладке "Настройки" -> "API" задаются адрес сервиса, частота запросов и число одновременных локальных сборок.
 
-• Steps — необязательная настройка скорости и качества. Оставьте поле выключенным для обычного режима; для эксперимента выберите готовое значение или введите целое от 1 до 72.
+• Steps — необязательная настройка скорости и качества. Оставьте поле выключенным для обычного режима; для эксперимента выберите готовое значение или введите целое от 1 до 72. Флажок учёта Steps управляет ключами постоянного кэша; временная речь при выключенном кэшировании учитывает Steps независимо от него.
 • Лимитер действует на Прямой и пакетный синтез внутри одного запущенного окна. Несколько отдельных экземпляров приложения ограничиваются независимо.
 • Число локальных сборок FFmpeg можно оставить автоматическим или задать собственный предел. Снятый флажок «Параллельно» на вкладке экспорта временно переводит эту операцию в последовательный режим, не меняя сохранённый предел.
-• «⏹ Стоп» завершает текущий безопасный этап и останавливает очередь. «☠️ Принудительно» прерывает активную операцию; уже сохранённый кэш не удаляется.
-• Перед закрытием приложения дождитесь завершения пакетной нормализации или остановите её после текущего файла. Если при выходе не удалось сохранить кэш, настройки или очередь, окно останется открытым: устраните причину ошибки и повторите закрытие.
+• «⏹ Стоп» завершает текущий безопасный этап и останавливает очередь. «☠️ Принудительно» сразу передаёт команду остановки; уже выполняющийся запрос может завершиться. При включённом кэшировании полученные фрагменты сохраняются с учётом действующих LRU/TTL; при выключенном исправная временная речь остаётся для возобновления в открытом приложении. Сообщения принудительной остановки и закрытия отражают настройки запущенной задачи, даже если настройки в окне уже изменены.
+• При закрытии во время прямого или пакетного синтеза, экспорта, сборки готового аудио или обновления тегов приложение просит подтверждение. Отказ от закрытия оставляет работу запущенной. После подтверждения очередь останавливается, приложение дожидается завершения текущего запроса или аудиофайла и сохраняет полученные фрагменты при включённом кэшировании с учётом действующих LRU/TTL, настройки и данные проекта. При выключенном постоянном кэше временная речь удаляется после завершения использующих её задач. Готовые аудиофайлы остаются на диске. На macOS это относится и к закрытию окна, и к команде выхода из приложения.
+• При следующем запуске неизменённые успешные выходы пропускаются, если включена соответствующая настройка; при включённом кэшировании сохранённые фрагменты используются для незавершённых результатов без новых запросов на ту же речь, пока они не удалены вручную или ограничениями кэша. Перед закрытием дождитесь завершения импорта, добавления аудиофайлов и операций с кэшем. Пакетную нормализацию можно остановить после текущего файла. Если при выходе не удалось сохранить данные синтеза, статусы обработки, настройки или проект, окно останется открытым: устраните причину ошибки и повторите закрытие.
+• Если сохранение не удалось после обычной остановки синтеза, несохранённые данные остаются в памяти приложения. Восстановите доступ к папке или освободите место на диске; следующий запуск синтеза или повторная попытка выхода повторит запись данных.
 
 ====================================================================
 📁 12. ОСОБЕННОСТИ РАБОТЫ НА РАЗНЫХ ОС
@@ -37662,6 +39037,8 @@ API Token нужен для создания новых речевых фраг�
 • Программа запоминает последние открытые папки для каждого поля и предлагает папку текущего проекта, если поле пустое.
 """
 
+        # Длинный текстовый разделитель не помещается при крупном шрифте.
+        help_text = help_text.replace("=" * 68, "=" * 40)
         self.help_text_widget.insert(tk.END, help_text)
         self.help_text_widget.config(state=tk.DISABLED)
 
@@ -38012,7 +39389,7 @@ API Token нужен для создания новых речевых фраг�
         )
 
     def _current_source_m4b_template(self):
-        """Возвращает текущий шаблон M4B исходников для операций интерфейса.
+        """Возвращает текущий шаблон имени группы исходников.
 
         Обычный экземпляр приложения хранит редактируемое значение в
         ``_source_plan_template``. Облегчённые/устаревшие вызывающие стороны
@@ -38562,11 +39939,11 @@ API Token нужен для создания новых речевых фраг�
         )
 
     def _source_selected_virtual_group_ids(self):
-        """Возвращает выбранные виртуальные M4B-группы в порядке дерева.
+        """Возвращает выбранные виртуальные группы в порядке дерева.
 
         В рекурсивном режиме пользователь может выбрать как строку части, так
         и один из вложенных TXT.  В последнем случае поднимаемся к ближайшей
-        виртуальной группе, но физические каталоги не считаем частью M4B-плана.
+        виртуальной группе, но физические каталоги не считаем частью плана групп.
         Дубликаты удаляются, чтобы один двойной выбор не открыл два диалога.
         """
         plan_groups = getattr(self, "_source_plan_groups", {})
@@ -39051,11 +40428,11 @@ API Token нужен для создания новых речевых фраг�
                 "info",
             )
         except (AttributeError, KeyError, tk.TclError, ValueError) as exc:
-            logging.exception("Не удалось разгруппировать виртуальный план M4B")
+            logging.exception("Не удалось разгруппировать виртуальный план групп")
             self._show_error("Разгруппировать", str(exc))
 
     def prepare_m4b_source_plan(self):
-        """Готовит виртуальные части M4B в дереве TXT до синтеза.
+        """Готовит виртуальные группы TXT для целевых файлов до синтеза.
 
         Фактическая длительность аудио до обращения к API неизвестна. Поэтому
         фоновый обработчик читает исходные TXT и строит только оценочный план по символам;
@@ -39076,7 +40453,7 @@ API Token нужен для создания новых речевых фраг�
             self._show_info("Пусто", "Сначала добавьте TXT-файлы в очередь.")
             return
         if getattr(self, "_source_plan_groups", {}) and not self._ask_yes_no(
-            "Заменить план M4B",
+            "Заменить план групп",
             "Новый автоматический расчёт заменит текущее ручное или оценочное "
             "разбиение. TXT на диске не изменятся. Продолжить?",
             icon="warning",
@@ -39085,7 +40462,7 @@ API Token нужен для создания новых речевых фраг�
 
         dialog = tk.Toplevel(self.root)
         dialog.withdraw()
-        dialog.title("Подготовка частей M4B")
+        dialog.title("Подготовка плана групп")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.resizable(True, True)
@@ -39094,14 +40471,15 @@ API Token нужен для создания новых речевых фраг�
             self._make_collapsible_hint(
                 dialog,
                 (
+                    "Группы используются всеми целями с режимом «Один файл». "
                     "План строится до синтеза по оценке длительности в "
                     "символах в минуту. Независимый лимит символов делит "
                     "только между целыми TXT; для деления только по нему "
                     "задайте лимит минут 0. Фактическая длительность после "
                     "озвучки может отличаться. Пустой шаблон имени означает "
-                    "только название книги без диапазона. Альбом задаётся "
-                    "одним шаблоном для всех частей, чтобы плееры видели их "
-                    "как одну книгу. Для имени доступны {book}, {name}, "
+                    "только название книги без диапазона. Для M4B альбом "
+                    "задаётся одним шаблоном для всех частей, чтобы плееры "
+                    "видели их как одну книгу. Для имени доступны {book}, {name}, "
                     "{group}, {title}, {range}, {part}, {parts}, "
                     "{first_index}, {last_index}, {first_name}, {last_name}, "
                     "{num}, {first} и {last}; при оценке {name}, {group} и "
@@ -39118,7 +40496,7 @@ API Token нужен для создания новых речевых фраг�
 
         ttk.Label(
             dialog,
-            text="Задайте границы частей и правила именования.",
+            text="Задайте границы групп и правила именования.",
             justify=tk.LEFT,
             anchor=tk.W,
         ).pack(fill=tk.X, padx=16, pady=(0, 6))
@@ -39146,7 +40524,7 @@ API Token нужен для создания новых речевых фраг�
             )
         )
 
-        ttk.Label(form, text="Лимит части (минут, 0 = без лимита):").grid(
+        ttk.Label(form, text="Лимит группы (минут, 0 = без лимита):").grid(
             row=0, column=0, sticky=tk.W, pady=3
         )
         ttk.Entry(form, textvariable=duration_var, width=10).grid(
@@ -39158,19 +40536,19 @@ API Token нужен для создания новых речевых фраг�
         ttk.Entry(form, textvariable=chars_var, width=10).grid(
             row=1, column=1, sticky=tk.W, pady=3
         )
-        ttk.Label(form, text="Макс. TXT в части (0 = без лимита):").grid(
+        ttk.Label(form, text="Макс. TXT в группе (0 = без лимита):").grid(
             row=2, column=0, sticky=tk.W, pady=3
         )
         ttk.Entry(form, textvariable=chapters_var, width=10).grid(
             row=2, column=1, sticky=tk.W, pady=3
         )
-        ttk.Label(form, text="Макс. символов в части (0 = без лимита):").grid(
+        ttk.Label(form, text="Макс. символов в группе (0 = без лимита):").grid(
             row=3, column=0, sticky=tk.W, pady=3
         )
         ttk.Entry(form, textvariable=max_chars_var, width=10).grid(
             row=3, column=1, sticky=tk.W, pady=3
         )
-        ttk.Label(form, text="Шаблон имени части:").grid(
+        ttk.Label(form, text="Шаблон имени группы:").grid(
             row=4, column=0, sticky=tk.W, pady=3
         )
         plan_name_template_row = ttk.Frame(form)
@@ -39189,10 +40567,10 @@ API Token нужен для создания новых речевых фраг�
             text="Помощник…",
             command=lambda: self._open_template_helper(
                 template_var,
-                "m4b_part",
+                "source_group",
                 owner=dialog,
                 target_entry=plan_name_template_entry,
-                title="Помощник имени M4B",
+                title="Помощник имени группы",
                 preview_data=self._template_helper_source_preview_data(),
             ),
         ).grid(row=0, column=1, padx=(6, 0))
@@ -39200,17 +40578,19 @@ API Token нужен для создания новых речевых фраг�
             self._make_collapsible_hint(
                 form,
                 (
-                    "Поля имени части: {book} — книга; {name}, {group}, "
-                    "{title} — имя текущей части; {filename} — физическое имя "
+                    "Поля имени группы: {book} — книга; {name}, {group}, "
+                    "{title} — имя текущей группы; {filename} — физическое имя "
                     "исходника; {source_name}/{source_title} — совместимые поля; "
                     "{source_title} — её исходный Title; {part}/{num}/"
-                    "{volume}/{index} — номер тома; {chapter} — первая глава; "
-                    "{parts} — всего томов; {range} — диапазон глав; "
+                    "{volume}/{index} — номер группы; {chapter} — первая глава; "
+                    "{parts} — всего групп; {range} — диапазон глав; "
                     "{first_index}/{last_index} — границы; {first_name}/"
                     "{last_name} — имена первого и последнего TXT. Обычное "
-                    ":N задаёт начальный номер, :03d — ширину. Для альбома "
-                    "доступны те же поля; стандартный {book} используется "
-                    "только при пустом теге «Альбом» в настройках."
+                    ":N задаёт начальный номер, :03d — ширину. {format} и "
+                    "{ext} сохраняют служебное значение m4b и не зависят от "
+                    "форматов вывода. Для альбома M4B доступны те же поля; "
+                    "стандартный {book} используется только при пустом теге "
+                    "«Альбом» в настройках."
                 ),
                 title="Поля шаблона",
                 wraplength=560,
@@ -39297,9 +40677,7 @@ API Token нужен для создания новых речевых фраг�
             template = template_input or SOURCE_M4B_NO_RANGE_TEMPLATE
             source_template_fields = set(SOURCE_M4B_TEMPLATE_FIELDS)
             try:
-                used_fields = validate_filename_template(
-                    template, source_template_fields
-                )
+                validate_filename_template(template, source_template_fields)
             except TemplateError as exc:
                 self._show_error("Некорректный шаблон", str(exc), parent=dialog)
                 return
@@ -39318,7 +40696,7 @@ API Token нужен для создания новых речевых фраг�
             self._source_plan_running = True
             self._set_status_label(
                 self.lbl_current_text,
-                "Подготовка оценочного плана M4B…",
+                "Подготовка плана групп…",
                 "warning",
             )
             for widget in (
@@ -39414,13 +40792,13 @@ API Token нужен для создания новых речевых фраг�
                         reflow_minutes=duration_minutes,
                     )
                 except Exception as exc:
-                    logging.exception("Не удалось подготовить план M4B")
+                    logging.exception("Не удалось подготовить план групп")
                     self._post_to_ui(self._finish_m4b_source_plan, None, None, str(exc))
 
             try:
                 threading.Thread(target=worker, daemon=True).start()
             except Exception as exc:
-                logging.exception("Не удалось запустить расчёт плана M4B")
+                logging.exception("Не удалось запустить расчёт плана групп")
                 self._finish_m4b_source_plan(
                     None, None, f"Не удалось запустить расчёт: {exc}"
                 )
@@ -39492,12 +40870,12 @@ API Token нужен для создания новых речевых фраг�
         except tk.TclError:
             pass
 
-        # Обратные вызовы импорта и настроек могли запросить обновление, пока обработчик
-        # читал TXT. Также отклоняем изменение папки/пути, даже если
-        # обратного вызова ещё не перестроил дерево. Применить старые виртуальные
-        # идентификаторы к
-        # новому каталогу источника хуже, чем попросить пользователя подготовить план
-        # ещё раз, поэтому загружаем достоверное дерево и останавливаемся здесь.
+        # Обратные вызовы импорта и настроек могли запросить обновление, пока
+        # обработчик читал TXT. Также отклоняем изменение папки/пути, даже если
+        # обратный вызов ещё не перестроил дерево. Применять старые виртуальные
+        # идентификаторы к новому каталогу источника хуже, чем попросить
+        # пользователя подготовить план ещё раз, поэтому загружаем достоверное
+        # дерево и останавливаемся здесь.
         snapshot_changed = False
         if isinstance(plan_snapshot, dict):
             try:
@@ -39540,7 +40918,7 @@ API Token нужен для создания новых речевых фраг�
                     "Не удалось обновить список TXT после изменения папки.",
                     "error",
                 )
-                self._show_error("План M4B", str(exc))
+                self._show_error("План групп", str(exc))
                 return
             self._set_status_label(
                 self.lbl_current_text,
@@ -39556,7 +40934,7 @@ API Token нужен для создания новых речевых фраг�
         if error:
             self._set_status_label(self.lbl_current_text, "Ошибка подготовки плана.", "error")
             self._reset_source_progress_ui()
-            self._show_error("План M4B", str(error))
+            self._show_error("План групп", str(error))
             return
         if not groups:
             self._set_status_label(self.lbl_current_text, "Ожидание…", "info")
@@ -39601,15 +40979,12 @@ API Token нужен для создания новых речевых фраг�
             )
         album_template = normalize_source_m4b_album_template(album_template)
         try:
-            used_template_fields = validate_filename_template(
-                template,
-                source_template_fields,
-            )
+            validate_filename_template(template, source_template_fields)
         except TemplateError as exc:
             self._set_status_label(
-                self.lbl_current_text, "Ошибка шаблона плана M4B.", "error"
+                self.lbl_current_text, "Ошибка шаблона плана групп.", "error"
             )
-            self._show_error("План M4B", str(exc))
+            self._show_error("План групп", str(exc))
             self._reset_source_progress_ui()
             return
         try:
@@ -39618,7 +40993,7 @@ API Token нужен для создания новых речевых фраг�
             self._set_status_label(
                 self.lbl_current_text, "Ошибка шаблона альбома M4B.", "error"
             )
-            self._show_error("План M4B", str(exc))
+            self._show_error("План групп", str(exc))
             self._reset_source_progress_ui()
             return
         planned_names = []
@@ -39650,8 +41025,11 @@ API Token нужен для создания новых речевых фраг�
                 "title": book_name,
                 "source_name": book_name,
                 "source_title": book_name,
+                "filename": first_name,
                 "num": index,
                 "index": index,
+                "group_index": index,
+                "file_index": 1,
                 "chapter": first_index,
                 "chapter_count": total_chapters,
                 "part": index,
@@ -39678,9 +41056,9 @@ API Token нужен для создания новых речевых фраг�
             except TemplateError as exc:
                 logging.error("Некорректный шаблон плана M4B: %s", exc)
                 self._set_status_label(
-                    self.lbl_current_text, "Ошибка шаблона плана M4B.", "error"
+                    self.lbl_current_text, "Ошибка шаблона плана групп.", "error"
                 )
-                self._show_error("План M4B", str(exc))
+                self._show_error("План групп", str(exc))
                 return
             # Значение используется как подпись виртуальной группы дерева, а затем как
             # базовое имя планировщиком вывода. Пользователи часто включают
@@ -39689,7 +41067,7 @@ API Token нужен для создания новых речевых фраг�
             # в ``Книга.m4b.m4b``. Остальные точки остаются частью имени.
             group_name = _template_basename(group_name, "m4b").strip()
             if not group_name:
-                group_name = f"M4B часть {index}"
+                group_name = f"Группа {index}"
             # Компактный статический шаблон (например, ``{book}``) допустим для
             # одного тома, но после разбиения сделал бы все части одинаковыми.
             # Сохраняем написание пользователя и добавляем тот же детерминированный
@@ -39703,7 +41081,7 @@ API Token нужен для создания новых речевых фраг�
                 group_name = _append_m4b_part_suffix(
                     group_name,
                     template_context,
-                    fallback="M4B часть",
+                    fallback="Группа",
                 )
             rebuild_override = group_overrides.get(
                 tuple(str(file_id) for file_id in group_file_ids),
@@ -39805,7 +41183,7 @@ API Token нужен для создания новых речевых фраг�
             self.tree.insert(
                 "", tk.END, iid=group_id, text=group_name,
                 values=(
-                    "🧩 План M4B",
+                    "📁 Группа",
                     (
                         f"≈ {self.format_duration(duration)}"
                         if estimate_known
@@ -39841,7 +41219,7 @@ API Token нужен для создания новых речевых фраг�
 
         self.tree.configure(show="tree headings", displaycolumns=("status",))
         try:
-            self.tree.heading("#0", text="План / файл")
+            self.tree.heading("#0", text="Группа / файл")
         except tk.TclError:
             pass
         selected_now = self.tree.selection()
@@ -39852,14 +41230,13 @@ API Token нужен для создания новых речевых фраг�
         total_estimate = sum(estimate_for(file_id) for file_id in current_ids)
         if all_estimates_known:
             text = (
-                f"Готово: {len(groups)} частей M4B, оценка "
-                f"{self.format_duration(total_estimate)}. Фактическая длительность "
-                "уточнится после синтеза."
+                f"Готово: {len(groups)} групп, оценка "
+                f"{self.format_duration(total_estimate)}."
             )
         else:
             text = (
-                f"Готово: {len(groups)} виртуальных частей M4B. "
-                "Фактическая длительность уточнится после синтеза."
+                f"Готово: {len(groups)} групп. "
+                "Оценка длительности неполная."
             )
         self._set_status_label(self.lbl_current_text, text, "info")
         if unreadable:
@@ -39870,6 +41247,11 @@ API Token нужен для создания новых речевых фраг�
             )
 
     def load_files(self, *, reset_session=False):
+        if getattr(self, "batch_processor", None) is not None:
+            # Импорт/сброс настроек может запросить перечитывание источников,
+            # пока обработчик ещё публикует статусы строк текущего дерева.
+            self._source_reload_after_processing = True
+            return
         if getattr(self, "_source_plan_running", False):
             # Обратные вызовы импорта и настроек доставляются через цикл событий Tk,
             # пока обработчик оценки читает TXT. Не отбрасываем молча обновление:
@@ -39993,6 +41375,12 @@ API Token нужен для создания новых речевых фраг�
             self.config["input_dir"] = DEFAULT_INPUT_DIR
             self.ensure_dirs(keys=("input_dir",))
             input_dir = Path(self.config["input_dir"])
+            input_var = getattr(self, "settings_vars", {}).get("input_dir")
+            if input_var is not None:
+                try:
+                    input_var.set(str(input_dir))
+                except (AttributeError, tk.TclError):
+                    pass
             self.txt_files = sorted(
                 (
                     path
@@ -40024,6 +41412,7 @@ API Token нужен для создания новых речевых фраг�
                 self.load_files(reset_session=True)
                 return
         self._restoring_source_session = False
+        self._sync_source_session_audio()
         self._schedule_source_session_save()
 
         # Сброс прогресс-баров
@@ -40039,6 +41428,7 @@ API Token нужен для создания новых речевых фраг�
         except (AttributeError, tk.TclError):
             pass
         self._set_status_label(self.lbl_current_text, "Ожидание...", "info")
+        self._source_reload_after_processing = False
 
     def remove_selected_from_queue(self):
         if getattr(self, "_source_plan_running", False):
@@ -40100,6 +41490,7 @@ API Token нужен для создания новых речевых фраг�
         self.txt_files = list(
             getattr(self, "_source_path_by_id", {}).values()
         )
+        self._sync_source_session_audio()
 
         if had_virtual_plan:
             self._source_plan_dirty = True
@@ -40165,9 +41556,14 @@ API Token нужен для создания новых речевых фраг�
     def update_file_status(self, filename, status_code, output_format=None):
         if not self.tree.exists(filename):
             return
+        if status_code == "waiting" and getattr(
+            getattr(self, "batch_processor", None), "is_stopped", False
+        ):
+            status_code = "queued"
         status_map = {
             "processing": ("🔄 Синтез...", "processing"),
-            "waiting": ("⏳ Ожидание сборки...", "processing"),
+            "preparing": ("🔄 Подготовка...", "processing"),
+            "waiting": (SOURCE_WAITING_STATUS_TEXT, "processing"),
             "encoding": (
                 format_synthesis_encoding_status(output_format),
                 "processing",
@@ -40181,12 +41577,9 @@ API Token нужен для создания новых речевых фраг�
         text, tag = status_map.get(status_code, ("?", "queued"))
         old_values = self.tree.item(filename, "values")
         old_tags = self.tree.item(filename, "tags")
-        # Строки виртуального плана M4B используют второй столбец для оценочной
-        # длительности (``≈ 01:20:00``), а не для имени файла. Повторное использование общего
-        # формата ``(status, filename)`` заменило бы это полезное значение
-        # внутренним идентификатором ``m4b_plan:…`` сразу после запуска заключительного этапа.
-        # Сохраняем существующее отображаемое значение для этих строк, а листья
-        # оставляем с историческим столбцом имени файла.
+        # У виртуальных групп второй столбец содержит оценочную длительность,
+        # а не имя файла. Обновление статуса должно сохранить это значение,
+        # не заменяя его внутренним идентификатором группы.
         display_name = filename
         if (
             filename in getattr(self, "_source_group_ids", set())
@@ -40211,21 +41604,82 @@ API Token нужен для создания новых речевых фраг�
             if getattr(self, 'auto_scroll_var', None) and self.auto_scroll_var.get():
                 self.scroll_to_current()
 
-    def scroll_to_current(self):
-        """Центрирует текущий обрабатываемый файл в таблице"""
-        if not hasattr(self, 'current_processing_file') or not self.current_processing_file:
+    def _apply_initial_source_statuses(self, processor, statuses, offset=0):
+        """Показывает проверенные готовые выводы до обхода TXT.
+
+        Снимок строится в рабочем потоке. Поэтому к моменту отрисовки у строки
+        уже может быть более новое событие (например, реальный промах кэша), а
+        сам запуск может быть завершён. В обоих случаях старый снимок не должен
+        возвращать строку в зелёное состояние. Большая книга обновляется
+        небольшими порциями, чтобы один обратный вызов не занимал цикл Tk.
+        """
+        if hasattr(self, "batch_processor") and self.batch_processor is not processor:
             return
 
-        if self.tree.exists(self.current_processing_file):
-            children = self.tree.get_children("")
+        tree = getattr(self, "tree", None)
+        statuses = tuple(statuses)
+        start = max(0, int(offset))
+        chunk_size = 96
+        end = min(len(statuses), start + chunk_size)
+        for item_id, status in statuses[start:end]:
+            if tree is None:
+                self.update_file_status(item_id, status)
+                continue
             try:
-                idx = children.index(self.current_processing_file)
-                total = len(children)
-                # Отнимаем 8 позиций, чтобы элемент оказался примерно посередине видимой области
-                target_idx = max(0, idx - 8)
-                self.tree.yview_moveto(target_idx / total)
-            except ValueError:
-                self.tree.see(self.current_processing_file)
+                if not tree.exists(item_id):
+                    continue
+                tags = tuple(tree.item(item_id, "tags") or ())
+            except (AttributeError, tk.TclError, TypeError):
+                continue
+            # Не затираем более новое состояние текущего запуска. В штатном
+            # начале строки имеют queued/success; processing/warning/error уже
+            # принадлежат более позднему событию.
+            if tags and tags[0] not in {"queued", "success"}:
+                continue
+            self.update_file_status(item_id, status)
+
+        if end < len(statuses):
+            root = getattr(self, "root", None)
+            if root is not None:
+                try:
+                    root.after(
+                        1,
+                        self._apply_initial_source_statuses,
+                        processor,
+                        statuses,
+                        end,
+                    )
+                except (AttributeError, tk.TclError):
+                    pass
+
+    def _on_source_tree_map(self, event):
+        if (
+            event.widget is self.tree
+            and getattr(self, "current_processing_file", None)
+            and getattr(self, "auto_scroll_var", None)
+            and self.auto_scroll_var.get()
+        ):
+            self.tree.after_idle(self.scroll_to_current)
+
+    def scroll_to_current(self):
+        """Раскрывает текущий файл и помещает его в центр видимой области."""
+        current = getattr(self, "current_processing_file", None)
+        if not current or not self.tree.exists(current):
+            return
+
+        # Treeview.see() раскрывает все родительские группы и делает строку
+        # видимой; её координаты после этого учитывают фактическую структуру дерева.
+        self.tree.see(current)
+        self.tree.update_idletasks()
+        bounds = self.tree.bbox(current)
+        if bounds:
+            _, y, _, row_height = bounds
+            if row_height:
+                viewport_middle = self.tree.winfo_height() / 2
+                row_middle = y + row_height / 2
+                rows_to_scroll = round((row_middle - viewport_middle) / row_height)
+                if rows_to_scroll:
+                    self.tree.yview_scroll(rows_to_scroll, "units")
 
     def _validate_book_output_profile(self):
         try:
@@ -40241,13 +41695,28 @@ API Token нужен для создания новых речевых фраг�
             return False
 
     def _confirm_prepared_text_run(self):
+        mode = self.config.get("synthesis_mode", "sentence")
+        pauses = {
+            "sentence": (
+                "Действуют паузы между предложениями и абзацами, перед "
+                "репликой или мыслью и после двоеточия."
+            ),
+            "paragraph": (
+                "Действуют паузы между абзацами, перед репликой или мыслью "
+                "и после двоеточия. Ритм внутри абзаца определяет Silero."
+            ),
+            "full": (
+                "Заданные паузы действуют на разделителях и границах больших "
+                "блоков. Ритм внутри блока определяет Silero."
+            ),
+        }.get(mode, "Паузы применяются по выбранному режиму синтеза.")
         return self._ask_yes_no(
             "Текст уже подготовлен",
             "Для этого запуска Studio пропустит пользовательские RegEx, "
             "глоссарий, автообработку, ru-normalizr и финальную очистку.\n\n"
             "Используйте режим только для уже нормализованного текста после "
-            "внешней расстановки ударений. Строки-разделители и текущие "
-            "настройки пауз продолжат действовать. Продолжить?",
+            "внешней расстановки ударений. Строки-разделители и паузы в начале "
+            "и конце файла продолжат действовать. " + pauses + " Продолжить?",
             icon="warning",
         )
 
@@ -40285,6 +41754,143 @@ API Token нужен для создания новых речевых фраг�
             return False
         return self.save_glossary_ui(show_popup=False)
 
+    def _observe_cache_warning_policy(self, config):
+        """Сбрасывает согласие при изменении действующей политики кэша."""
+        signature = cache_policy_signature(config)
+        if signature != getattr(self, "_cache_warning_policy_signature", None):
+            self._cache_warning_policy_signature = signature
+            self._cache_warning_accepted_policy = None
+        return signature
+
+    def _refresh_cache_policy_hint(self, *_args):
+        """Показывает последствия выбранных ограничений сразу при редактировании."""
+        config = dict(self.config)
+        for key in (
+            "use_cache", "enable_cache_lru", "enable_cache_ttl",
+            "cache_max_entries", "cache_ttl_hours",
+        ):
+            try:
+                config[key] = self.settings_vars[key].get()
+            except (KeyError, tk.TclError):
+                pass
+        self._observe_cache_warning_policy(config)
+        text = cache_policy_resume_notice(config)
+        self.lbl_cache_policy_hint.configure(text=text)
+        if text:
+            self.lbl_cache_policy_hint.grid()
+        else:
+            self.lbl_cache_policy_hint.grid_remove()
+
+    def _open_cache_settings(self):
+        """Открывает ограничения кэша, сохраняя выбранные пользователем значения."""
+        self.notebook.select(self.tab_settings)
+        self.settings_notebook.select(self._cache_settings_page)
+        self.settings_notebook.focus_set()
+        self._schedule_focus_after_messagebox(self.settings_notebook)
+
+    def _ask_cache_policy_action(self, notice):
+        """Даёт продолжить запуск, перейти к настройкам кэша или отменить его."""
+        previous_focus = self.root.focus_get()
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title("Возможен повторный синтез")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        width = max(360, min(560, self.root.winfo_screenwidth() - 40))
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            body, text=notice, justify=tk.LEFT, wraplength=width - 32,
+        ).pack(fill=tk.X)
+        ttk.Label(
+            body,
+            text="В текущем запуске одна и та же речь используется всеми форматами "
+            "без повторных запросов на каждый формат. Готовые аудиофайлы сохраняются.",
+            justify=tk.LEFT, wraplength=width - 32,
+        ).pack(fill=tk.X, pady=(12, 0))
+        ttk.Label(
+            body,
+            text="Для сохранения речи между запусками можно использовать "
+            "постоянный кэш без ограничений LRU/TTL. "
+            "Это займёт больше места на диске.",
+            justify=tk.LEFT, wraplength=width - 32,
+        ).pack(fill=tk.X, pady=(12, 0))
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X, pady=(16, 0))
+        result = {"action": "cancel"}
+
+        def choose(action):
+            result["action"] = action
+            self._close_popup_safely(dialog)
+
+        for index, (label, action) in enumerate((
+            ("Продолжить", "continue"),
+            ("Настройки кэша…", "settings"),
+            ("Отмена", "cancel"),
+        )):
+            button = ttk.Button(buttons, text=label, command=lambda action=action: choose(action))
+            button.bind("<Return>", lambda _event, action=action: choose(action))
+            if width < 440:
+                button.grid(row=index, column=0, sticky=tk.EW, pady=3)
+                buttons.columnconfigure(0, weight=1)
+            else:
+                button.grid(row=0, column=index, sticky=tk.EW, padx=(0 if index == 0 else 8, 0))
+                buttons.columnconfigure(index, weight=1)
+            if action == "cancel":
+                cancel_button = button
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+        dialog.bind("<Escape>", lambda _event: choose("cancel"))
+        dialog.update_idletasks()
+        self._center_popup(dialog, width, dialog.winfo_reqheight(), fit_screen=True)
+        dialog.grab_set()
+        cancel_button.focus_set()
+        try:
+            self.root.wait_window(dialog)
+        except tk.TclError:
+            result["action"] = "cancel"
+        finally:
+            self._close_popup_safely(dialog)
+            # При переходе к настройкам фокус выбирает новая вкладка: возврат
+            # к прежнему виджету очереди перебил бы её клавиатурную навигацию.
+            if result["action"] != "settings":
+                self._schedule_focus_after_messagebox(previous_focus)
+        return result["action"]
+
+    def _confirm_source_cache_policy(self, config, skip_existing):
+        """Предупреждает перед сборкой групп без гарантии сохранения речи."""
+        signature = self._observe_cache_warning_policy(config)
+        notice = cache_policy_resume_notice(config)
+        if not notice or signature == getattr(self, "_cache_warning_accepted_policy", None):
+            return True
+        if not any(record.get("kind") in {"group", "m4b"}
+                   for record in config.get("source_target_records", ())):
+            return True
+        statuses = getattr(self, "_shared_processing_statuses", None)
+        cache_dir = Path(config.get("cache_dir", DEFAULT_CACHE_DIR)).expanduser().resolve()
+        if isinstance(statuses, dict) and getattr(self, "_shared_cache_dir", None) == cache_dir:
+            statuses = statuses.copy()
+        else:
+            # Для подтверждения нужен только небольшой журнал неуспешных выходов.
+            # TXT и индекс речевых фрагментов здесь не читаются.
+            try:
+                with (APP_DATA_DIR / "processing_statuses.json").open(encoding="utf-8") as stream:
+                    loaded = json.load(stream)
+                statuses = loaded if isinstance(loaded, dict) else None
+            except FileNotFoundError:
+                statuses = {}
+            except (OSError, ValueError):
+                statuses = None
+        if not source_groups_need_synthesis(config, skip_existing, statuses):
+            return True
+        action = self._ask_cache_policy_action(notice)
+        if action == "settings":
+            self._open_cache_settings()
+            return False
+        if action != "continue":
+            return False
+        self._cache_warning_accepted_policy = signature
+        return True
+
     def start_processing(self, only_selected=False):
         if self.batch_processor is not None or getattr(self, "_source_plan_running", False):
             return
@@ -40304,6 +41910,12 @@ API Token нужен для создания новых речевых фраг�
         if not self._validate_api_steps_ui():
             return
         self.save_settings()
+        loaded_source_dir = getattr(self, "_source_session_input_dir", None)
+        if loaded_source_dir is not None and (
+            Path(self.config.get("input_dir", DEFAULT_INPUT_DIR)).expanduser().resolve()
+            != loaded_source_dir
+        ):
+            self.load_files()
         self._check_source_session_changes()
         if not self._validate_book_output_profile():
             return
@@ -40315,23 +41927,7 @@ API Token нужен для создания новых речевых фраг�
 
         # Определяем, какие файлы отправлять на синтез
         if only_selected:
-            selected_ids = self.tree.selection()
-            # Родитель и один из его потомков могут быть выбраны одновременно в
-            # ``ttk.Treeview``. Сохраняем порядок отображения при удалении дубликатов, чтобы
-            # глава никогда не отправлялась в API дважды.
-            seen_ids = set()
-            ordered_ids = []
-            for selected_id in selected_ids:
-                candidates = (
-                    [selected_id]
-                    if selected_id in getattr(self, "_source_path_by_id", {})
-                    else self._source_tree_file_ids(selected_id)
-                )
-                for file_id in candidates:
-                    if file_id not in seen_ids:
-                        seen_ids.add(file_id)
-                        ordered_ids.append(file_id)
-            items_to_process = tuple(ordered_ids)
+            items_to_process = self._selected_source_file_ids()
         else:
             items_to_process = tuple(self._source_tree_file_ids())
 
@@ -40631,6 +42227,9 @@ API Token нужен для создания новых речевых фраг�
         processing_config["source_plan_revision"] = getattr(
             self, "_source_plan_revision", 0
         )
+        skip_existing = bool(self.settings_vars["skip_existing"].get())
+        if not self._confirm_source_cache_policy(processing_config, skip_existing):
+            return
         prepared_text = bool(self.batch_prepared_text_var.get())
         if prepared_text and not self._confirm_prepared_text_run():
             return
@@ -40666,7 +42265,6 @@ API Token нужен для создания новых речевых фраг�
         self._batch_hard_stop_requested = False
 
         processing_config["text_is_prepared"] = prepared_text
-        skip_existing = bool(self.settings_vars["skip_existing"].get())
         try:
             processor = self._create_synthesis_processor(processing_config)
         except Exception as exc:
@@ -40695,6 +42293,7 @@ API Token нужен для создания новых речевых фраг�
             self._show_error("Ошибка", f"Не удалось подготовить синтез:\n{exc}")
             return
         self._source_run_has_m4b = source_has_m4b
+        processor._session_audio_full_run = full_source_run
         self.batch_processor = processor
         self.processor = processor
         self.processing_thread = threading.Thread(
@@ -40705,6 +42304,7 @@ API Token нужен для создания новых речевых фраг�
         try:
             self.processing_thread.start()
         except Exception as exc:
+            processor.cleanup_transient_audio_files()
             self.processing_thread = None
             self.batch_processor = None
             self._source_run_has_m4b = False
@@ -40740,6 +42340,7 @@ API Token нужен для создания новых речевых фраг�
     def stop_processing(self):
         if self.batch_processor:
             self.batch_processor.is_stopped = True
+            self._reset_pending_source_rows(waiting_only=True)
             # Снимок делается в фоновом потоке, чтобы большой JSON не подвешивал Tk.
             processor = self.batch_processor
             threading.Thread(
@@ -40750,9 +42351,11 @@ API Token нужен для создания новых речевых фраг�
         self._set_status_label(self.lbl_current_text, "Остановка (ожидание завершения текущего запроса)...", "warning")
 
     def hard_stop_processing(self):
+        processor = self.batch_processor
         if self.batch_processor:
-            processor = self.batch_processor
-            processor.stop()  # Закрывает сокеты; JSON пишет фоновый обработчик.
+            # Сигнал остановки и освобождение HTTP-пула; JSON пишет обработчик.
+            processor.stop()
+            self._reset_pending_source_rows(waiting_only=True)
             threading.Thread(
                 target=processor.flush_cache,
                 daemon=True,
@@ -40766,23 +42369,31 @@ API Token нужен для создания новых речевых фраг�
 
         self._set_status_label(
             self.lbl_current_text,
-            "Принудительно остановлено. Кэш сохраняется...",
+            "Принудительная остановка... " + cache_stop_notice(
+                getattr(processor, "cfg", getattr(self, "config", {})),
+                finalized=False,
+            ),
             "error",
         )
+        self._render_source_status_before_alert()
         self._show_warning(
             "Принудительная остановка",
-            "Процесс прерван. Текущее предложение не завершено; "
-            "накопленный кэш сохраняется в фоне.",
+            "Команда остановки передана. Уже выполняющийся запрос может "
+            "завершиться.\n\n"
+            + cache_stop_notice(
+                getattr(processor, "cfg", getattr(self, "config", {})),
+                finalized=False,
+            ),
         )
 
-    def _reset_pending_source_rows(self):
+    def _reset_pending_source_rows(self, *, waiting_only=False):
         """Возвращает незавершённые строки синтеза из исходников в очередь.
 
-        M4B — заключительный этап: при остановке сборка глав намеренно не запускается,
-        поэтому строки TXT и виртуальной части могли остаться в состоянии
+        При остановке оставшиеся сборки не запускаются, поэтому строки TXT
+        и виртуальных групп могли остаться в состоянии
         ``processing``. Успешные строки не трогаем — они остаются полезной
-        диагностикой для продолжения, а только незавершённые получают обычный
-        стартовый статус.
+        диагностикой для продолжения. При запросе остановки переводим только
+        ожидающие строки: активная работа ещё может завершиться успешно.
         """
         tree = getattr(self, "tree", None)
         if tree is None:
@@ -40798,7 +42409,14 @@ API Token нужен для создания новых речевых фраг�
                     tags = tuple(tree.item(item_id, "tags") or ())
                 except (AttributeError, tk.TclError, TypeError):
                     tags = ()
-                if "processing" in tags:
+                should_queue = "processing" in tags
+                if should_queue and waiting_only:
+                    try:
+                        values = tree.item(item_id, "values") or ()
+                        should_queue = bool(values) and values[0] == SOURCE_WAITING_STATUS_TEXT
+                    except (AttributeError, tk.TclError, TypeError, IndexError):
+                        should_queue = False
+                if should_queue:
                     try:
                         self.update_file_status(item_id, "queued")
                     except (AttributeError, tk.TclError):
@@ -40806,6 +42424,15 @@ API Token нужен для создания новых речевых фраг�
                 walk(item_id)
 
         walk()
+
+    def _render_source_status_before_alert(self):
+        """Перерисовывает статусы до блокирующего системного сообщения."""
+        root = getattr(self, "root", None)
+        if root is not None:
+            try:
+                root.update_idletasks()
+            except (AttributeError, tk.TclError):
+                pass
 
     def _reset_source_progress_ui(self):
         """Сбрасывает индикаторы синтеза из исходников после остановки или обновления."""
@@ -40821,9 +42448,8 @@ API Token нужен для создания новых речевых фраг�
             if widget is not None:
                 try:
                     if widget_name == "file_progress":
-                        # Заключительный этап M4B использует неопределённый индикатор, пока
-                        # работает FFmpeg. При сбросе всегда останавливаем эту анимацию и
-                        # восстанавливаем обычный определённый режим.
+                        # Сбрасываем возможную анимацию и возвращаем
+                        # определённый режим перед следующим запуском.
                         widget.stop()
                         widget.configure(mode="determinate", maximum=100)
                         self._source_file_progress_indeterminate = False
@@ -40849,13 +42475,10 @@ API Token нужен для создания новых речевых фраг�
                 pass
 
     def _set_source_file_progress_indeterminate(self, active):
-        """Переключает анимацию M4B-фазы без сброса текущего значения.
+        """Управляет анимацией индикатора без сброса текущего значения.
 
-        Заключительный этап M4B не имеет достоверного процента на уровне байтов.
-        Поэтому его обратный вызов прогресса использует ``-1`` и запускает
-        неопределённую анимацию. Этот небольшой помощник также вызывается из
-        конечного обратного вызова, чтобы неудачный или пропущенный запуск не оставлял
-        работающую анимацию после показа модального сообщения с результатом.
+        После завершения очереди останавливает возможную анимацию до показа
+        модального сообщения. Этап M4B обычно обновляет только текст статуса.
         """
         active = bool(active)
         progressbar = getattr(self, "file_progress", None)
@@ -40904,6 +42527,13 @@ API Token нужен для создания новых речевых фраг�
         if processor is not self.batch_processor:
             return
 
+        persistence_failed = getattr(processor, "_persistence_failed", False) is True
+        if persistence_failed:
+            self._retain_unsaved_synthesis_processor(processor)
+        if (not queue_failed and not persistence_failed and not processor.is_stopped
+                and getattr(processor, "_session_audio_full_run", False) is True):
+            self._discard_processor_session_audio(processor)
+
         self.btn_start_all.config(state=tk.NORMAL)
         self.btn_start_sel.config(state=tk.NORMAL)
         self.btn_refresh.config(state=tk.NORMAL)
@@ -40942,11 +42572,33 @@ API Token нужен для создания новых речевых фраг�
             self._reset_pending_source_rows()
             self._reset_source_progress_ui()
             if getattr(self, "_batch_hard_stop_requested", False):
-                message = "Принудительно остановлено. Кэш сохранен."
+                message = "Принудительно остановлено. " + cache_stop_notice(
+                    getattr(processor, "cfg", getattr(self, "config", {})),
+                    finalized=True,
+                )
             else:
                 message = "Обработка была прервана."
-            self._set_status_label(self.lbl_current_text, "Ожидание...", "info")
-            self._show_warning("Остановлено", message)
+            self._set_status_label(
+                self.lbl_current_text,
+                "Ошибка сохранения. Данные остаются в памяти."
+                if persistence_failed else "Ожидание...",
+                "error" if persistence_failed else "info",
+            )
+            self._render_source_status_before_alert()
+            if persistence_failed:
+                self._show_error(
+                    "Ошибка сохранения", self._synthesis_save_failure_message()
+                )
+            else:
+                self._show_warning("Остановлено", message)
+        elif persistence_failed:
+            self._set_status_label(
+                self.lbl_current_text,
+                "Ошибка сохранения. Данные остаются в памяти.", "error",
+            )
+            self._show_error(
+                "Ошибка сохранения", self._synthesis_save_failure_message()
+            )
         elif queue_failed:
             self._set_status_label(self.lbl_current_text, "Обработка завершилась с ошибкой.", "error")
             self._show_error("Ошибка", "Очередь синтеза завершилась с ошибкой. Подробности записаны в лог.")
@@ -40975,9 +42627,17 @@ API Token нужен для создания новых речевых фраг�
             self.processor = self.direct_processor
         self._release_shared_cache_if_idle()
         self._save_source_session()
+        if getattr(self, "_source_reload_after_processing", False):
+            self._source_reload_after_processing = False
+            try:
+                self.load_files()
+            except Exception:
+                self._source_reload_after_processing = True
+                logging.exception("Не удалось обновить папку источников после синтеза")
 
     def process_queue(self, processor, items_to_process, processing_config, skip_existing):
         queue_failed = False
+        processor._persistence_failed = False
         cache_eviction_deferred = False
         source_m4b_pipeline_queue = None
         source_m4b_pipeline_threads = []
@@ -41217,17 +42877,10 @@ API Token нужен для создания новых речевых фраг�
 
             def source_target_done(record):
                 """Возвращает, завершён ли один запланированный вывод так, чтобы его можно было возобновить."""
-                try:
-                    path = Path(record.get("path", "")).expanduser()
-                except (TypeError, ValueError, OSError):
-                    return False
-                if not path.is_file():
-                    return False
-                if record.get("kind") == "m4b" and m4b_target_needs_rebuild(record):
-                    return False
-                statuses = getattr(processor, "processing_statuses_ram", {})
-                key = str(path.resolve())
-                return statuses.get(key, "success") == "success"
+                return source_output_file_is_ready(
+                    record, getattr(processor, "processing_statuses_ram", {}),
+                    rebuild=record.get("kind") == "m4b" and m4b_target_needs_rebuild(record),
+                )
 
             # Обычная склейка использует фиксированные границы группы. Ей не
             # нужны измерение длительности, главы или переразбиение M4B.
@@ -41384,6 +43037,42 @@ API Token нужен для создания новых речевых фраг�
                     "source_virtual_group_ids", ()
                 )
             }
+            initial_ready_regular = set()
+            initial_ready_group = set()
+            initial_ready_m4b = set()
+            if source_target_mode:
+                initial_ready_regular = {
+                    id(record) for record in planned_source_targets
+                    if record.get("kind") == "file"
+                    and skip_existing
+                    and not regular_target_needs_rebuild(record)
+                    and source_target_done(record)
+                }
+                initial_ready_group = {
+                    id(record) for record in source_merged_records
+                    if skip_existing
+                    and not regular_target_needs_rebuild(record)
+                    and source_target_done(record)
+                }
+                initial_ready_m4b = {
+                    id(record) for record in source_m4b_records
+                    if skip_existing
+                    and not source_m4b_duration_pass_enabled
+                    and not m4b_target_needs_rebuild(record)
+                    and source_target_done(record)
+                    and id(record) not in m4b_records_changed_by_regular_targets
+                }
+            # В режиме черновой AAC-подготовки готовые тома можно исключить
+            # до обхода глав. Кэшируем это решение один раз: проверка пути и
+            # статуса не должна повторяться для каждого TXT большой книги.
+            draft_ready_m4b = {
+                id(record)
+                for record in source_m4b_records
+                if source_m4b_pipeline_draft_mode
+                and skip_existing
+                and id(record) not in m4b_records_changed_by_regular_targets
+                and source_target_done(record)
+            }
             source_m4b_pipeline_submitted = set()
             source_m4b_pipeline_status_lock = threading.Lock()
             source_m4b_pipeline_schedule_lock = threading.Lock()
@@ -41471,10 +43160,23 @@ API Token нужен для создания новых речевых фраг�
                 # Незавершённая задача остаётся активной для штатного возврата
                 # в очередь в finish_processing; ранее записанные ошибки других
                 # задач сохраняются в журнале.
-                source_output_status.update([
-                    (task_id, "pending" if processor.is_stopped and status == "error" else status)
-                    for task_id, status in statuses
-                ])
+                normalized_statuses = []
+                for task_id, status in statuses:
+                    if processor.is_stopped and status == "error":
+                        status = "pending"
+                        if task_id[0] == "source":
+                            own_records = source_target_records_by_file.get(task_id[1], ())
+                            # Повторный сбор речи для незавершённой группы не
+                            # отменяет готовность ранее записанных глав. Новые
+                            # или изменённые выходы сохраняют ожидание сборки.
+                            if own_records and all(
+                                id(record) in initial_ready_regular
+                                and source_target_done(record)
+                                for record in own_records
+                            ):
+                                status = "success"
+                    normalized_statuses.append((task_id, status))
+                source_output_status.update(normalized_statuses)
 
             def output_status_registration(record, status="pending"):
                 if record.get("kind") in {"group", "m4b"}:
@@ -41509,12 +43211,44 @@ API Token нужен для создания новых речевых фраг�
                     for record in records
                 }
                 for item_id in items_to_process:
-                    source_output_status.register(("source", str(item_id)), (item_id,))
+                    own_records = source_target_records_by_file.get(str(item_id), ())
+                    if own_records:
+                        ready = all(
+                            id(record) in initial_ready_regular
+                            for record in own_records
+                        )
+                    else:
+                        # При режиме только групп у TXT нет собственной цели.
+                        # Если все связанные групповые выводы уже записаны, строку
+                        # можно восстановить сразу; иначе она станет готовой после
+                        # обычного сбора кэша и проверки группы.
+                        related_records = (
+                            *source_group_records_by_file.get(str(item_id), ()),
+                            *source_m4b_records_by_file.get(str(item_id), ()),
+                        )
+                        ready = bool(related_records) and all(
+                            id(record) in initial_ready_group
+                            or id(record) in initial_ready_m4b
+                            for record in related_records
+                        )
+                    source_output_status.register(
+                        ("source", str(item_id)), (item_id,),
+                        status="success" if ready else "pending",
+                    )
                 for record in planned_source_targets:
                     status = "pending"
                     if record.get("kind") == "group" and id(record) not in pending_groups:
                         status = "success"
+                    elif id(record) in initial_ready_regular or id(record) in initial_ready_m4b:
+                        status = "success"
                     source_output_status.register(*output_status_registration(record, status))
+                completed_rows = source_output_status.initial_completed_rows()
+                if completed_rows:
+                    self._post_to_ui(
+                        self._apply_initial_source_statuses,
+                        processor,
+                        completed_rows,
+                    )
 
             def finish_regular_records(records, aggregate, final_status, source_status="success"):
                 results = {
@@ -41786,7 +43520,7 @@ API Token нужен для создания новых речевых фраг�
                         if (
                             source_m4b_pipeline_draft_mode
                             and skip_existing
-                            and source_target_done(record)
+                            and record_key in draft_ready_m4b
                             and record_key not in m4b_records_changed_by_regular_targets
                         ):
                             # При восстановлении соседнего тома готовому M4B
@@ -42002,7 +43736,9 @@ API Token нужен для создания новых речевых фраг�
                     # пропуска одного вывода после этой предварительной проверки. Набор целей
                     # может содержать несколько форматов/каталогов, поэтому каждое
                     # назначение независимо обрабатывается цепочкой целей.
-                    update_source_output_status([(("source", item_key), "processing")])
+                    ready_own_outputs = bool(target_records) and not pending_target_records
+                    if not ready_own_outputs:
+                        update_source_output_status([(("source", item_key), "preparing")])
 
                     if not filepath.exists():
                         publish_source_audio(item_key, ())
@@ -42022,6 +43758,7 @@ API Token нужен для создания новых речевых фраг�
 
                     last_progress_post = 0.0
                     last_progress_value = None
+                    synthesis_started = False
 
                     def source_on_progress(current, total, text):
                         nonlocal last_progress_post, last_progress_value
@@ -42035,20 +43772,42 @@ API Token нужен для создания новых речевых фраг�
                         last_progress_post = now
                         last_progress_value = pct
                         self._post_to_ui(
-                            self.update_progress_ui, pct, text
+                            self.update_progress_ui,
+                            pct,
+                            None if synthesis_started else filepath.name,
+                            "Синтез" if synthesis_started else "Подготовка",
+                        )
+
+                    def source_on_request(text):
+                        nonlocal synthesis_started
+                        # После первого запроса весь текущий TXT остаётся
+                        # на стадии синтеза, включая последующие попадания в кэш.
+                        synthesis_started = True
+                        update_source_output_status([
+                            (("source", item_key), "processing")
+                        ])
+                        self._post_to_ui(
+                            self.update_progress_ui,
+                            last_progress_value or 0,
+                            text,
+                            "Синтез",
                         )
 
                     try:
                         # ``return_audio_files`` подавляет старую конкатенацию
-                        # по файлам и возвращает канонические пути кэша.
+                        # по файлам и возвращает пути подготовленных речевых фрагментов.
                         # Путь вывода в этом режиме служит только метаданными.
+                        collector_kwargs = {
+                            "progress_callback": source_on_progress,
+                            "completion_callback": None,
+                            "encoding_callback": None,
+                            "output_path": out_filepath,
+                            "return_audio_files": True,
+                        }
+                        if isinstance(processor, TTSProcessor):
+                            collector_kwargs["request_callback"] = source_on_request
                         result = processor.process_text_file(
-                            filepath,
-                            progress_callback=source_on_progress,
-                            completion_callback=None,
-                            encoding_callback=None,
-                            output_path=out_filepath,
-                            return_audio_files=True,
+                            filepath, **collector_kwargs
                         )
                     except Exception as exc:
                         logging.error(
@@ -42220,13 +43979,18 @@ API Token нужен для создания новых речевых фраг�
                         self._post_to_ui(self.update_total_ui, idx + 1, total_files)
                         continue
 
-                self._post_to_ui(self.update_file_status, item_id, "processing")
+                # Сначала показываем нейтральную подготовку: ``process_text_file``
+                # может пройти весь файл по кэшу без единого сетевого запроса.
+                # Реальный статус «Синтез» выставляется обратным вызовом перед
+                # сетевым запросом при промахе кэша в ``TTSProcessor``.
+                self._post_to_ui(self.update_file_status, item_id, "preparing")
                 # Общий счётчик показывает позицию именно однопоточного
                 # синтеза. Фоновые события завершения FFmpeg его не трогают.
                 self._post_to_ui(self.update_total_ui, idx + 1, total_files)
 
                 last_progress_post = 0.0
                 last_progress_value = None
+                synthesis_started = False
 
                 def on_progress(current, total, text):
                     nonlocal last_progress_post, last_progress_value
@@ -42241,13 +44005,35 @@ API Token нужен для создания новых речевых фраг�
                         return
                     last_progress_post = now
                     last_progress_value = pct
-                    self._post_to_ui(self.update_progress_ui, pct, text)
+                    self._post_to_ui(
+                        self.update_progress_ui,
+                        pct,
+                        None if synthesis_started else filepath.name,
+                        "Синтез" if synthesis_started else "Подготовка",
+                    )
+
+                def on_request(text):
+                    nonlocal synthesis_started
+                    # Между фрагментами не возвращаем подпись к подготовке.
+                    # Для следующего TXT флаг сбрасывается отдельно.
+                    synthesis_started = True
+                    self._post_to_ui(
+                        self.update_file_status,
+                        item_id,
+                        "processing",
+                    )
+                    self._post_to_ui(
+                        self.update_progress_ui,
+                        last_progress_value or 0,
+                        text,
+                        "Синтез",
+                    )
 
                 def on_encoding(filename, _item_id=item_id, _status_format=output_format):
                     # Этот статус принадлежит завершившему синтез файлу. Общий
                     # счётчик остаётся привязан к однопоточному синтезу. Формат
                     # берётся из неизменяемого снимка запуска, а публичный
-                    # Обратный вызов ``TTSProcessor`` сохраняет старую сигнатуру.
+                    # обратный вызов ``TTSProcessor`` сохраняет старую сигнатуру.
                     status_format = _status_format
                     self._post_to_ui(
                         self.update_file_status,
@@ -42263,9 +44049,18 @@ API Token нужен для создания новых речевых фраг�
                     # перехода очереди к следующему TXT. Фиксируем идентификатор в
                     # аргументе по умолчанию, иначе позднее связывание Python могло отметить
                     # последний файл вместо реально завершившегося.
+                    # Старый контракт сообщает отмену как error. В дереве такой
+                    # файл остаётся в очереди; опубликованный успех сохраняем.
+                    display_status = (
+                        "queued"
+                        if processor.is_stopped and status == "error"
+                        else status
+                    )
                     if status in {"warning", "error"}:
                         mark_source_runtime_failure("target", _item_id)
-                    self._post_to_ui(self.update_file_status, _item_id, status)
+                    self._post_to_ui(
+                        self.update_file_status, _item_id, display_status
+                    )
 
                 try:
                     processor.process_text_file(
@@ -42274,12 +44069,21 @@ API Token нужен для создания новых речевых фраг�
                         completion_callback=on_complete,
                         encoding_callback=on_encoding,
                         output_path=out_filepath,
+                        **(
+                            {"request_callback": on_request}
+                            if isinstance(processor, TTSProcessor)
+                            else {}
+                        ),
                     )
                 except Exception as e:
                     logging.error(f"Ошибка при обработке файла {filepath.name}: {e}")
                     processor._mark_output_status(out_filepath, "error")
                     mark_source_runtime_failure("collector", filepath)
-                    self._post_to_ui(self.update_file_status, item_id, "error")
+                    self._post_to_ui(
+                        self.update_file_status,
+                        item_id,
+                        "queued" if processor.is_stopped else "error",
+                    )
 
             source_collection_finished.set()
             source_output_status.refresh_activity()
@@ -42356,18 +44160,18 @@ API Token нужен для создания новых речевых фраг�
 
             # Необязательный второй проход для целей M4B исходников. Сбор API и кэша
             # выше намеренно полон и выполняется ровно
-            # один раз для каждого TXT. Здесь мы только проверяем канонический кэш,
+            # один раз для каждого TXT. Здесь мы проверяем подготовленную речь,
             # разворачиваем прежние оценочные/ручные группы и жадно перепаковываем целые
             # главы TXT. При ошибке проверки сохраняется исходный план, чтобы частично
             # измеренная книга никогда не была молча переименована или разделена.
             source_m4b_duration_overrides = {}
-            # Переразбиение по длительности может сохранить некоторые имена назначений, но изменить
-            # назначенные им главы. Такая цель больше не эквивалентна
-            # старому файлу с точки зрения возобновления: принудительно запускаем заключительный этап M4B
-            # заменить каждую затронутую запись, даже если её путь уже
-            # существует и включён ``skip_existing``. Флаг локален для
-            # этого запуска; неудачное/отменённое переразбиение не должно отравлять обычную
-            # политику возобновления следующего запуска.
+            # Переразбиение по длительности может сохранить имена выходов, но
+            # изменить состав глав в них. Такая цель больше не эквивалентна
+            # старому файлу для возобновления, поэтому заключительный этап M4B
+            # принудительно пересобирает каждую затронутую запись, даже если её
+            # путь уже существует и включён ``skip_existing``. Флаг действует
+            # только в текущем запуске; неудачное или отменённое переразбиение
+            # не меняет политику возобновления следующего запуска.
             m4b_force_rebuild_for_stage = bool(
                 force_m4b_rebuild
                 or m4b_records_changed_by_regular_targets
@@ -42555,10 +44359,9 @@ API Token нужен для создания новых речевых фраг�
                     ):
                         if status == "encoding":
                             source_output_status.start(_task_id)
-                            # Устаревший/пользовательский экспортёр M4B может не выдавать
-                            # необязательный обратный вызов прогресса. Самого события статуса всё равно
-                            # достаточно, чтобы переключить индикатор в анимированное,
-                            # явно активное состояние.
+                            # Экспортёр M4B может не выдавать необязательный
+                            # обратный вызов прогресса. Событие статуса всё равно
+                            # показывает текущую стадию без сдвига процента.
                             post_source_output_progress(
                                 PROGRESS_STATUS_ONLY,
                                 format_sequential_export_status(
@@ -42825,8 +44628,10 @@ API Token нужен для создания новых речевых фраг�
             try:
                 if processor.flush_cache() is False:
                     queue_failed = True
+                    processor._persistence_failed = True
             except Exception:
                 queue_failed = True
+                processor._persistence_failed = True
                 logging.exception("Не удалось сохранить индекс кэша")
             cleanup_transient = getattr(
                 processor, "cleanup_transient_audio_files", None
@@ -42842,8 +44647,10 @@ API Token нужен для создания новых речевых фраг�
             try:
                 if processor._save_processing_statuses() is False:
                     queue_failed = True
+                    processor._persistence_failed = True
             except Exception:
                 queue_failed = True
+                processor._persistence_failed = True
                 logging.exception("Не удалось сохранить статусы очереди")
 
             if completed_regular_targets and "source_plan_revision" in processing_config:
@@ -42996,7 +44803,9 @@ API Token нужен для создания новых речевых фраг�
             output_dir=direct_output_dir,
         )
         try:
-            processor = self._create_synthesis_processor(direct_config)
+            processor = self._create_synthesis_processor(
+                direct_config, session_kind="direct", session_text=text,
+            )
         except Exception as exc:
             logging.error(f"Не удалось создать процессор прямого синтеза: {exc}")
             self.btn_direct_start.config(state=tk.NORMAL)
@@ -43015,19 +44824,36 @@ API Token нужен для создания новых речевых фраг�
 
         def run_direct():
             last_progress_post = 0.0
+            last_completed_progress = (0, 0)
             eviction_guard = False
 
-            def on_progress(current, total, _text):
-                nonlocal last_progress_post
-                now = time.monotonic()
-                if current < total and now - last_progress_post < 0.05:
+            def display_progress(current, total):
+                # Проверяем остановку и принадлежность запуску уже в UI:
+                # ранее поставленная в очередь подпись не должна затереть «Остановка…».
+                if processor is not self.direct_processor or processor.is_stopped:
                     return
-                last_progress_post = now
-                self._post_status_label(
+                self._set_status_label(
                     self.lbl_direct_status,
                     f"Синтез: {current}/{total}...",
                     "info",
                 )
+
+            def on_progress(current, total, _text):
+                nonlocal last_progress_post, last_completed_progress
+                last_completed_progress = (current, total)
+                if processor.is_stopped:
+                    return
+                now = time.monotonic()
+                if current < total and now - last_progress_post < 0.05:
+                    return
+                last_progress_post = now
+                self._post_to_ui(display_progress, current, total)
+
+            def on_request(_text):
+                if processor.is_stopped:
+                    return
+                current, total = last_completed_progress
+                self._post_to_ui(display_progress, current, total)
 
             def on_complete(fname, status, audio=None):
                 result.update(fname=fname, status=status, audio=audio)
@@ -43049,6 +44875,7 @@ API Token нужен для создания новых речевых фраг�
                     save_to_disk=save_file,
                     progress_callback=on_progress,
                     completion_callback=on_complete,
+                    request_callback=on_request,
                 )
                 # Дожидаемся завершения кодирования только в рабочем потоке.
                 for thread in processor.active_threads:
@@ -43079,8 +44906,10 @@ API Token нужен для создания новых речевых фраг�
                 try:
                     if processor.flush_cache() is False:
                         result["status"] = "error"
+                        result["persistence_failed"] = True
                 except Exception:
                     result["status"] = "error"
+                    result["persistence_failed"] = True
                     logging.exception(
                         "Не удалось сохранить индекс кэша прямого синтеза"
                     )
@@ -43098,8 +44927,10 @@ API Token нужен для создания новых речевых фраг�
                 try:
                     if processor._save_processing_statuses() is False:
                         result["status"] = "error"
+                        result["persistence_failed"] = True
                 except Exception:
                     result["status"] = "error"
+                    result["persistence_failed"] = True
                     logging.exception(
                         "Не удалось сохранить статусы прямого синтеза"
                     )
@@ -43115,6 +44946,7 @@ API Token нужен для создания новых речевых фраг�
         try:
             self.direct_thread.start()
         except Exception as exc:
+            processor.cleanup_transient_audio_files()
             self.direct_thread = None
             self.direct_processor = None
             if self.processor is processor:
@@ -43144,9 +44976,10 @@ API Token нужен для создания новых речевых фраг�
         self._set_status_label(self.lbl_direct_status, "Остановка...", "warning")
 
     def hard_stop_direct_processing(self):
+        processor = self.direct_processor
         if self.direct_processor:
-            processor = self.direct_processor
-            processor.stop()  # Закрывает HTTP-сокет; JSON пишет фоновый обработчик.
+            # Сигнал остановки и освобождение HTTP-пула; JSON пишет обработчик.
+            processor.stop()
             threading.Thread(
                 target=processor.flush_cache,
                 daemon=True,
@@ -43158,7 +44991,10 @@ API Token нужен для создания новых речевых фраг�
         self.btn_direct_hard_stop.config(state=tk.DISABLED)
         self._set_status_label(
             self.lbl_direct_status,
-            "Принудительно остановлено. Кэш сохраняется...",
+            "Принудительная остановка... " + cache_stop_notice(
+                getattr(processor, "cfg", getattr(self, "config", {})),
+                finalized=False,
+            ),
             "error",
         )
 
@@ -43176,16 +45012,30 @@ API Token нужен для создания новых речевых фраг�
 
         status = result.get("status")
         audio = result.get("audio")
-        if processor.is_stopped:
+        persistence_failed = bool(result.get("persistence_failed"))
+        if not persistence_failed and not processor.is_stopped and status in ("success", "empty"):
+            self._discard_processor_session_audio(processor)
+        if persistence_failed:
+            self._retain_unsaved_synthesis_processor(processor)
+            text = "Ошибка сохранения. Данные остаются в памяти."
+            status_kind = "error"
+        elif processor.is_stopped:
             if self._direct_hard_stop_requested:
-                text = "Принудительно остановлено. Кэш сохранен."
+                text = "Принудительно остановлено. " + cache_stop_notice(
+                    getattr(processor, "cfg", getattr(self, "config", {})),
+                    finalized=True,
+                )
                 status_kind = "error"
             else:
                 text = "Остановлено."
                 status_kind = "warning"
         elif status in ("success", "warning"):
             saved_path = audio or result.get("fname")
-            text = f"Готово! Сохранено в {saved_path}" if save_file else "Готово! (Не сохранено)"
+            text = (
+                f"Готово! Сохранено в {saved_path}"
+                if save_file
+                else "Готово! Итоговый файл не сохранён; доступно прослушивание."
+            )
             status_kind = status
         elif status == "empty":
             text = "Нет поддерживаемого текста для синтеза."
@@ -43204,6 +45054,12 @@ API Token нужен для создания новых речевых фраг�
             )
 
         self._set_status_label(self.lbl_direct_status, text, status_kind)
+        if persistence_failed:
+            # Системный диалог должен открываться поверх уже обновлённой подписи.
+            self._render_source_status_before_alert()
+            self._show_error(
+                "Ошибка сохранения", self._synthesis_save_failure_message()
+            )
         self.last_direct_audio = audio if audio and os.path.exists(audio) else None
         self.last_direct_audio_has_effects = bool(save_file and self.last_direct_audio)
         self.btn_direct_play.config(state=tk.NORMAL if self.last_direct_audio else tk.DISABLED)
@@ -43218,7 +45074,7 @@ API Token нужен для создания новых речевых фраг�
             self.processor = self.batch_processor
         self._release_shared_cache_if_idle()
 
-    def update_progress_ui(self, pct, text):
+    def update_progress_ui(self, pct, text=None, activity=None):
         # ``pct < 0`` зарезервировано для стадий M4B, не связанных с байтами. ``-1``
         # сохраняет неопределённую анимацию для интеграций, а
         # ``PROGRESS_STATUS_ONLY`` обновляет только текст и оставляет индикатор
@@ -43282,6 +45138,14 @@ API Token нужен для создания новых речевых фраг�
         except (AttributeError, tk.TclError):
             pass
 
+        # Обновление процентов без текста сохраняет последний отправленный
+        # фрагмент: имя TXT не должно подменять его между запросами синтеза.
+        batch_processor = getattr(self, "batch_processor", None)
+        if text is None or (
+            batch_processor is not None and batch_processor.is_stopped
+        ):
+            return
+
         display_text = normalize_display_text(text, fallback="Ожидание...")
 
         # Индикатор прогресса источника общий для синтеза API и отложенной
@@ -43295,15 +45159,16 @@ API Token нужен для создания новых речевых фраг�
                 flags=re.IGNORECASE,
             )
         )
-        status_prefix = (
-            "Сборка"
-            if (
-                status_only
-                or display_text.lstrip().upper().startswith("M4B:")
-                or compact_m4b_status
-            )
-            else "Синтез"
-        )
+        if activity is not None:
+            status_prefix = activity
+        elif (
+            status_only
+            or display_text.lstrip().upper().startswith("M4B:")
+            or compact_m4b_status
+        ):
+            status_prefix = "Сборка"
+        else:
+            status_prefix = "Синтез"
         try:
             self._set_source_activity_status(status_prefix, display_text, "info")
         except (AttributeError, tk.TclError):
