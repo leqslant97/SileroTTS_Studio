@@ -242,6 +242,67 @@ class CacheVariantPolicyTests(unittest.TestCase):
         )
 
 
+class CacheOptimizationSourceTests(unittest.TestCase):
+    def test_nested_texts_protect_their_cache_entries(self):
+        for root_text in (True, False):
+            with self.subTest(root_text=root_text), tempfile.TemporaryDirectory() as temp:
+                source_dir = Path(temp) / "texts"
+                nested_dir = source_dir / "part"
+                nested_dir.mkdir(parents=True)
+                (nested_dir / "nested.txt").write_text("Nested text", encoding="utf-8")
+                if root_text:
+                    (source_dir / "root.txt").write_text("Root text", encoding="utf-8")
+
+                entries = {"nested": {"text": "Nested text"}, "stale": {"text": "Old text"}}
+                if root_text:
+                    entries["root"] = {"text": "Root text"}
+                processor = mock.Mock()
+                processor.cache = entries.copy()
+                processor.cache_dir = Path(temp) / "cache"
+                processor.get_all_possible_hashes.side_effect = (
+                    lambda raw_text, include_prepared: {raw_text}
+                )
+
+                app = object.__new__(studio.TTSApp)
+                app.config = {"input_dir": str(source_dir), "include_subdirs": True}
+                app.is_cache_operation_running = mock.Mock(return_value=False)
+                app.is_synthesis_running = mock.Mock(return_value=False)
+                app._validate_api_steps_ui = mock.Mock(return_value=True)
+                app.save_settings = mock.Mock()
+                popup = mock.Mock()
+                app._begin_cache_operation = mock.Mock(return_value=popup)
+                app._end_cache_operation = mock.Mock()
+                app._choose_cache_variant_policy = mock.Mock(
+                    return_value=studio.CACHE_VARIANT_KEEP_ALL
+                )
+                app._ask_yes_no = mock.Mock(return_value=True)
+                app.is_cache_optimization_running = mock.Mock(return_value=True)
+                app._post_to_ui = mock.Mock()
+                app._show_info = mock.Mock()
+                app._show_warning = mock.Mock()
+                app._finish_cache_optimization = mock.Mock()
+
+                with ExitStack() as patches:
+                    patches.enter_context(mock.patch.object(studio, "TTSProcessor", return_value=processor))
+                    patches.enter_context(mock.patch.object(studio, "cache_entry_matches_required_text", side_effect=lambda entry, hashes: entry["text"] in hashes))
+                    patches.enter_context(mock.patch.object(studio, "unreferenced_cache_audio_paths", return_value=[]))
+                    write_index = patches.enter_context(mock.patch.object(studio, "write_cache_index_atomic"))
+                    thread_class = patches.enter_context(mock.patch.object(studio.threading, "Thread"))
+                    thread_class.return_value.start.side_effect = (
+                        lambda: thread_class.call_args.kwargs["target"]()
+                    )
+
+                    app.optimize_cache()
+
+                expected = {key: value for key, value in entries.items() if key != "stale"}
+                write_index.assert_called_once_with(processor.cache_dir, expected)
+                self.assertEqual(processor.cache, expected)
+                self.assertFalse(any(
+                    call.args[0] is app._show_warning
+                    for call in app._post_to_ui.call_args_list
+                ))
+
+
 class CacheIndexFormatTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -1415,6 +1476,33 @@ class SourceSynthesisRuntimeTests(unittest.TestCase):
                 profiles[0]["extradata_hash"],
                 profiles[1]["extradata_hash"],
             )
+
+    def test_stopped_target_chain_skips_remaining_fragment_headers(self):
+        processor = mock.Mock(is_stopped=True)
+        records = [{
+            "target_index": 0,
+            "target": {"format": "mp3"},
+            "path": "out.mp3",
+        }]
+        fragments = ("first.ogg", "second.ogg")
+        with mock.patch.object(studio, "_inspect_ogg_audio_header_details") as inspect:
+            with self.assertRaises(InterruptedError):
+                studio.run_source_synthesis_target_chain(
+                    processor, fragments, records, {}
+                )
+            inspect.assert_not_called()
+
+            processor.is_stopped = False
+            def stop_after_first(_path):
+                processor.is_stopped = True
+                return "opus", 1, b"OpusHead"
+
+            inspect.side_effect = stop_after_first
+            with self.assertRaises(InterruptedError):
+                studio.run_source_synthesis_target_chain(
+                    processor, fragments, records, {}
+                )
+            self.assertEqual(inspect.call_count, 1)
 
     def test_merge_accepts_reusable_profiles_without_reprobing_sources(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -9385,6 +9473,26 @@ class TemplateHelperTests(unittest.TestCase):
             ),
         )
 
+    def test_source_group_helper_describes_groups_without_output_extension(self):
+        fields = {
+            name: (label, description)
+            for name, label, description in studio.template_helper_context(
+                "source_group"
+            )["fields"]
+        }
+        self.assertEqual(fields["part"][0], "Номер группы")
+        self.assertIn("не формат выхода", fields["format"][1])
+        self.assertEqual(
+            studio.render_template_helper_preview(
+                "source_group", "{book} Группа {part}"
+            ),
+            (
+                "Моя книга Группа 1",
+                "Моя книга Группа 2",
+                "Моя книга Группа 3",
+            ),
+        )
+
     def test_m4b_chapter_preview_resets_volume_and_continues_global_counter(self):
         preview = studio.render_template_helper_preview(
             "m4b_chapter",
@@ -9865,6 +9973,125 @@ class BookImportTests(unittest.TestCase):
             studio.BookExtractor._is_epub_cover_document(chapter_named_cover)
         )
 
+    def test_epub_toc_decodes_hrefs_and_deduplicates_anchor_links(self):
+        class Item:
+            id = "chapter1"
+            file_name = "chapters/Глава 1.xhtml"
+
+            def get_content(self):
+                return "<html><body><p>Текст.</p></body></html>".encode()
+
+        item = Item()
+        book = mock.Mock()
+        book.toc = [
+            studio.epub.Link(
+                "chapters/%D0%93%D0%BB%D0%B0%D0%B2%D0%B0%201.xhtml#one",
+                "Глава 1",
+                "chapter1",
+            ),
+            studio.epub.Link(
+                "./chapters/Глава 1.xhtml#two",
+                "Глава 1 (продолжение)",
+                "chapter1",
+            ),
+        ]
+        book.get_items.return_value = [item]
+        book.get_metadata.return_value = []
+
+        with mock.patch.object(studio.epub, "read_epub", return_value=book):
+            chapters, _author = studio.BookExtractor.extract_epub("book.epub")
+
+        self.assertEqual(chapters, [("Глава 1", "Текст.")])
+
+    def test_epub_toc_without_matching_documents_falls_back_to_spine(self):
+        class Item:
+            id = "chapter1"
+            file_name = "chapter.xhtml"
+
+            def get_content(self):
+                return "<html><body><p>Текст из spine.</p></body></html>".encode()
+
+            def get_type(self):
+                return studio.ebooklib.ITEM_DOCUMENT
+
+        item = Item()
+        book = mock.Mock()
+        book.toc = [studio.epub.Link("missing.xhtml", "Потеряно", "missing")]
+        book.get_items.return_value = [item]
+        book.spine = [("chapter1", "yes")]
+        book.get_item_with_id.return_value = item
+        book.get_metadata.return_value = []
+
+        with mock.patch.object(studio.epub, "read_epub", return_value=book):
+            chapters, _author = studio.BookExtractor.extract_epub("book.epub")
+
+        self.assertEqual(chapters, [("Глава", "Текст из spine.")])
+
+    def test_epub_toc_with_only_cover_falls_back_to_spine_chapters(self):
+        class Item:
+            def __init__(self, item_id, file_name, text, item_type):
+                self.id = item_id
+                self.file_name = file_name
+                self._text = text
+                self._type = item_type
+
+            def get_content(self):
+                return self._text.encode()
+
+            def get_type(self):
+                return self._type
+
+        cover = Item(
+            "cover",
+            "cover.xhtml",
+            "<html><body><img src='cover.jpg'/></body></html>",
+            studio.ebooklib.ITEM_DOCUMENT,
+        )
+        chapter = Item(
+            "chapter1",
+            "chapter.xhtml",
+            "<html><body><p>Текст главы.</p></body></html>",
+            studio.ebooklib.ITEM_DOCUMENT,
+        )
+        book = mock.Mock()
+        book.toc = [studio.epub.Link("cover.xhtml", "Обложка", "cover")]
+        book.get_items.return_value = [cover, chapter]
+        book.spine = [("cover", "yes"), ("chapter1", "yes")]
+        book.get_item_with_id.side_effect = {"cover": cover, "chapter1": chapter}.get
+        book.get_metadata.return_value = []
+
+        with mock.patch.object(studio.epub, "read_epub", return_value=book):
+            chapters, _author = studio.BookExtractor.extract_epub("book.epub")
+
+        self.assertEqual(chapters, [("Глава", "Текст главы.")])
+
+    def test_docx_localized_heading_styles_split_chapters(self):
+        class Paragraph:
+            def __init__(self, style_name, text, style_id=""):
+                self.style = mock.Mock(name=style_name)
+                self.style.name = style_name
+                self.style.style_id = style_id
+                self.text = text
+
+        document = mock.Mock()
+        document.paragraphs = [
+            Paragraph("Заголовок 1", "Глава 1", "Heading1"),
+            Paragraph("Обычный", "Текст один"),
+            Paragraph("Заголовок 1", "Глава 2", "Heading1"),
+            Paragraph("Обычный", "Текст два"),
+        ]
+
+        with mock.patch.object(studio.docx, "Document", return_value=document):
+            chapters = studio.BookExtractor.extract_docx("book.docx")
+
+        self.assertEqual(
+            chapters,
+            [
+                ("Глава 1", "Глава 1\nТекст один"),
+                ("Глава 2", "Глава 2\nТекст два"),
+            ],
+        )
+
     def test_txt_chapter_regex_accepts_utf8_bom(self):
         with tempfile.TemporaryDirectory() as tempdir:
             source = Path(tempdir) / "book.txt"
@@ -10175,7 +10402,7 @@ class SynthesisStatusTests(unittest.TestCase):
         app.tree = mock.Mock()
         app.tree.exists.return_value = True
         app.tree.item.side_effect = [
-            ("🧩 План M4B", "≈ 01:20:00"),
+            ("📁 Группа", "≈ 01:20:00"),
             ("queued",),
             None,
         ]
@@ -10342,6 +10569,7 @@ class MacAquaRestoreTests(unittest.TestCase):
         app.root = mock.Mock()
         app.root.winfo_exists.return_value = True
         app.root.state.return_value = "normal"
+        app.root.focus_displayof.return_value = None
         app.root.after.return_value = "restore-after"
         app._mac_startup_focus_done = True
         app._mac_restore_refresh_after_id = None
@@ -10401,29 +10629,327 @@ class MacAquaRestoreTests(unittest.TestCase):
         self.assertEqual(app.root.after.call_count, 2)
         self.assertEqual(
             app.root.after.call_args.args,
-            (25, app._refresh_mac_after_restore),
+            (150, app._refresh_mac_after_restore),
         )
+        self.assertTrue(app._mac_restore_progress_pending)
+
+    def test_restore_map_marks_progress_for_late_native_refresh(self):
+        app = self.make_app()
+        app._refresh_mac_aqua_widget_states = mock.Mock()
+
+        app._on_mac_restore_map(mock.Mock(widget=app.root))
+
+        self.assertTrue(app._mac_restore_progress_pending)
+        app._refresh_mac_aqua_widget_states.assert_not_called()
+
+    def test_restore_map_finishes_idle_drawing_before_return(self):
+        """Потомки дорисовываются сразу; сброс Aqua остаётся отложенным."""
+        app = self.make_app()
+        order = []
+
+        def schedule(delay, callback):
+            order.append("schedule")
+            self.assertEqual(delay, 150)
+            self.assertIs(callback.__self__, app)
+            self.assertTrue(app._mac_restore_progress_pending)
+            return "restore-after"
+
+        def draw():
+            order.append("draw")
+            self.assertTrue(app._mac_restore_idle_flush_in_progress)
+
+        app.root.after.side_effect = schedule
+        app.root.update_idletasks.side_effect = draw
+
+        app._on_mac_restore_map(mock.Mock(widget=app.root))
+
+        self.assertEqual(order, ["schedule", "draw"])
+        app.root.update_idletasks.assert_called_once_with()
+        self.assertFalse(app._mac_restore_idle_flush_in_progress)
+        app.root.focus_force.assert_not_called()
+        app.root.update.assert_not_called()
+
+    def test_restore_map_ignores_children_startup_closing_and_hidden_root(self):
+        """Обработка восстановления ограничена уже работающим главным окном."""
+        for case in ("child", "startup", "closing", "iconic", "destroyed"):
+            with self.subTest(case=case):
+                app = self.make_app()
+                event = mock.Mock(widget=app.root)
+                if case == "child":
+                    event.widget = mock.Mock()
+                elif case == "startup":
+                    app._mac_startup_focus_done = False
+                elif case == "closing":
+                    app._is_closing = True
+                elif case == "iconic":
+                    app.root.state.return_value = "iconic"
+                else:
+                    app.root.winfo_exists.return_value = False
+
+                app._on_mac_restore_map(event)
+
+                app.root.after.assert_not_called()
+                app.root.update_idletasks.assert_not_called()
+
+    def test_restore_map_does_not_reenter_idle_drawing(self):
+        """Повторный корневой Map из idle не запускает вложенную отрисовку."""
+        app = self.make_app()
+        event = mock.Mock(widget=app.root)
+        app.root.update_idletasks.side_effect = lambda: app._on_mac_restore_map(event)
+
+        app._on_mac_restore_map(event)
+
+        app.root.after.assert_called_once_with(150, app._refresh_mac_after_restore)
+        app.root.update_idletasks.assert_called_once_with()
+        self.assertFalse(app._mac_restore_idle_flush_in_progress)
+
+    def test_restore_map_recovers_after_tcl_error(self):
+        """Ошибка Tk не оставляет защиту от повторного входа включённой."""
+        for operation in ("winfo_exists", "update_idletasks"):
+            with self.subTest(operation=operation):
+                app = self.make_app()
+                failing = getattr(app.root, operation)
+                failing.side_effect = studio.tk.TclError("Окно пока недоступно")
+                event = mock.Mock(widget=app.root)
+
+                app._on_mac_restore_map(event)
+                self.assertFalse(app._mac_restore_idle_flush_in_progress)
+
+                failing.side_effect = None
+                app.root.winfo_exists.return_value = True
+                app.root.reset_mock()
+                app._on_mac_restore_map(event)
+
+                app.root.update_idletasks.assert_called_once_with()
+                self.assertTrue(app._mac_restore_progress_pending)
+                self.assertFalse(app._mac_restore_idle_flush_in_progress)
 
     @mock.patch.object(studio.ttk, "Style")
-    def test_restore_reapplies_auto_appearance_and_redraws_all_ttk_widgets(
+    def test_activate_without_map_refreshes_native_widget_states(self, style_class):
+        app = self.make_app()
+        app._mac_window_active = True
+        app._mac_restore_progress_pending = False
+        app._mac_restore_activation_refresh_pending = False
+        app._refresh_mac_aqua_widget_states = mock.Mock()
+        style_class.return_value.theme_use.side_effect = ("aqua", None)
+        event = mock.Mock(widget=app.root)
+
+        app._on_mac_restore_deactivate(event)
+        app._on_mac_restore_activate(event)
+        self.assertTrue(app._mac_restore_progress_pending)
+        self.assertEqual(
+            app.root.after.call_args.args,
+            (150, app._refresh_mac_after_restore),
+        )
+        app._refresh_mac_after_restore()
+
+        app._refresh_mac_aqua_widget_states.assert_called_once_with()
+        self.assertFalse(app._mac_restore_progress_pending)
+
+    @mock.patch.object(studio.ttk, "Style")
+    def test_active_restore_refreshes_native_widget_states(self, style_class):
+        app = self.make_app()
+        app._mac_window_active = True
+        app._mac_restore_progress_pending = True
+        app._refresh_mac_aqua_widget_states = mock.Mock()
+        style_class.return_value.theme_use.side_effect = ("aqua", None)
+
+        app._refresh_mac_after_restore()
+
+        app._refresh_mac_aqua_widget_states.assert_called_once_with()
+        self.assertFalse(app._mac_restore_progress_pending)
+
+    @mock.patch.object(studio.ttk, "Style")
+    def test_map_only_restore_refreshes_states_without_tk_focus(
+        self, style_class
+    ):
+        app = self.make_app()
+        app._mac_window_active = False
+        app._refresh_mac_aqua_widget_states = mock.Mock()
+        style_class.return_value.theme_use.side_effect = ("aqua", None)
+
+        app._on_mac_restore_map(mock.Mock(widget=app.root))
+        app._refresh_mac_after_restore()
+
+        app._refresh_mac_aqua_widget_states.assert_called_once_with()
+        self.assertFalse(app._mac_restore_progress_pending)
+        self.assertTrue(app._mac_restore_activation_refresh_pending)
+        app.root.focus_displayof.assert_not_called()
+
+    @mock.patch.object(studio.ttk, "Style")
+    def test_later_activate_refreshes_after_inactive_map(self, style_class):
+        app = self.make_app()
+        app._mac_window_active = False
+        app._refresh_mac_aqua_widget_states = mock.Mock()
+        style_class.return_value.theme_use.side_effect = (
+            "aqua", None, "aqua", None
+        )
+
+        app._on_mac_restore_map(mock.Mock(widget=app.root))
+        app._refresh_mac_after_restore()
+        self.assertEqual(app._refresh_mac_aqua_widget_states.call_count, 1)
+        self.assertTrue(app._mac_restore_activation_refresh_pending)
+
+        app._on_mac_restore_activate(mock.Mock(widget=app.root))
+        app._refresh_mac_after_restore()
+
+        self.assertEqual(app._refresh_mac_aqua_widget_states.call_count, 2)
+        self.assertFalse(app._mac_restore_progress_pending)
+        self.assertFalse(app._mac_restore_activation_refresh_pending)
+
+    def test_native_refresh_redraws_only_widgets_with_stale_background(self):
+        """Штатно активные и уничтоженные контролы не требуют перерисовки."""
+        app = self.make_app()
+        background = app.file_progress = mock.Mock()
+        active = app.total_progress = mock.Mock()
+        destroyed = app.export_progress = mock.Mock()
+        selected = app.chk_auto_scroll = mock.Mock()
+        background.instate.return_value = True
+        active.instate.return_value = False
+        destroyed.winfo_exists.return_value = False
+        selected.instate.return_value = True
+
+        app._refresh_mac_aqua_widget_states()
+
+        background.state.assert_called_once_with(["!background"])
+        selected.state.assert_called_once_with(["!background"])
+        active.state.assert_not_called()
+        destroyed.instate.assert_not_called()
+        destroyed.state.assert_not_called()
+
+        # Повторный Map/Activate не ставит ещё одну перерисовку, когда флаг снят.
+        background.instate.return_value = False
+        selected.instate.return_value = False
+        app._refresh_mac_aqua_widget_states()
+
+        background.state.assert_called_once_with(["!background"])
+        selected.state.assert_called_once_with(["!background"])
+        active.state.assert_not_called()
+        destroyed.state.assert_not_called()
+
+    def test_native_refresh_preserves_widgets_layout_values_and_animation(self):
+        """Восстановление сбрасывает состояние Aqua у уже существующих виджетов."""
+        try:
+            root = studio.tk.Tk()
+        except studio.tk.TclError as exc:
+            self.skipTest(f"Tk is unavailable: {exc}")
+        self.addCleanup(root.destroy)
+
+        frame = studio.ttk.Frame(root)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.grid_columnconfigure(0, weight=1)
+        export_frame = studio.ttk.Frame(root)
+        export_frame.grid(row=1, column=0, sticky="ew")
+        app = object.__new__(studio.TTSApp)
+        app.file_progress = studio.ttk.Progressbar(
+            frame, mode="indeterminate", maximum=100, value=0
+        )
+        app.total_progress = studio.ttk.Progressbar(
+            frame, mode="determinate", maximum=240, value=73
+        )
+        app.export_progress = studio.ttk.Progressbar(
+            export_frame, mode="determinate", maximum=100, value=31,
+            length=145, style="Horizontal.TProgressbar",
+        )
+        app.file_progress.grid(row=0, column=0, sticky="ew")
+        app.total_progress.grid(row=1, column=0, sticky="ew")
+        app.total_progress.state(["disabled"])
+        app.export_progress.pack(side="right", fill="x", expand=True, padx=(8, 0))
+        app.auto_scroll_var = studio.tk.BooleanVar(root, value=True)
+        app.chk_auto_scroll = studio.ttk.Checkbutton(
+            frame, text="Автопрокрутка", variable=app.auto_scroll_var
+        )
+        app.chk_auto_scroll.grid(row=3, column=0, sticky="e")
+        app.chk_auto_scroll.state(["disabled"])
+        for widget in (
+            app.file_progress,
+            app.total_progress,
+            app.export_progress,
+            app.chk_auto_scroll,
+        ):
+            widget.state(["background"])
+        app.file_progress.start(12)
+        self.addCleanup(app.file_progress.stop)
+        root.update()
+
+        widgets = (
+            app.file_progress,
+            app.total_progress,
+            app.export_progress,
+            app.chk_auto_scroll,
+        )
+        identities = tuple(str(widget) for widget in widgets)
+        placements = tuple(
+            widget.pack_info() if widget.winfo_manager() == "pack" else widget.grid_info()
+            for widget in widgets
+        )
+        values = (
+            float(app.total_progress["value"]),
+            float(app.export_progress["value"]),
+            float(app.total_progress["maximum"]),
+        )
+        initial_animation_value = float(app.file_progress["value"])
+
+        app._refresh_mac_aqua_widget_states()
+        root.update_idletasks()
+
+        for name, original in zip(
+            ("file_progress", "total_progress", "export_progress", "chk_auto_scroll"),
+            widgets,
+        ):
+            self.assertIs(getattr(app, name), original)
+            self.assertTrue(original.winfo_exists())
+        self.assertEqual(tuple(str(widget) for widget in widgets), identities)
+        self.assertEqual(
+            tuple(
+                widget.pack_info() if widget.winfo_manager() == "pack" else widget.grid_info()
+                for widget in widgets
+            ),
+            placements,
+        )
+        self.assertEqual(
+            (
+                float(app.total_progress["value"]),
+                float(app.export_progress["value"]),
+                float(app.total_progress["maximum"]),
+            ),
+            values,
+        )
+        self.assertEqual(str(app.file_progress["mode"]), "indeterminate")
+        self.assertEqual(float(app.export_progress["length"]), 145)
+        self.assertEqual(str(app.export_progress["style"]), "Horizontal.TProgressbar")
+        self.assertIn("disabled", app.total_progress.state())
+        self.assertIn("selected", app.chk_auto_scroll.state())
+        self.assertIn("disabled", app.chk_auto_scroll.state())
+        for widget in widgets:
+            self.assertNotIn("background", widget.state())
+
+        root.after(80, root.quit)
+        root.mainloop()
+        self.assertGreater(float(app.file_progress["value"]), initial_animation_value)
+
+
+
+
+
+
+
+    @mock.patch.object(studio.ttk, "Style")
+    def test_restore_updates_only_native_widgets_without_full_theme_flash(
         self, style_class
     ):
         app = self.make_app()
         style = style_class.return_value
         style.theme_use.side_effect = ("aqua", None)
+        app._refresh_mac_aqua_widget_states = mock.Mock()
 
         app._refresh_mac_after_restore()
 
-        style_class.assert_called_once_with(app.root)
-        self.assertEqual(
-            style.theme_use.call_args_list,
-            [mock.call(), mock.call("aqua")],
-        )
-        app.root.tk.call.assert_any_call(
-            "wm", "attributes", app.root._w, "-appearance", "auto"
-        )
-        app.root.event_generate.assert_called_with("<Expose>", when="tail")
-        app.root.after_idle.assert_called_once_with(app.root.update_idletasks)
+        style_class.assert_not_called()
+        app.root.tk.call.assert_not_called()
+        app.root.event_generate.assert_not_called()
+        app.root.after_idle.assert_not_called()
+        app._refresh_mac_aqua_widget_states.assert_not_called()
         app._check_system_appearance.assert_called_once_with(reschedule=False)
 
     @mock.patch.object(studio.ttk, "Style")
@@ -11112,7 +11638,8 @@ class ExportLayoutContractTests(unittest.TestCase):
         end = source.index('    # --- Вкладка "Прямой синтез" ---', start)
         setup_source = source[start:end]
         self.assertIn("self._make_collapsible_hint(", setup_source)
-        self.assertIn('title="О плане M4B"', setup_source)
+        self.assertIn('title="О плане групп"', setup_source)
+        self.assertIn('text="🧩 Подготовить план групп…"', setup_source)
         self.assertIn('title="О ручном разбиении"', setup_source)
 
         dialog_start = source.index("    def prepare_m4b_source_plan(self):")
@@ -11401,6 +11928,81 @@ class ExportLayoutContractTests(unittest.TestCase):
                 self.assertFalse(app.is_export_stopped)
 
 
+class SourceTreeScrollTests(unittest.TestCase):
+    def test_auto_scroll_centers_current_file_after_tab_is_shown(self):
+        try:
+            root = studio.tk.Tk()
+        except studio.tk.TclError as exc:
+            self.skipTest(f"Tk is unavailable: {exc}")
+        self.addCleanup(root.destroy)
+        root.geometry("500x360+60+60")
+        notebook = studio.ttk.Notebook(root)
+        notebook.pack(fill="both", expand=True)
+        source = studio.ttk.Frame(notebook)
+        other = studio.ttk.Frame(notebook)
+        notebook.add(source, text="Файлы")
+        notebook.add(other, text="Другая вкладка")
+        tree = studio.ttk.Treeview(source)
+        tree.pack(fill="both", expand=True)
+        for index in range(100):
+            tree.insert("", "end", iid=f"file-{index}", text=f"Файл {index}")
+        app = object.__new__(studio.TTSApp)
+        app.tree = tree
+        app.auto_scroll_var = studio.tk.BooleanVar(value=True)
+        app.current_processing_file = "file-50"
+        tree.bind("<Map>", app._on_source_tree_map, add="+")
+        root.update()
+
+        notebook.select(other)
+        root.update()
+        app.scroll_to_current()
+        notebook.select(source)
+        root.update()
+
+        bounds = tree.bbox("file-50")
+        self.assertTrue(bounds)
+        self.assertAlmostEqual(
+            bounds[1] + bounds[3] / 2,
+            tree.winfo_height() / 2,
+            delta=bounds[3],
+        )
+
+    def test_current_file_is_centered_in_flat_and_nested_trees(self):
+        try:
+            root = studio.tk.Tk()
+        except studio.tk.TclError as exc:
+            self.skipTest(f"Tk is unavailable: {exc}")
+        self.addCleanup(root.destroy)
+        root.geometry("500x360+60+60")
+        tree = studio.ttk.Treeview(root, columns=("status",), show="tree headings")
+        tree.pack(fill="both", expand=True)
+        app = object.__new__(studio.TTSApp)
+        app.tree = tree
+
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                tree.delete(*tree.get_children())
+                parent = ""
+                if nested:
+                    parent = tree.insert("", "end", iid="group", text="Группа", open=False)
+                for index in range(100):
+                    tree.insert(parent, "end", iid=f"file-{index}", text=f"Файл {index}")
+                root.update()
+
+                app.current_processing_file = "file-50"
+                app.scroll_to_current()
+                root.update_idletasks()
+
+                if nested:
+                    self.assertTrue(tree.item("group", "open"))
+                bounds = tree.bbox("file-50")
+                self.assertTrue(bounds)
+                row_middle = bounds[1] + bounds[3] / 2
+                self.assertAlmostEqual(
+                    row_middle, tree.winfo_height() / 2, delta=bounds[3]
+                )
+
+
 class TkLayoutRegressionTests(unittest.TestCase):
     def test_hint_collapse_keeps_dialog_size_and_normalizer_actions_fit(self):
         script = textwrap.dedent(
@@ -11472,6 +12074,24 @@ class TkLayoutRegressionTests(unittest.TestCase):
                     root.geometry("900x520+60+70")
                     app.notebook.select(app.tab_settings)
                     root.update()
+                    app.settings_vars["api_token"].set("test-token")
+                    token_initially_masked = (
+                        app.api_token_entry.cget("show") == "*"
+                        and not app.api_token_visible_var.get()
+                    )
+                    app.api_token_show_check.invoke()
+                    token_revealed = (
+                        app.api_token_entry.cget("show") == ""
+                        and app.settings_vars["api_token"].get() == "test-token"
+                    )
+                    app.update_config_from_ui()
+                    token_saved = app.config["api_token"] == "test-token"
+                    app.set_ui_from_config()
+                    token_remasked_on_reload = (
+                        app.api_token_entry.cget("show") == "*"
+                        and not app.api_token_visible_var.get()
+                        and app.settings_vars["api_token"].get() == "test-token"
+                    )
                     limit_var = str(app.settings_vars["max_parallel_encodes"])
                     limit_entry = next(
                         widget for widget in descendants(app.tab_settings)
@@ -11488,6 +12108,10 @@ class TkLayoutRegressionTests(unittest.TestCase):
                         "rows": rows,
                         "initial_height": initial_height,
                         "collapsed_height": collapsed_height,
+                        "token_initially_masked": token_initially_masked,
+                        "token_revealed": token_revealed,
+                        "token_saved": token_saved,
+                        "token_remasked_on_reload": token_remasked_on_reload,
                         "initial_api_scroll": initial_scroll,
                         "last_api_entry_visible": (
                             limit_entry.winfo_rooty() >= api_canvas.winfo_rooty()
@@ -11519,6 +12143,10 @@ class TkLayoutRegressionTests(unittest.TestCase):
         self.assertEqual(len(reports), 1, result.stdout + result.stderr)
         report = json.loads(reports[0])
         self.assertEqual(report["collapsed_height"], report["initial_height"])
+        self.assertTrue(report["token_initially_masked"])
+        self.assertTrue(report["token_revealed"])
+        self.assertTrue(report["token_saved"])
+        self.assertTrue(report["token_remasked_on_reload"])
         # Если все настройки помещаются, прокрутка не нужна; нижнее поле доступно в обоих случаях.
         self.assertTrue(report["last_api_entry_visible"])
         for requested, available in report["rows"]:
@@ -12397,7 +13025,9 @@ class EmptySynthesisTests(unittest.TestCase):
                 ),
             )
 
-            self.assertEqual(progress, [(1, 1, "[ПАУЗА РАЗДЕЛИТЕЛЯ]")])
+            self.assertEqual(progress, [
+                (0, 1, ""), (1, 1, "[ПАУЗА РАЗДЕЛИТЕЛЯ]"),
+            ])
 
     def test_consecutive_separators_keep_two_full_pauses(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -13387,6 +14017,75 @@ class CacheBehaviorTests(unittest.TestCase):
         self.assertEqual(returned_file, cache_file)
         self.assertEqual(processor.session.calls, [])
 
+    def test_request_callback_only_reports_cache_miss(self):
+        processor = self.make_processor(use_cache=True)
+        text = "Фраза."
+        text_hash = processor.get_hash(text)
+        cache_file = processor.cache_audio_dir / f"{text_hash}.ogg"
+        cache_file.write_bytes(fake_ogg_first_page(b"OpusHead-cached"))
+        processor.cache[text_hash] = {
+            "file_name": cache_file.name,
+            "speaker": processor.cfg["speaker"],
+        }
+        requests_seen = []
+
+        processor.synthesize_sentence(text, text, request_callback=requests_seen.append)
+        self.assertEqual(requests_seen, [])
+
+        with mock.patch.object(
+            studio, "_prepare_api_audio_file",
+            side_effect=lambda _source, destination, **_kwargs: Path(destination).write_bytes(
+                fake_ogg_first_page(b"OpusHead-new audio")
+            ),
+        ), mock.patch.object(studio, "_require_opus_audio_file"):
+            processor.synthesize_sentence(
+                "Новая фраза.", "Новая фраза.", request_callback=requests_seen.append
+            )
+        self.assertEqual(requests_seen, ["Новая фраза."])
+        self.assertEqual(len(processor.session.calls), 1)
+
+    def test_request_callback_failure_does_not_retry_or_replace_audio(self):
+        """Ошибка наблюдателя не должна выглядеть как ошибка API-запроса."""
+        processor = self.make_processor(use_cache=True)
+
+        def broken_callback(_text):
+            raise RuntimeError("UI callback failed")
+
+        with mock.patch.object(
+            studio,
+            "_prepare_api_audio_file",
+            side_effect=lambda _source, destination, **_kwargs: Path(
+                destination
+            ).write_bytes(fake_ogg_first_page(b"OpusHead-callback-failure")),
+        ), mock.patch.object(studio, "_require_opus_audio_file"):
+            returned_file, success = processor.synthesize_sentence(
+                "Фраза с ошибкой наблюдателя.",
+                "Фраза с ошибкой наблюдателя.",
+                request_callback=broken_callback,
+            )
+
+        self.assertTrue(success)
+        self.assertTrue(returned_file.exists())
+        self.assertEqual(len(processor.session.calls), 1)
+
+    def test_stop_in_request_callback_prevents_http_request(self):
+        """Остановка перед отправкой запроса не должна обращаться к API."""
+        processor = self.make_processor(use_cache=True)
+
+        def stop_before_request(_text):
+            processor.is_stopped = True
+
+        returned_file, success = processor.synthesize_sentence(
+            "Фраза перед остановкой.",
+            "Фраза перед остановкой.",
+            request_callback=stop_before_request,
+        )
+
+        self.assertIsNone(returned_file)
+        self.assertFalse(success)
+        self.assertEqual(processor.session.calls, [])
+        self.assertEqual(processor.cache, {})
+
     def synthesize_without_decoding(self, processor, *, force_new=False):
         def fake_prepare(source, destination, **_kwargs):
             destination = Path(destination)
@@ -13479,7 +14178,7 @@ class CacheBehaviorTests(unittest.TestCase):
         self.assertEqual(processor.unsaved_cache_items, 1)
 
     def test_shared_cache_miss_is_published_by_one_api_request(self):
-        """Два процессора объединяют совпавший cache miss в один запрос."""
+        """Два процессора объединяют совпавший промах кэша в один запрос."""
         shared_cache = {}
         shared_lock = threading.RLock()
         shared_inflight = {}

@@ -77,5 +77,80 @@ class VerbatimOccurrenceAuditTests(unittest.TestCase):
         self.assertEqual(normalize.call_count, 1)
 
 
+class NormalizerEntryPreviewAuditTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            self.root = studio.tk.Tk()
+        except studio.tk.TclError as exc:
+            self.skipTest(f"Tk is unavailable: {exc}")
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+        self.app = object.__new__(studio.TTSApp)
+        self.app.root = self.root
+        self.app.config = {}
+        self.app.settings_vars = {}
+        self.app._status_label_kinds = {}
+        self.app.font_size_var = studio.tk.IntVar(master=self.root, value=12)
+        self.app.get_status_color = lambda _kind: "#333333"
+        self.app.tab_normalizer = studio.ttk.Frame(self.root)
+        self.app.run_normalizer_preview = mock.Mock()
+        self.app.setup_normalizer_tab()
+
+    @staticmethod
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from NormalizerEntryPreviewAuditTests.descendants(child)
+
+    def entry_for(self, key):
+        variable = self.app.normalizer_preview_vars[key]
+        return next(
+            widget for widget in self.descendants(self.app.tab_normalizer)
+            if widget.winfo_class() == "TEntry"
+            and str(widget.cget("textvariable")) == str(variable)
+        )
+
+    def mark_completed_preview(self):
+        self.app._normalizer_last_preview_result = {
+            "normalized_text_for_file": "Проверенный текст."
+        }
+        self.app.btn_save_normalized_text.configure(state="normal")
+        return self.app._normalizer_preview_generation
+
+    def assert_preview_invalidated(self, generation):
+        self.assertIsNone(self.app._normalizer_last_preview_result)
+        self.assertIn("disabled", self.app.btn_save_normalized_text.state())
+        self.assertGreater(self.app._normalizer_preview_generation, generation)
+        # Инвалидация синхронна; отложенный пересчёт ещё не запускался.
+        self.app.run_normalizer_preview.assert_not_called()
+
+    def test_virtual_paste_and_cut_invalidate_completed_preview_immediately(self):
+        for key in (
+            "latin_dictionary_filename",
+            "dictionary_include_files",
+            "dictionary_exclude_files",
+            "dictionaries_path",
+        ):
+            with self.subTest(key=key):
+                entry = self.entry_for(key)
+                variable = self.app.normalizer_preview_vars[key]
+                variable.set("before.dic")
+                entry.selection_range(0, "end")
+                self.root.clipboard_clear()
+                self.root.clipboard_append("after.dic")
+                generation = self.mark_completed_preview()
+                entry.event_generate("<<Paste>>")
+
+                self.assertEqual(variable.get(), "after.dic")
+                self.assert_preview_invalidated(generation)
+
+                entry.selection_range(0, "end")
+                generation = self.mark_completed_preview()
+                entry.event_generate("<<Cut>>")
+
+                self.assertEqual(variable.get(), "")
+                self.assert_preview_invalidated(generation)
+
+
 if __name__ == "__main__":
     unittest.main()

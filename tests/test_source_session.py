@@ -211,6 +211,17 @@ class SourceSessionTests(unittest.TestCase):
         self.assertEqual(tuple(
             group["name"] for group in app._source_plan_groups.values()
         ), ("Том 1", "Том 2"))
+        group_ids = tuple(app._source_plan_groups)
+        self.assertEqual(
+            tuple(app.tree.item(group_id, "values")[0] for group_id in group_ids),
+            ("📁 Группа", "📁 Группа"),
+        )
+        app._save_source_session()
+        restored = self.app()
+        self.assertEqual(
+            tuple(restored.tree.item(group_id, "values")[0] for group_id in group_ids),
+            ("📁 Группа", "📁 Группа"),
+        )
 
     def test_reordered_tree_rejects_stale_estimate_without_losing_existing_group(self):
         app = self.app()
@@ -324,6 +335,92 @@ class SourceSessionTests(unittest.TestCase):
         self.assertIn("Обновить папку", message)
         self.assertIn("Объединение всей очереди", message)
         self.assertEqual(app.tree.get_children("m4b_plan:my-group"), ("01.txt", "02.txt"))
+
+    def test_selected_source_order_follows_tree_and_deduplicates_parent(self):
+        app = self.app()
+        self.add_group(app)
+        app.tree.selection = lambda: ("03.txt", "02.txt", "m4b_plan:my-group")
+
+        self.assertEqual(
+            app._selected_source_file_ids(),
+            ("03.txt", "01.txt", "02.txt"),
+        )
+
+    def test_start_refreshes_source_tree_after_input_folder_change(self):
+        app = self.app()
+        changed = self.root / "new-texts"
+        changed.mkdir()
+        (changed / "99.txt").write_text("Новый текст", encoding="utf-8")
+        app.config["input_dir"] = str(changed)
+        app.batch_processor = None
+        app.direct_processor = None
+        app._warn_if_cache_busy_for_synthesis = mock.Mock(return_value=False)
+        app._validate_api_steps_ui = mock.Mock(return_value=True)
+        app._validate_book_output_profile = mock.Mock(return_value=False)
+
+        app.start_processing()
+
+        self.assertEqual(app._source_tree_file_ids(), ["99.txt"])
+        self.assertEqual(app._source_session_input_dir, changed)
+        app._validate_book_output_profile.assert_called_once_with()
+
+    def test_unreadable_source_fallback_updates_path_field(self):
+        app = self.app()
+        fallback = self.root / "fallback-texts"
+        fallback.mkdir()
+        (fallback / "fallback.txt").write_text("Запасной текст", encoding="utf-8")
+        app.include_subdirs_var.get.return_value = True
+        app.settings_vars = {"input_dir": mock.Mock()}
+        app._source_reload_after_processing = True
+
+        with mock.patch.object(studio, "DEFAULT_INPUT_DIR", str(fallback)), mock.patch.object(
+            studio, "scan_source_tree", side_effect=OSError("нет доступа")
+        ):
+            app.load_files()
+
+        self.assertEqual(app._source_tree_file_ids(), ["fallback.txt"])
+        self.assertEqual(app.config["input_dir"], str(fallback))
+        app.settings_vars["input_dir"].set.assert_called_with(str(fallback))
+        self.assertFalse(app._source_reload_after_processing)
+
+    def test_active_queue_keeps_tree_until_deferred_reload_after_finish(self):
+        app = self.app()
+        changed = self.root / "new-texts"
+        changed.mkdir()
+        (changed / "99.txt").write_text("Новый текст", encoding="utf-8")
+        app.config["input_dir"] = str(changed)
+        processor = mock.Mock(is_stopped=False)
+        app.batch_processor = processor
+        app.processor = processor
+        app.direct_processor = None
+        app.load_files()
+
+        self.assertEqual(app._source_tree_file_ids(), ["01.txt", "02.txt", "03.txt"])
+        self.assertTrue(app._source_reload_after_processing)
+        self.assertEqual(app._source_session_input_dir, self.source)
+
+        for name in (
+            "btn_start_all", "btn_start_sel", "btn_refresh", "btn_remove_sel",
+            "btn_prepare_m4b_plan", "btn_source_group_selection",
+            "btn_source_merge_groups", "btn_source_reset_groups",
+            "btn_source_rename_group", "btn_source_group_tags",
+            "btn_source_output_targets", "btn_source_settings",
+            "chk_include_subdirs", "chk_batch_prepared_text", "btn_stop",
+            "btn_hard_stop", "batch_prepared_text_var",
+        ):
+            setattr(app, name, mock.Mock())
+        for name in (
+            "_refresh_source_settings_summary", "_set_source_m4b_reflow_ui_state",
+            "_set_source_file_progress_indeterminate", "_apply_pending_source_m4b_ui_plan",
+            "_release_shared_cache_if_idle", "_save_source_session",
+        ):
+            setattr(app, name, mock.Mock())
+
+        app.finish_processing(processor)
+
+        self.assertEqual(app._source_tree_file_ids(), ["99.txt"])
+        self.assertEqual(app._source_session_input_dir, changed)
+        self.assertFalse(app._source_reload_after_processing)
 
     def test_refresh_adds_new_files_removes_missing_and_keeps_remaining_group(self):
         app = self.app()

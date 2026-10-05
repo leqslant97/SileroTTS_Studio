@@ -112,6 +112,93 @@ class ExportCancellationTests(unittest.TestCase):
             self.assertEqual(set(folder.iterdir()), {source, encoded, output})
 
 
+class GroupTagInheritanceTests(unittest.TestCase):
+    @staticmethod
+    def make_app(source, *, file_language="", group_language="rus"):
+        app = object.__new__(studio.TTSApp)
+        app.lbl_export_status = object()
+        app._post_status_label = mock.Mock()
+        app.export_tree = mock.Mock()
+        app.export_tree.get_children.side_effect = (
+            lambda item="": ("file",) if item == "group" else ("group",)
+        )
+        app.export_files = {
+            "file": {"path": str(source), "title": "Глава", "language": file_language}
+        }
+        app.export_groups = {"group": {"name": "Книга", "language": group_language}}
+        app.export_targets = []
+        for name, value in {
+            "export_tags_only_var": True,
+            "export_outdir_var": "",
+            "export_apply_fx_var": False,
+            "export_fmt_var": "mp3",
+            "export_bitrate_var": "auto",
+            "export_sample_rate_var": "auto",
+            "export_channels_var": "auto",
+        }.items():
+            setattr(app, name, mock.Mock(get=lambda current=value: current))
+        app.export_progress = mock.Mock()
+        app.config = {}
+        for name in (
+            "save_settings", "_set_export_running_state",
+            "_set_export_progress_indeterminate", "_show_error", "_show_warning",
+            "_show_info", "_set_export_progress_value", "_set_export_status",
+            "_finish_export_process_ui",
+        ):
+            setattr(app, name, mock.Mock())
+        app._post_to_ui = lambda callback, *args, **kwargs: callback(*args, **kwargs)
+        return app
+
+    @staticmethod
+    def run_export(app):
+        with mock.patch.object(threading.Thread, "start"):
+            app.start_export_process()
+        app._export_thread._target()
+
+    def test_tags_only_inherits_group_language_when_file_language_is_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "chapter.mp3"
+            source.write_bytes(b"source")
+            app = self.make_app(source)
+            app._update_file_tags_inplace = mock.Mock(return_value=True)
+            self.run_export(app)
+            self.assertEqual(app._update_file_tags_inplace.call_args.args[1]["language"], "rus")
+            app._show_error.assert_not_called()
+
+    def test_tags_only_keeps_explicit_file_language(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "chapter.mp3"
+            source.write_bytes(b"source")
+            app = self.make_app(source, file_language="eng")
+            app._update_file_tags_inplace = mock.Mock(return_value=True)
+            self.run_export(app)
+            self.assertEqual(app._update_file_tags_inplace.call_args.args[1]["language"], "eng")
+            app._show_error.assert_not_called()
+
+    @unittest.skipUnless(
+        Path(studio.get_ffmpeg_path()).is_file()
+        and Path(studio.get_ffprobe_path()).is_file(),
+        "Для проверки необходимы FFmpeg и FFprobe",
+    )
+    def test_real_tags_only_writes_inherited_language_to_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "chapter.mp3"
+            subprocess.run([
+                studio.get_ffmpeg_path(), "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=duration=0.1",
+                "-metadata", "language=eng", str(source),
+            ], check=True)
+            app = self.make_app(source)
+            self.run_export(app)
+            result = json.loads(subprocess.check_output([
+                studio.get_ffprobe_path(), "-v", "error",
+                "-show_format", "-of", "json", str(source),
+            ]))
+            self.assertEqual(result["format"]["tags"]["language"], "rus")
+            self.assertEqual(list(Path(directory).iterdir()), [source])
+            app._show_error.assert_not_called()
+
+
 class InplaceMetadataAuditTests(unittest.TestCase):
     @staticmethod
     def make_app():
@@ -260,6 +347,218 @@ class M4BTemplateConsistencyTests(unittest.TestCase):
                 )
             self.assertEqual(paths, [record["path"] for record in planned])
             self.assertTrue(paths[1].name.startswith("Второй"))
+
+
+class ExportDialogFormatSwitchTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            self.root = studio.tk.Tk()
+        except studio.tk.TclError as exc:
+            self.skipTest(f"Tk is unavailable: {exc}")
+        self.root.withdraw()
+        self.addCleanup(self.root.destroy)
+
+    @staticmethod
+    def descendants(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from ExportDialogFormatSwitchTests.descendants(child)
+
+    def make_app(self):
+        app = object.__new__(studio.TTSApp)
+        app.root = self.root
+        app.config = {}
+        app.settings_vars = {}
+        app.export_fmt_var = studio.tk.StringVar(master=self.root, value="mp3")
+        app.save_settings = mock.Mock(return_value=True)
+        app._refresh_output_targets_summary = mock.Mock()
+        app._refresh_audio_profile_summaries = mock.Mock()
+        app._sync_export_mode_controls = mock.Mock()
+        app._show_error = mock.Mock()
+        app.get_status_color = mock.Mock(return_value="#555555")
+        app._register_palette_widget = lambda widget, _kind: widget
+        app._close_popup_safely = lambda dialog: dialog.destroy()
+        app._center_popup = lambda dialog, *_args, **_kwargs: dialog.deiconify()
+
+        def make_hint(parent, _text, **_kwargs):
+            shell = studio.ttk.Frame(parent)
+            return shell, studio.ttk.Label(shell), studio.ttk.Button(shell)
+
+        app._make_collapsible_hint = make_hint
+        return app
+
+    def dialog(self, title):
+        return next(
+            child for child in self.root.winfo_children()
+            if isinstance(child, studio.tk.Toplevel) and child.title() == title
+        )
+
+    def button(self, dialog, text):
+        return next(
+            widget for widget in self.descendants(dialog)
+            if isinstance(widget, studio.ttk.Button) and widget.cget("text") == text
+        )
+
+    def test_output_target_restores_non_m4b_assembly(self):
+        labels = studio.OUTPUT_TARGET_ASSEMBLY_LABELS
+        for assembly_mode in ("inherit", "files", "merge"):
+            with self.subTest(assembly_mode=assembly_mode):
+                app = self.make_app()
+                app.export_targets = [studio.OutputTarget(
+                    format="mp3", assembly_mode=assembly_mode,
+                    bitrate="192k", filename_template="{name}",
+                    apply_effects=True,
+                ).to_dict()]
+                app.open_output_targets_dialog()
+                dialog = self.dialog("Набор выходных форматов")
+                try:
+                    widgets = list(self.descendants(dialog))
+                    format_combo = next(
+                        widget for widget in widgets
+                        if isinstance(widget, studio.ttk.Combobox)
+                        and "m4b" in widget.cget("values")
+                    )
+                    assembly_combo = next(
+                        widget for widget in widgets
+                        if isinstance(widget, studio.ttk.Combobox)
+                        and labels["inherit"] in widget.cget("values")
+                    )
+                    filename_hint = next(
+                        widget for widget in widgets
+                        if isinstance(widget, studio.ttk.Label)
+                        and widget.cget("text").startswith("Пусто —")
+                        and "{source_name}" in widget.cget("text")
+                    )
+                    track_check = next(
+                        widget for widget in widgets
+                        if isinstance(widget, studio.ttk.Checkbutton)
+                        and widget.cget("text") == "N/T"
+                    )
+
+                    def volume_header_visible():
+                        return any(
+                            isinstance(widget, studio.ttk.Label)
+                            and widget.cget("text") == "Том N/T"
+                            and widget.winfo_manager() == "grid"
+                            for widget in widgets
+                        )
+
+                    self.assertEqual(assembly_combo.get(), labels[assembly_mode])
+                    self.assertFalse(volume_header_visible())
+                    self.assertEqual(track_check.winfo_manager(), "")
+                    if assembly_mode == "inherit":
+                        for selected_mode, expected_hint in (
+                            ("merge", "Пусто — имя группы."),
+                            ("files", "Пусто — имя Title исходного файла."),
+                            ("inherit", "Пусто — имя группы при склейке"),
+                        ):
+                            assembly_combo.set(labels[selected_mode])
+                            assembly_combo.event_generate("<<ComboboxSelected>>")
+                            self.assertIn(expected_hint, filename_hint.cget("text"))
+                    format_combo.set("m4b")
+                    self.assertEqual(assembly_combo.get(), labels["merge"])
+                    self.assertIn("disabled", assembly_combo.state())
+                    self.assertTrue(volume_header_visible())
+                    self.assertEqual(track_check.winfo_manager(), "grid")
+                    for output_format in ("wav", "ogg", "opus", "m4a", "mp3"):
+                        format_combo.set(output_format)
+                        self.assertEqual(assembly_combo.get(), labels[assembly_mode])
+                        self.assertNotIn("disabled", assembly_combo.state())
+                        self.assertFalse(volume_header_visible())
+                        self.assertEqual(track_check.winfo_manager(), "")
+                        if output_format != "mp3":
+                            format_combo.set("m4b")
+                            self.assertEqual(track_check.winfo_manager(), "grid")
+                    self.button(dialog, "Применить").invoke()
+                    app._show_error.assert_not_called()
+                    self.assertEqual(app.export_targets[0]["assembly_mode"], assembly_mode)
+                    self.assertEqual(app.export_targets[0]["format"], "mp3")
+                    self.assertEqual(app.export_targets[0]["bitrate"], "192k")
+                    self.assertEqual(app.export_targets[0]["filename_template"], "{name}")
+                    self.assertTrue(app.export_targets[0]["apply_effects"])
+                    app.save_settings.assert_called_once()
+                finally:
+                    if dialog.winfo_exists():
+                        dialog.destroy()
+
+    def test_hidden_m4b_values_do_not_block_regular_formats(self):
+        app = self.make_app()
+        values = {
+            "export_bitrate_var": "auto",
+            "export_sample_rate_var": "auto",
+            "export_channels_var": "auto",
+            "export_apply_fx_var": False,
+            "exp_speed_var": 1.0,
+            "exp_pitch_var": 1.0,
+            "exp_echo_var": False,
+            "exp_delay_var": 300,
+            "exp_decay_var": 0.3,
+            "export_m4b_template_var": "{invalid_field}",
+            "export_m4b_hours_var": "unfinished",
+            "export_m4b_chapters_var": "-1",
+            "export_m4b_bitrate_var": "bad",
+        }
+        for name, value in values.items():
+            setattr(app, name, studio.tk.StringVar(master=self.root, value=value))
+
+        for output_format in ("mp3", "wav", "ogg", "opus", "m4a"):
+            with self.subTest(output_format=output_format):
+                app.export_fmt_var.set(output_format)
+                app.open_export_settings_dialog()
+                dialog = self.dialog("Продвинутые параметры сборки")
+                self.button(dialog, "Применить").invoke()
+                self.assertFalse(dialog.winfo_exists())
+                self.assertEqual(app.export_fmt_var.get(), output_format)
+                for name in (
+                    "export_m4b_template_var", "export_m4b_hours_var",
+                    "export_m4b_chapters_var", "export_m4b_bitrate_var",
+                ):
+                    self.assertEqual(getattr(app, name).get(), values[name])
+        self.assertEqual(app.save_settings.call_count, 5)
+
+        app.export_fmt_var.set("m4b")
+        app.open_export_settings_dialog()
+        dialog = self.dialog("Продвинутые параметры сборки")
+        self.button(dialog, "Применить").invoke()
+        self.assertTrue(dialog.winfo_exists())
+        self.assertEqual(app.save_settings.call_count, 5)
+        dialog.destroy()
+
+    def test_effects_return_after_temporary_m4b_selection(self):
+        app = self.make_app()
+        values = {
+            "export_bitrate_var": "auto",
+            "export_sample_rate_var": "auto",
+            "export_channels_var": "auto",
+            "export_apply_fx_var": True,
+            "exp_speed_var": 1.2,
+            "exp_pitch_var": 1.0,
+            "exp_echo_var": False,
+            "exp_delay_var": 300,
+            "exp_decay_var": 0.3,
+            "export_m4b_template_var": "",
+            "export_m4b_hours_var": 0,
+            "export_m4b_chapters_var": 0,
+            "export_m4b_bitrate_var": "64k",
+        }
+        for name, value in values.items():
+            setattr(app, name, studio.tk.StringVar(master=self.root, value=value))
+
+        app.open_export_settings_dialog()
+        dialog = self.dialog("Продвинутые параметры сборки")
+        format_combo = next(
+            widget for widget in self.descendants(dialog)
+            if isinstance(widget, studio.ttk.Combobox)
+            and "m4b" in widget.cget("values")
+        )
+        format_combo.set("m4b")
+        format_combo.set("mp3")
+        self.button(dialog, "Применить").invoke()
+
+        self.assertFalse(dialog.winfo_exists())
+        self.assertTrue(studio._config_bool(app.export_apply_fx_var.get()))
+        self.assertEqual(app.export_fmt_var.get(), "mp3")
+        app.save_settings.assert_called_once()
 
 
 if __name__ == "__main__":
