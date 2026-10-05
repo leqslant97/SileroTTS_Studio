@@ -15,12 +15,12 @@ env:
   # setup-python закрепляет эту версию на Windows/Linux.
   PYTHON_VERSION: "3.13.15"
   # Версия нормализатора должна совпадать с requirements*.txt. Проект
-  # использует выпущенный пакет, а не неприкреплённую копию с GitHub,
+  # использует выпущенный пакет, а не копию с GitHub без фиксированной версии,
   # чтобы сборки оставались воспроизводимыми.
   RU_NORMALIZR_VERSION: "0.3.0"
-  # Версионированные формулы Homebrew привязаны к ветке минорной версии Python,
-  # а не к каждому доступному патчу. Задание macOS сохраняет выбранную ветку
-  # и использует абсолютный путь к этому интерпретатору в следующих командах.
+  # Имена формул Homebrew задают минорную ветку Python; точные версии Python/Tk
+  # определяются закреплённой ревизией homebrew/core. Следующие шаги используют
+  # абсолютный путь к выбранному интерпретатору.
   MACOS_PYTHON_SERIES: "3.13"
   # На macOS используются Python/Tk из Homebrew: дистрибутив setup-python
   # сейчас содержит Tk 8.6. Сборке Aqua нужен Tk 9 для надёжного переключения
@@ -219,7 +219,8 @@ jobs:
             exit 0
           fi
 
-          if ! tar -xzf "$archive_path" -C / ./usr/local; then
+          # Пропускаем заголовок /usr/local: его метаданные принадлежат системе.
+          if ! tar -xzf "$archive_path" -C /usr/local --strip-components 3 ./usr/local; then
             # После частичной распаковки резервная установка не гарантирует
             # целостность Cellar и ссылок opt; сборку такого окружения прерываем.
             echo "::error::Не удалось восстановить Intel Homebrew-префикс из проверенного архива."
@@ -314,12 +315,32 @@ jobs:
         timeout-minutes: 60
         shell: bash
         env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
           # Все вызовы Python ниже используют абсолютный путь к выбранной формуле.
           HOMEBREW_NO_PATH_SHADOW_CHECK: "1"
         run: |
-          # Обновляем формулы вместе, чтобы Python и tkinter использовали одну версию.
-          brew update
+          # Используем ту же ревизию формул, что и Intel: Python 3.13.15 и Tcl/Tk 9.0.
+          brew tap --force homebrew/core
+          core_dir="$(brew --repository homebrew/core)"
+          git -C "$core_dir" fetch --depth 1 origin "$MACOS_INTEL_CORE_REVISION"
+          git -C "$core_dir" checkout --force --detach FETCH_HEAD
           python_series="$MACOS_PYTHON_SERIES"
+          # В одноразовом runner заменяем предустановленные версии этих формул:
+          # brew install может оставить более новый Python или Tcl/Tk в opt.
+          for formula in "python-tk@$python_series" "python@$python_series" tcl-tk; do
+            if brew list --formula "$formula" >/dev/null 2>&1; then
+              brew uninstall --formula --force --ignore-dependencies "$formula"
+            fi
+          done
+          # --skip-link не передаётся зависимостям; устанавливаем OpenSSL отдельно.
+          if brew list --formula openssl@1.1 >/dev/null 2>&1; then
+            brew unlink openssl@1.1
+          fi
+          brew install --verbose --skip-link openssl@3
+          brew install --verbose --skip-link tcl-tk
           brew install --skip-link "python@$python_series"
           # Python ищет pip в общем site-packages Homebrew. --skip-link не создаёт
           # эти ссылки; сборка tkinter из исходников тогда падает с No module named pip.
@@ -334,8 +355,8 @@ jobs:
           echo "Homebrew Python: $python_bin"
           "$python_bin" --version
           installed_python_version="$("$python_bin" -c 'import platform; print(platform.python_version())')"
-          if [[ "${installed_python_version%.*}" != "$MACOS_PYTHON_SERIES" ]]; then
-            echo "::error::Homebrew installed Python $installed_python_version; expected $MACOS_PYTHON_SERIES.x"
+          if [[ "$installed_python_version" != "$PYTHON_VERSION" ]]; then
+            echo "::error::Homebrew installed Python $installed_python_version; expected $PYTHON_VERSION"
             exit 1
           fi
           echo "MACOS_PYTHON_VERSION=$installed_python_version" >> "$GITHUB_ENV"
@@ -433,7 +454,7 @@ jobs:
             source .venv/bin/activate
           fi
           # Устанавливаем только зафиксированные в репозитории зависимости,
-          # чтобы бинарники релиза не зависели от случайно новых транзитивных версий.
+          # чтобы бинарники релиза не зависели от обновлений транзитивных зависимостей.
           python -m pip install -r requirements-release.txt
           python -m pip check
 
