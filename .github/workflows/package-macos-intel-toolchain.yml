@@ -136,8 +136,10 @@ jobs:
           tools_dir="${{ steps.ffmpeg.outputs.tools_dir }}"
           encoders="$(/usr/bin/arch -x86_64 "$tools_dir/ffmpeg" -hide_banner -encoders 2>&1)"
           decoders="$(/usr/bin/arch -x86_64 "$tools_dir/ffmpeg" -hide_banner -decoders 2>&1)"
+          grep -Eq '[[:space:]]libmp3lame([[:space:]]|$)' <<< "$encoders"
           grep -q 'libopus' <<< "$encoders"
           grep -q 'libvorbis' <<< "$encoders"
+          grep -Eq '[[:space:]]aac([[:space:]]|$)' <<< "$encoders"
           grep -Eq '[[:space:]]opus([[:space:]]|$)' <<< "$decoders"
           grep -Eq '[[:space:]]vorbis([[:space:]]|$)' <<< "$decoders"
 
