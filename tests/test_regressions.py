@@ -946,9 +946,11 @@ class ConfigurationValidationTests(unittest.TestCase):
             config = studio.DEFAULT_CONFIG.copy()
             config["input_dir"] = str(blocked_parent / "texts")
 
-            studio.TTSProcessor(
+            processor = studio.TTSProcessor(
                 config, shared_cache={}, shared_processing_statuses={}
             )
+            self.addCleanup(processor.close_cache)
+            self.addCleanup(processor.cleanup_transient_audio_files)
 
             self.assertEqual(config["input_dir"], studio.DEFAULT_INPUT_DIR)
 
@@ -14290,16 +14292,10 @@ class CacheBehaviorTests(unittest.TestCase):
         waiter_is_waiting = threading.Event()
         real_event_type = threading.Event
 
-        class ObservedInflightEvent:
-            def __init__(self):
-                self._event = real_event_type()
-
+        class ObservedInflightEvent(real_event_type):
             def wait(self, timeout=None):
                 waiter_is_waiting.set()
-                return self._event.wait(timeout)
-
-            def set(self):
-                return self._event.set()
+                return super().wait(timeout)
 
         class BlockingSession(self.FakeSession):
             def post(self, url, json, timeout):
@@ -14329,9 +14325,7 @@ class CacheBehaviorTests(unittest.TestCase):
 
         def fake_prepare(_source, destination, **_kwargs):
             destination = Path(destination)
-            destination.write_bytes(
-                fake_ogg_first_page(b"OpusHead-shared audio")
-            )
+            destination.write_bytes(self.complete_cached_opus())
             return destination
 
         owner_thread = threading.Thread(
@@ -14347,15 +14341,17 @@ class CacheBehaviorTests(unittest.TestCase):
         ), mock.patch.object(
             studio, "_prepare_api_audio_file", side_effect=fake_prepare
         ):
-            owner_thread.start()
-            self.assertTrue(owner_post_started.wait(timeout=5))
+            try:
+                owner_thread.start()
+                self.assertTrue(owner_post_started.wait(timeout=5))
 
-            waiter_thread.start()
-            self.assertTrue(waiter_is_waiting.wait(timeout=5))
-            release_owner_post.set()
-
-            owner_thread.join(timeout=5)
-            waiter_thread.join(timeout=5)
+                waiter_thread.start()
+                self.assertTrue(waiter_is_waiting.wait(timeout=5))
+            finally:
+                release_owner_post.set()
+                for thread in (owner_thread, waiter_thread):
+                    if thread.ident is not None:
+                        thread.join(timeout=5)
 
         self.assertFalse(owner_thread.is_alive())
         self.assertFalse(waiter_thread.is_alive())
@@ -14403,16 +14399,10 @@ class CacheBehaviorTests(unittest.TestCase):
         forced_post_started = threading.Event()
         real_event_type = threading.Event
 
-        class ObservedInflightEvent:
-            def __init__(self):
-                self._event = real_event_type()
-
+        class ObservedInflightEvent(real_event_type):
             def wait(self, timeout=None):
                 forced_waiting.set()
-                return self._event.wait(timeout)
-
-            def set(self):
-                return self._event.set()
+                return super().wait(timeout)
 
         class OwnerSession(self.FakeSession):
             def post(self, url, json, timeout):
@@ -14446,9 +14436,7 @@ class CacheBehaviorTests(unittest.TestCase):
         def fake_prepare(_source, destination, **_kwargs):
             destination = Path(destination)
             prepare_calls.append(destination)
-            destination.write_bytes(
-                fake_ogg_first_page(b"OpusHead-forced audio")
-            )
+            destination.write_bytes(self.complete_cached_opus())
             return destination
 
         owner_thread = threading.Thread(
@@ -14465,16 +14453,18 @@ class CacheBehaviorTests(unittest.TestCase):
         ), mock.patch.object(
             studio, "_prepare_api_audio_file", side_effect=fake_prepare
         ):
-            owner_thread.start()
-            self.assertTrue(owner_post_started.wait(timeout=5))
+            try:
+                owner_thread.start()
+                self.assertTrue(owner_post_started.wait(timeout=5))
 
-            forced_thread.start()
-            self.assertTrue(forced_waiting.wait(timeout=5))
-            self.assertFalse(forced_post_started.wait(timeout=0.05))
-            release_owner_post.set()
-
-            owner_thread.join(timeout=5)
-            forced_thread.join(timeout=5)
+                forced_thread.start()
+                self.assertTrue(forced_waiting.wait(timeout=5))
+                self.assertFalse(forced_post_started.wait(timeout=0.05))
+            finally:
+                release_owner_post.set()
+                for thread in (owner_thread, forced_thread):
+                    if thread.ident is not None:
+                        thread.join(timeout=5)
 
         self.assertFalse(owner_thread.is_alive())
         self.assertFalse(forced_thread.is_alive())

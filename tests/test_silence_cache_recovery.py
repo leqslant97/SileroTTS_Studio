@@ -50,6 +50,9 @@ class SilenceCacheRecoveryTests(unittest.TestCase):
         studio._validate_complete_ogg_audio_file(fixture)
 
     def setUp(self):
+        cache_patch = mock.patch.object(studio, "_OGG_VALIDATION_CACHE", {})
+        cache_patch.start()
+        self.addCleanup(cache_patch.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.cache_dir = Path(self.directory.name)
@@ -75,15 +78,17 @@ class SilenceCacheRecoveryTests(unittest.TestCase):
         self.assertEqual(decoded.stdout, b"\x00" * (48000 * 2))
         self.assertEqual(list(path.parent.glob(".*.tmp.ogg")), [])
 
-    def assert_warm_hit_does_not_scan_or_encode(self, processor=None):
+    def assert_warm_hit_validates_without_encoding(self, processor=None):
         processor = processor or self.processor
+        expected_scans = 1 if studio.platform.system() == "Windows" else 0
         with mock.patch.object(studio, "_validate_complete_ogg_audio_file",
-                               side_effect=AssertionError("Повторное чтение Ogg")), \
+                               wraps=studio._validate_complete_ogg_audio_file) as validate, \
              mock.patch.object(studio.AudioSegment, "export",
                                side_effect=AssertionError("Повторное кодирование")), \
              mock.patch.object(studio.subprocess, "Popen",
                                side_effect=AssertionError("Новый FFmpeg/ffprobe")):
             self.assertEqual(processor._get_silence_file(1000), self.silence_path)
+        self.assertEqual(validate.call_count, expected_scans)
 
     def test_truncated_opus_header_is_regenerated_and_published_into_memo(self):
         self.silence_path.write_bytes(self.truncated_silence)
@@ -94,7 +99,7 @@ class SilenceCacheRecoveryTests(unittest.TestCase):
         with studio._OGG_VALIDATION_CACHE_LOCK:
             self.assertIn(studio._ogg_audio_file_fingerprint(result),
                           studio._OGG_VALIDATION_CACHE)
-        self.assert_warm_hit_does_not_scan_or_encode()
+        self.assert_warm_hit_validates_without_encoding()
 
     def test_payload_corruption_invalidates_previous_memo_and_is_regenerated(self):
         self.silence_path.write_bytes(self.valid_silence)
@@ -106,9 +111,9 @@ class SilenceCacheRecoveryTests(unittest.TestCase):
             studio._validate_complete_ogg_audio_file(self.silence_path)
         result = self.processor._get_silence_file(1000)
         self.assert_real_second_of_silence(result)
-        self.assert_warm_hit_does_not_scan_or_encode()
+        self.assert_warm_hit_validates_without_encoding()
 
-    def test_existing_valid_silence_is_checked_once_without_ffmpeg_or_ffprobe(self):
+    def test_existing_valid_silence_uses_platform_validation_without_encoding(self):
         self.silence_path.write_bytes(self.valid_silence)
         with mock.patch.object(studio, "_validate_complete_ogg_audio_file",
                                wraps=studio._validate_complete_ogg_audio_file) as validate, \
@@ -119,7 +124,8 @@ class SilenceCacheRecoveryTests(unittest.TestCase):
             for _ in range(3):
                 self.assertEqual(self.processor._get_silence_file(1000),
                                  self.silence_path)
-        self.assertEqual(validate.call_count, 1)
+        expected_validations = 3 if studio.platform.system() == "Windows" else 1
+        self.assertEqual(validate.call_count, expected_validations)
         self.assertEqual(self.silence_path.read_bytes(), self.valid_silence)
 
     def test_incomplete_encoder_output_does_not_replace_old_file_or_leave_temp(self):
@@ -176,11 +182,12 @@ class SilenceCacheRecoveryTests(unittest.TestCase):
                 self.assertEqual([future.result(timeout=10) for future in futures],
                                  [self.silence_path, self.silence_path])
         self.assertEqual(publish.call_count, 1)
-        self.assertEqual(memo.call_count, 1)
-        self.assertEqual(validate.call_count, 2)
+        is_windows = studio.platform.system() == "Windows"
+        self.assertEqual(memo.call_count, 2 if is_windows else 1)
+        self.assertEqual(validate.call_count, 3 if is_windows else 2)
         self.assert_real_second_of_silence(self.silence_path)
         for processor in processors:
-            self.assert_warm_hit_does_not_scan_or_encode(processor)
+            self.assert_warm_hit_validates_without_encoding(processor)
 
 
 if __name__ == "__main__":

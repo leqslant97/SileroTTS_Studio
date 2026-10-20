@@ -191,6 +191,7 @@ class SynthesisCancellationTests(unittest.TestCase):
         self.processor = studio.TTSProcessor(
             self.config, shared_cache={}, shared_processing_statuses={}
         )
+        self.addCleanup(self.processor.close_cache)
         self.addCleanup(self.processor.cleanup_transient_audio_files)
 
     def test_stop_interrupts_both_network_and_http_retry_delays(self):

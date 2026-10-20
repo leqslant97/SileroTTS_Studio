@@ -103,8 +103,11 @@ class CacheBackendSelectionTests(unittest.TestCase):
             studio.get_active_cache_backend(self.cache)
         self.assertEqual(self.database.read_bytes(), before)
         self.database.unlink()
-        with sqlite3.connect(self.database) as connection:
+        connection = sqlite3.connect(self.database)
+        try:
             connection.execute("CREATE TABLE user_data (value TEXT)")
+        finally:
+            connection.close()
         with self.assertRaises((ValueError, sqlite3.DatabaseError)):
             studio.get_active_cache_backend(self.cache)
         self.assertFalse(self.main.exists())
