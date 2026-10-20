@@ -172,9 +172,11 @@ class SQLiteCacheIndexTests(unittest.TestCase):
         statements = []
         original_dispatch = index._dispatch
         plans = []
+        instructions = []
         def traced(connection, operation, args):
             if operation == 'query_page':
                 connection.set_trace_callback(statements.append)
+                connection.set_progress_handler(lambda: instructions.append(None) or 0, 1)
                 try:
                     result = original_dispatch(connection, operation, args)
                     statement = next(sql for sql in reversed(statements) if sql.startswith('SELECT CASE WHEN length'))
@@ -182,15 +184,21 @@ class SQLiteCacheIndexTests(unittest.TestCase):
                     return result
                 finally:
                     connection.set_trace_callback(None)
+                    connection.set_progress_handler(None, 0)
             return original_dispatch(connection, operation, args)
-        for number in range(100):
+        for number in range(10000):
             index.upsert(f'{number:04}', {'original_text': 'sample'})
+        index.flush()
+        index.query_page(cursor='0020', limit=5, max_scan_rows=10)
         with mock.patch.object(index, '_dispatch', side_effect=traced):
-            index.query_page(cursor='0020', limit=5, max_scan_rows=10)
+            page = index.query_page(cursor='0020', limit=5, max_scan_rows=10)
         details = [row[3] for row in plans]
         self.assertTrue(any('MERGE (UNION ALL)' in item for item in details), details)
         self.assertTrue(any('SEARCH entries USING PRIMARY KEY (key>?)' in item for item in details), details)
-        self.assertFalse(any('USE TEMP B-TREE FOR ORDER BY' in item for item in details), details)
+        # Старые SQLite могут сортировать уже ограниченную внутренним LIMIT
+        # страницу. Число инструкций отличает её от сортировки всего остатка.
+        self.assertLess(len(instructions), 1000, (len(instructions), details))
+        self.assertEqual([key for key, _ in page['rows']], ['0021', '0022', '0023', '0024', '0025'])
 
     def test_failed_flush_and_close_preserve_pending_and_allow_retry(self):
         index = self.index()

@@ -82,6 +82,7 @@ class TaskNotificationTkTests(unittest.TestCase):
             import importlib.util
             import json
             import logging
+            import os
             import queue
             import shutil
             import sys
@@ -90,7 +91,12 @@ class TaskNotificationTkTests(unittest.TestCase):
             import time
             from pathlib import Path
 
-            with tempfile.TemporaryDirectory(prefix="silero_notification_test_") as directory:
+            from contextlib import ExitStack
+
+            original_directory = Path.cwd()
+            with tempfile.TemporaryDirectory(prefix="silero_notification_test_") as directory, ExitStack() as cleanup:
+                cleanup.callback(os.chdir, original_directory)
+                cleanup.callback(logging.shutdown)
                 path = Path(directory) / "SileroTTS_Studio.py"
                 shutil.copy2(sys.argv[1], path)
                 spec = importlib.util.spec_from_file_location("notification_test", path)

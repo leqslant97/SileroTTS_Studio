@@ -268,7 +268,10 @@ class CacheOptimizationSourceTests(unittest.TestCase):
                 )
 
                 app = object.__new__(studio.TTSApp)
-                app.config = {"input_dir": str(source_dir), "include_subdirs": True}
+                app.config = {
+                    "input_dir": str(source_dir), "include_subdirs": True,
+                    "cache_dir": str(processor.cache_dir),
+                }
                 app.is_cache_operation_running = mock.Mock(return_value=False)
                 app.is_synthesis_running = mock.Mock(return_value=False)
                 app._validate_api_steps_ui = mock.Mock(return_value=True)

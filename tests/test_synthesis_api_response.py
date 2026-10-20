@@ -275,7 +275,8 @@ class ApiAudioCompletenessTests(unittest.TestCase):
         path = self.work / "cached.ogg"
         path.write_bytes(self.samples["mono"])
         original_validation = studio._validate_complete_ogg_audio_file
-        with mock.patch.object(studio, "_validate_complete_ogg_audio_file", wraps=original_validation) as validate:
+        with mock.patch.object(studio.platform, "system", return_value="Linux"), \
+                mock.patch.object(studio, "_validate_complete_ogg_audio_file", wraps=original_validation) as validate:
             studio._canonicalize_cached_audio_if_needed(path)
             studio._canonicalize_cached_audio_if_needed(path)
             self.assertEqual(validate.call_count, 1)
@@ -295,11 +296,12 @@ class ApiAudioCompletenessTests(unittest.TestCase):
         processor, _response = self.processor()
         text = "Новый исправный фрагмент."
         processor.synthesize_sentence(text, text)
-        with mock.patch.object(studio, "_validate_complete_ogg_audio_file") as validate:
+        with mock.patch.object(studio, "_validate_complete_ogg_audio_file",
+                               wraps=studio._validate_complete_ogg_audio_file) as validate:
             result, success = processor.synthesize_sentence(text, text)
         self.assertTrue(success)
         self.assertTrue(result.is_file())
-        validate.assert_not_called()
+        self.assertEqual(validate.call_count, 1 if studio.platform.system() == "Windows" else 0)
         processor.session.post.assert_called_once()
 
     def test_retargeted_audio_symlink_revalidates_same_size_and_mtime(self):
@@ -320,12 +322,12 @@ class ApiAudioCompletenessTests(unittest.TestCase):
         with mock.patch.object(studio, "_validate_complete_ogg_audio_file", wraps=validation) as validate:
             studio._validate_cached_ogg_audio_file(alias)
             studio._validate_cached_ogg_audio_file(alias)
-            self.assertEqual(validate.call_count, 1)
+            self.assertEqual(validate.call_count, 2 if studio.platform.system() == "Windows" else 1)
             alias.unlink()
             alias.symlink_to(bad)
             with self.assertRaises(ValueError):
                 studio._validate_cached_ogg_audio_file(alias)
-            self.assertEqual(validate.call_count, 2)
+            self.assertEqual(validate.call_count, 3 if studio.platform.system() == "Windows" else 2)
         self.assertEqual(good.read_bytes(), self.samples["mono"])
 
     def test_lexical_path_alias_cannot_reuse_validation_for_different_inode(self):
@@ -343,9 +345,15 @@ class ApiAudioCompletenessTests(unittest.TestCase):
             alias.symlink_to(nested, target_is_directory=True)
         except OSError as exc:
             self.skipTest(f"Symbolic links are unavailable: {exc}")
-        # link/.. follows the real parent, whereas its lexical absolute name
-        # matches the damaged file. Device/inode must distinguish the two.
-        studio._validate_cached_ogg_audio_file(alias / ".." / "fragment.ogg")
+        candidate = alias / ".." / "fragment.ogg"
+        # POSIX проходит по ссылке до «..», Windows нормализует такой путь
+        # лексически. Проверяем содержимое файла, который реально открывает ОС.
+        if candidate.samefile(good):
+            studio._validate_cached_ogg_audio_file(candidate)
+        else:
+            with self.assertRaises(ValueError):
+                studio._validate_cached_ogg_audio_file(candidate)
+            studio._validate_cached_ogg_audio_file(good)
         with self.assertRaises(ValueError):
             studio._validate_cached_ogg_audio_file(bad)
 

@@ -1,9 +1,11 @@
 """Одиночный M4B принимает целый файл и сохраняет границы явного фрагмента."""
 
 import array
+import atexit
 import copy
 import importlib.util
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -28,6 +30,8 @@ if MODULE_NAME not in sys.modules:
         studio = importlib.util.module_from_spec(spec)
         sys.modules[MODULE_NAME] = studio
         spec.loader.exec_module(studio)
+        # Обработчики журнала должны закрыться до удаления временного импорта.
+        atexit.register(logging.shutdown)
     finally:
         os.chdir(_previous_cwd)
 else:

@@ -160,8 +160,6 @@ class AudioTempoBoundaryTests(unittest.TestCase):
                 self.assertAlmostEqual(reconstructed, factor)
 
     def test_rejected_tempo_does_not_leave_cover_metadata_or_replace_output(self):
-        from PIL import Image
-
         with tempfile.TemporaryDirectory() as temporary:
             work = Path(temporary)
             source = work / 'source.ogg'
@@ -171,7 +169,9 @@ class AudioTempoBoundaryTests(unittest.TestCase):
                 '-c:a', 'libopus', str(source),
             ], check=True, capture_output=True)
             cover = work / 'cover.png'
-            Image.new('RGB', (8, 8), 'red').save(cover)
+            cover.write_bytes(base64.b64decode(
+                'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CA'
+                'FWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC'))
             output = work / 'existing.opus'
             output.write_bytes(b'previous complete output')
             metadata_dir = work / 'operation_temporary'

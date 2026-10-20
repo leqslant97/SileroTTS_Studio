@@ -1,5 +1,7 @@
 """Русский текстовый диалог: точный результат, отмена и вложенная модальность."""
 import importlib.util
+import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -13,6 +15,8 @@ class StringPromptTests(unittest.TestCase):
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory(prefix='silero_string_prompt_')
         cls.addClassCleanup(cls.directory.cleanup)
+        cls.addClassCleanup(os.chdir, Path.cwd())
+        cls.addClassCleanup(logging.shutdown)
         path = Path(cls.directory.name) / 'SileroTTS_Studio.py'
         shutil.copyfile(Path(__file__).resolve().parents[1] / 'SileroTTS_Studio.py', path)
         spec = importlib.util.spec_from_file_location('silero_string_prompt_under_test', path)
@@ -32,6 +36,12 @@ class StringPromptTests(unittest.TestCase):
         self.addCleanup(self.root.destroy)
         self.root.geometry('560x260+40+40')
         self.root.update()
+        # Сценарии меняют текст через insert/delete. Ввод с рабочего стола
+        # не должен менять выделенное начальное значение между callback-ами.
+        self.root.bind_class(
+            'TEntry', '<KeyPress>',
+            lambda event: 'break' if event.char and event.char not in ('\r', '\n', '\x1b') else None,
+        )
         self.app = object.__new__(studio.TTSApp)
         self.app.root = self.root
         self.app._is_dark_appearance = False
@@ -64,7 +74,7 @@ class StringPromptTests(unittest.TestCase):
                 self.assertEqual(set(buttons), {'ОК', 'Отмена'})
                 self.assertEqual(entry.get(), initial)
                 self.assertEqual(str(entry.cget('state')), 'normal')
-                self.assertEqual(dialog.transient(), str(parent))
+                self.assertEqual(str(dialog.transient()), str(parent))
                 action(dialog, entry)
             except BaseException as exc:
                 self.errors.append(exc)

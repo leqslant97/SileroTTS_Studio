@@ -36,6 +36,25 @@ class CleanCacheArchiveTests(unittest.TestCase):
         path.write_bytes(payload)
         return path
 
+    def test_archive_sync_uses_a_writable_descriptor_before_publication(self):
+        self.write_file("chapter.ogg", b"audio")
+        sync = studio.os.fsync
+        checked = []
+
+        def require_write_access(descriptor):
+            # На POSIX синхронизация rb проходит; запись пустого блока проверяет
+            # доступ так же строго, как _commit в Windows, не меняя содержимое.
+            studio.os.write(descriptor, b"")
+            checked.append(descriptor)
+            return sync(descriptor)
+
+        with mock.patch.object(studio.os, "fsync", side_effect=require_write_access), \
+                mock.patch.object(studio, "_fsync_cache_directory"):
+            studio.create_zip_archive_atomic(self.cache, self.destination)
+        self.assertTrue(checked)
+        with zipfile.ZipFile(self.destination) as archive:
+            self.assertEqual(archive.read(self.cache.name + "/chapter.ogg"), b"audio")
+
     def test_clean_archive_restores_all_payload_and_has_no_unix_extra_fields(self):
         entries = {
             "hash": {
