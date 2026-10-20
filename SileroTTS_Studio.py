@@ -10388,7 +10388,8 @@ class SQLiteCacheIndex:
         try:
             shutil.copyfile(prepared_path, owned_prepared)
             _validate_complete_ogg_audio_file(owned_prepared)
-            with open(owned_prepared, "rb") as file:
+            # Windows _commit требует дескриптор с правом записи.
+            with open(owned_prepared, "r+b") as file:
                 os.fsync(file.fileno())
             _fsync_cache_directory(audio_dir)
             metadata = json.loads(record)
@@ -10793,7 +10794,7 @@ class SQLiteCacheIndex:
                 target.execute("PRAGMA journal_mode=DELETE")
             finally:
                 target.close()
-            with open(temporary, "rb") as file:
+            with open(temporary, "r+b") as file:
                 os.fsync(file.fileno())
             # Publish without replacing another database, including a live one
             # created while the snapshot was being copied. WAL is local-only;
@@ -11316,7 +11317,7 @@ def stage_sqlite_cache_metadata(source_json, destination, *, batch_size=100,
             raise ValueError("candidate reopen verification failed")
     finally:
         restored.close()
-    with open(staged, "rb") as file:
+    with open(staged, "r+b") as file:
         os.fsync(file.fileno())
     os.link(staged, destination)
     staged.unlink()
@@ -11423,7 +11424,7 @@ def _initialize_sqlite_cache(cache_dir):
             staged = Path(temporary) / _CACHE_DATABASE_NAME
             with SQLiteCacheIndex(staged) as index:
                 index._request("set_meta", "activation", "active")
-            with open(staged, "rb") as file:
+            with open(staged, "r+b") as file:
                 os.fsync(file.fileno())
             if get_active_cache_backend(cache_dir) != "sqlite":
                 raise ValueError("Во время создания SQLite в папке появился JSON-индекс")
@@ -12432,7 +12433,7 @@ def create_zip_archive_atomic(source_dir, destination, *, file_overrides=None,
         if not temp_archive.is_file():
             raise OSError("Архиватор не создал выходной ZIP-файл")
         check_cancelled()
-        with open(temp_archive, "rb") as file:
+        with open(temp_archive, "r+b") as file:
             os.fsync(file.fileno())
         os.replace(temp_archive, destination)
         _fsync_cache_directory(destination.parent)
@@ -15299,18 +15300,18 @@ def _remember_validated_ogg_audio_file(path, *, fingerprint=None, header=None):
 
 
 def _validate_cached_ogg_audio_file(path, *, return_header=False):
-    """Проверяет физическую версию и повторно использует её проверенный заголовок."""
+    """Проверяет Ogg; переиспользует результат при надёжной версии файла из stat."""
     fingerprint = _ogg_audio_file_fingerprint(path)
     already_validated = False
     with _OGG_VALIDATION_CACHE_LOCK:
-        if fingerprint in _OGG_VALIDATION_CACHE:
+        # В Windows ctime может быть временем создания. Перезапись с прежними
+        # размером и mtime не меняет ключ, поэтому CRC нужно проверить повторно.
+        if platform.system() != "Windows" and fingerprint in _OGG_VALIDATION_CACHE:
             header = _OGG_VALIDATION_CACHE.pop(fingerprint)
             _OGG_VALIDATION_CACHE[fingerprint] = header
             if not return_header:
                 return Path(path)
-            # В Windows ctime может означать время создания: при сохранённом
-            # mtime повторно читаем заголовок, как и на прежнем пути cache-hit.
-            if header is not None and platform.system() != "Windows":
+            if header is not None:
                 return header
             already_validated = True
     header = None
