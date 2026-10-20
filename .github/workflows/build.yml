@@ -452,6 +452,14 @@ jobs:
           fi
           # Устанавливаем только зафиксированные в репозитории зависимости,
           # чтобы бинарники релиза не зависели от обновлений транзитивных зависимостей.
+          if [[ "$RUNNER_OS" == "Linux" && "$(uname -m)" == "aarch64" ]]; then
+            # Декодер Base64 в DAWG2 0.13.3 требует знаковый char; в Linux ARM64
+            # он беззнаковый по умолчанию. Старое колесо из кэша pip не подходит.
+            CFLAGS="${CFLAGS:+$CFLAGS }-fsigned-char" \
+            CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-fsigned-char" \
+              python -m pip install --no-cache-dir --no-binary=DAWG2 \
+                -c requirements-release.txt DAWG2
+          fi
           python -m pip install -r requirements-release.txt
           python -m pip check
 
@@ -510,9 +518,11 @@ jobs:
           from tempfile import TemporaryDirectory
 
           assert pydub.utils.audioop is audioop
-          assert getattr(ru_normalizr, "__version__", None) == os.environ[
-              "RU_NORMALIZR_VERSION"
-          ]
+          normalizr_version = getattr(ru_normalizr, "__version__", None)
+          expected_normalizr_version = os.environ["RU_NORMALIZR_VERSION"]
+          assert normalizr_version == expected_normalizr_version, (
+              f"ru-normalizr {normalizr_version!r}; expected {expected_normalizr_version!r}"
+          )
           assert EXTENSION_AVAILABLE, "DAWG2 native morphology must be available"
           normalizer = ru_normalizr.Normalizer(ru_normalizr.NormalizeOptions.tts())
           assert "икс в степени два плюс три" in normalizer.normalize("Это $x^2 + 3$.").casefold()
@@ -569,6 +579,9 @@ jobs:
 
       - name: Run regression tests
         shell: bash
+        env:
+          # Текстовые фикстуры и вывод дочерних Python-процессов используют UTF-8.
+          PYTHONUTF8: "1"
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             py=.venv/Scripts/python.exe
