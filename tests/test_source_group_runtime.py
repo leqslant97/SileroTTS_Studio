@@ -135,6 +135,70 @@ class SourceGroupOutputRuntimeTests(unittest.TestCase):
             self.assertEqual(encoded[1], tuple(self.fragments[key] for key in record["file_ids"]))
         self.assertFalse(self.app.finish_processing.call_args.args[-1])
 
+    def test_timecode_notices_preserve_complete_audio_and_runtime_m4b_boundaries(self):
+        self.configure([
+            {"format": "opus", "assembly_mode": "merge",
+             "timecodes": {"enabled": True, "preset": "youtube"}},
+            {"format": "m4b", "timecodes": {"enabled": True, "preset": "youtube"}},
+        ])
+        def with_notice(audio, output, **kwargs):
+            self.encode(audio, output, **kwargs)
+            options = kwargs.get("timecodes")
+            if options:
+                path = studio.timecode_output_path(output, options,
+                                                   context=kwargs.get("timecode_context"))
+                path.write_text("00:00 Глава\n", encoding="utf-8")
+                kwargs["_timecode_result"].update(path=path, warnings=("Меньше трёх глав",))
+        with mock.patch.object(studio, "_export_merged_audio_ffmpeg", side_effect=with_notice), \
+             mock.patch.object(studio, "_export_m4b_ffmpeg", side_effect=with_notice):
+            self.run_queue()
+        for record in self.records:
+            self.assertEqual(self.processor.processing_statuses_ram.get(str(record["path"].resolve()), "success"), "success")
+        self.assertEqual(len(self.app._source_completed_regular_targets), 2)
+        self.assertEqual(self.app._source_regular_rebuild_paths(self.records), ())
+        for record in self.records:
+            self.assertTrue(studio.source_output_file_is_ready(record, self.processor.processing_statuses_ram))
+        accepted = self.app._remember_source_runtime_m4b_records.call_args.args[0]
+        self.assertEqual(len(accepted), 2)
+        self.assertTrue(self.app.finish_processing.call_args.args[-1])
+
+    def test_timecode_notice_keeps_incomplete_chapter_retryable(self):
+        self.configure([
+            {"format": "opus", "assembly_mode": "files",
+             "timecodes": {"enabled": True, "preset": "youtube"}},
+        ])
+        incomplete = self.paths[self.keys[0]]
+
+        def collect(path, **kwargs):
+            result = self.collect(path, **kwargs)
+            if Path(path) == incomplete:
+                result["status"] = "warning"
+            return result
+
+        def with_notice(audio, output, **kwargs):
+            self.encode(audio, output, **kwargs)
+            path = studio.timecode_output_path(
+                output, kwargs["timecodes"], context=kwargs.get("timecode_context")
+            )
+            path.write_text("00:00 Глава\n", encoding="utf-8")
+            kwargs["_timecode_result"].update(path=path, warnings=("Меньше трёх глав",))
+
+        self.processor.process_text_file.side_effect = collect
+        with mock.patch.object(studio, "_export_merged_audio_ffmpeg", side_effect=with_notice):
+            self.run_queue()
+
+        incomplete_record = next(record for record in self.records
+                                 if record["file_ids"] == (self.keys[0],))
+        self.assertEqual(
+            self.processor.processing_statuses_ram.get(str(incomplete_record["path"].resolve())),
+            "warning",
+        )
+        self.assertFalse(studio.source_output_file_is_ready(
+            incomplete_record, self.processor.processing_statuses_ram
+        ))
+        self.assertEqual(len(self.app._source_completed_regular_targets), 3)
+        self.assertTrue(self.app.finish_processing.call_args.args[-1])
+
     def test_group_only_run_skips_everything_when_groups_are_ready(self):
         self.configure([{"format": "opus", "bitrate": "48k", "assembly_mode": "merge"}])
         self.run_queue()

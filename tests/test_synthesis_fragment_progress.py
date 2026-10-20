@@ -46,6 +46,9 @@ class SynthesisFragmentProgressTests(unittest.TestCase):
         patcher = mock.patch.object(studio, "APP_DATA_DIR", self.root / "data")
         patcher.start()
         self.addCleanup(patcher.stop)
+        cache = self.root / "cache"
+        cache.mkdir()
+        (cache / "sentence_cache.json").write_text("{}")
         self.processor = studio.TTSProcessor(config)
         self.addCleanup(self.processor.session.close)
         self.progress = []
@@ -359,12 +362,15 @@ class SynthesisFragmentProgressTests(unittest.TestCase):
         app._show_error = mock.Mock()
         app._show_warning = mock.Mock()
         app._show_info = mock.Mock()
+        app._show_task_notification = mock.Mock()
 
     def assert_retained_cache_is_retried_before_next_run(self, app):
         self.assertIsNone(app.batch_processor)
         self.assertIsNone(app.direct_processor)
         self.assertEqual(app._closing_processors, (self.processor,))
-        app._show_error.assert_called_once()
+        app._show_task_notification.assert_called_once()
+        self.assertEqual(app._show_task_notification.call_args.args[0], "error")
+        app._show_error.assert_not_called()
         app._show_warning.assert_not_called()
         processor = studio.TTSApp._create_synthesis_processor(app, self.processor.cfg)
         self.addCleanup(processor.session.close)
@@ -388,12 +394,12 @@ class SynthesisFragmentProgressTests(unittest.TestCase):
 
         def capture_error_dialog_state(*_args):
             dialog_states.append((
-                statuses[-1], app.root.update_idletasks.called,
+                statuses[-1], app.direct_processor, app.direct_thread,
                 app.btn_direct_start.config.call_args.kwargs.get("state"),
                 app.btn_direct_stop.config.call_args.kwargs.get("state"),
             ))
 
-        app._show_error.side_effect = capture_error_dialog_state
+        app._show_task_notification.side_effect = capture_error_dialog_state
         with mock.patch.object(
             studio, "write_cache_index_atomic", side_effect=OSError("Диск недоступен")
         ):
@@ -409,9 +415,9 @@ class SynthesisFragmentProgressTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
         self.assertEqual(dialog_states, [(
             "Ошибка сохранения. Данные остаются в памяти.",
-            True, studio.tk.NORMAL, studio.tk.DISABLED,
+            None, None, studio.tk.NORMAL, studio.tk.DISABLED,
         )])
-        self.assertFalse(self.processor.cache_index_path.exists())
+        self.assertEqual(self.processor.cache_index_path.read_text(), "{}")
         self.assert_retained_cache_is_retried_before_next_run(app)
 
     def test_batch_stop_retains_cache_after_failed_write_and_retries_next_run(self):
@@ -457,7 +463,7 @@ class SynthesisFragmentProgressTests(unittest.TestCase):
                 worker.join(5)
             self.assertFalse(worker.is_alive())
         self.assertTrue(self.processor._persistence_failed)
-        self.assertFalse(self.processor.cache_index_path.exists())
+        self.assertEqual(self.processor.cache_index_path.read_text(), "{}")
         self.assert_retained_cache_is_retried_before_next_run(app)
 
 

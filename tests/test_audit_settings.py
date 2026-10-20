@@ -348,15 +348,19 @@ class CacheArchiveReportingTests(unittest.TestCase):
             root = Path(tempdir)
             cache = root / "cache"
             cache.mkdir()
+            (cache / "sentence_cache.json").write_text("{}")
             archive = root / "backup.zip"
             app = object.__new__(studio.TTSApp)
             app.config = {"cache_dir": str(cache)}
+            app.root = mock.Mock()
             app.del_after_zip = mock.Mock()
             app.del_after_zip.get.return_value = True
             app.is_cache_operation_running = mock.Mock(return_value=False)
             app.is_synthesis_running = mock.Mock(return_value=False)
             popup = mock.Mock()
             app._begin_cache_operation = mock.Mock(return_value=popup)
+            app._create_wait_popup = mock.Mock(return_value=popup)
+            app._flush_cache_before_operation = mock.Mock()
             app._post_to_ui = mock.Mock()
 
             with mock.patch.object(
@@ -381,6 +385,7 @@ class CacheArchiveReportingTests(unittest.TestCase):
             self.assertFalse(cleared)
             self.assertIn(str(archive), error)
             self.assertIn("Не удалось очистить кэш", error)
+            self.assertTrue(app._post_to_ui.call_args.kwargs["clear_attempted"])
 
 
 if __name__ == "__main__":

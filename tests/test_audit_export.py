@@ -71,7 +71,7 @@ class ExportCancellationTests(unittest.TestCase):
                         with self.assertRaises(InterruptedError):
                             if copy_stream:
                                 studio._run_ffmpeg_stream_copy_concat(
-                                    sources, output, cancelled=stopped.is_set
+                                    sources[:1], output, cancelled=stopped.is_set
                                 )
                             else:
                                 studio._export_merged_audio_ffmpeg(

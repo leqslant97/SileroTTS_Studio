@@ -55,7 +55,9 @@ class CachePolicyWarningTests(unittest.TestCase):
                     config = dict(self.config, **policy, source_target_records=[self.record(kind, name)])
                     self.assertTrue(app._confirm_source_cache_policy(config, True))
                     app._ask_cache_policy_action.assert_called_once()
-                    self.assertIn("лимит", app._ask_cache_policy_action.call_args.args[0])
+                    notice = app._ask_cache_policy_action.call_args.args[0]
+                    self.assertIn("повторный синтез", notice)
+                    self.assertIn("API-запрос", notice)
 
     def test_single_chapters_and_local_exports_do_not_warn(self):
         for records in ((), (self.record("file", "chapter.mp3"),)):
@@ -190,10 +192,12 @@ class CachePolicyWarningTests(unittest.TestCase):
         self.app.settings_notebook = mock.Mock()
         self.app._cache_settings_page = "cache-page"
         self.app._schedule_focus_after_messagebox = mock.Mock()
+        self.app.refresh_cache_backend_status = mock.Mock()
         self.app._open_cache_settings()
         self.app.notebook.select.assert_called_once_with(self.app.tab_settings)
         self.app.settings_notebook.select.assert_called_once_with("cache-page")
         self.app._schedule_focus_after_messagebox.assert_called_once_with(self.app.settings_notebook)
+        self.app.refresh_cache_backend_status.assert_called_once_with()
 
     def test_broken_status_journal_does_not_hide_risk(self):
         self.config["source_target_records"][0]["path"].write_bytes(b"ready")

@@ -259,6 +259,10 @@ class CacheOptimizationSourceTests(unittest.TestCase):
                 processor = mock.Mock()
                 processor.cache = entries.copy()
                 processor.cache_dir = Path(temp) / "cache"
+                processor.cache_dir.mkdir()
+                (processor.cache_dir / "sentence_cache.json").write_text(
+                    json.dumps(entries), encoding="utf-8"
+                )
                 processor.get_all_possible_hashes.side_effect = (
                     lambda raw_text, include_prepared: {raw_text}
                 )
@@ -276,6 +280,8 @@ class CacheOptimizationSourceTests(unittest.TestCase):
                     return_value=studio.CACHE_VARIANT_KEEP_ALL
                 )
                 app._ask_yes_no = mock.Mock(return_value=True)
+                app._confirm_cache_mutation = mock.Mock(return_value=False)
+                app._create_wait_popup = mock.Mock(return_value=popup)
                 app.is_cache_optimization_running = mock.Mock(return_value=True)
                 app._post_to_ui = mock.Mock()
                 app._show_info = mock.Mock()
@@ -284,6 +290,10 @@ class CacheOptimizationSourceTests(unittest.TestCase):
 
                 with ExitStack() as patches:
                     patches.enter_context(mock.patch.object(studio, "TTSProcessor", return_value=processor))
+                    patches.enter_context(mock.patch.object(
+                        studio, "read_cache_index_with_backup",
+                        return_value=(entries.copy(), processor.cache_dir / "sentence_cache.json", []),
+                    ))
                     patches.enter_context(mock.patch.object(studio, "cache_entry_matches_required_text", side_effect=lambda entry, hashes: entry["text"] in hashes))
                     patches.enter_context(mock.patch.object(studio, "unreferenced_cache_audio_paths", return_value=[]))
                     write_index = patches.enter_context(mock.patch.object(studio, "write_cache_index_atomic"))
@@ -341,10 +351,12 @@ class CacheIndexFormatTests(unittest.TestCase):
             json.dumps({"hash": "audio/old.ogg"}), encoding="utf-8"
         )
 
+        original = processor.cache_index_path.read_bytes()
         with self.assertLogs(level=logging.ERROR) as captured:
-            loaded = processor._load_cache()
+            with self.assertRaises(studio.CacheRecoveryError):
+                processor._load_cache()
 
-        self.assertEqual(loaded, {})
+        self.assertEqual(processor.cache_index_path.read_bytes(), original)
         self.assertIn("не является JSON-объектом", "\n".join(captured.output))
 
     def test_invalid_numeric_metadata_is_normalized_without_mutating_input(self):
@@ -1102,7 +1114,7 @@ class ExportGroupingTests(unittest.TestCase):
 
             def process_text_file(self, filepath, **kwargs):
                 # Настоящий кодировщик вызывает их из другого потока. Оставляем
-                # вызовы отложенными до завершения обеих итераций очереди —
+                # вызовы отложенными до завершения обеих итераций очереди:
                 # именно такой порядок выявляет ошибку позднего связывания.
                 self.callbacks.append(
                     (kwargs["encoding_callback"], kwargs["completion_callback"])
@@ -5311,17 +5323,11 @@ class SourceSynthesisRuntimeTests(unittest.TestCase):
                 command[command.index("-map_chapters") + 1], "-1"
             )
 
-    def test_streaming_merge_uses_concat_stream_copy_for_uniform_inputs(self):
-        """Однородный уже готовый поток не должен кодироваться второй раз.
-
-        Это намеренно проверяет именно команду, а не продолжительность/размер
-        результата: реальный FFmpeg проверяется отдельными интеграционными тестами,
-        а здесь важно, что быстрый путь не возвращается к ``filter_complex`` и не
-        получает лишние параметры перекодирования.
-        """
+    def test_single_mp3_stream_copy_preserves_source_input(self):
+        """Один неизменённый MP3 перепаковывается напрямую без concat demuxer."""
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            sources = (root / "one.mp3", root / "two.mp3")
+            sources = (root / "one.mp3",)
             for source in sources:
                 source.write_bytes(b"audio")
             destination = root / "book.mp3"
@@ -5357,10 +5363,9 @@ class SourceSynthesisRuntimeTests(unittest.TestCase):
                 )
 
             command = popen.call_args.args[0]
-            self.assertIn("-f", command)
-            self.assertEqual(command[command.index("-f") + 1], "concat")
-            self.assertIn("-safe", command)
-            self.assertEqual(command[command.index("-safe") + 1], "0")
+            self.assertNotIn("-f", command)
+            self.assertNotIn("-safe", command)
+            self.assertEqual(Path(command[command.index("-i") + 1]), sources[0].resolve())
             self.assertIn("-c:a", command)
             self.assertEqual(command[command.index("-c:a") + 1], "copy")
             self.assertNotIn("-filter_complex", command)
@@ -5376,17 +5381,13 @@ class SourceSynthesisRuntimeTests(unittest.TestCase):
             self.assertTrue(destination.exists())
             self.assertEqual(destination.read_bytes(), b"copied")
 
-            manifest = Path(command[command.index("-i") + 1])
-            self.assertFalse(
-                manifest.exists(),
-                "concat-манифест должен удаляться только после завершения FFmpeg",
-            )
+            self.assertEqual(sources[0].read_bytes(), b"audio")
 
-    def test_streaming_merge_all_unknown_opus_bitrate_uses_stream_copy(self):
-        """Одинаковые VBR-потоки Opus без номинального ``bit_rate`` не перекодируются."""
+    def test_single_unknown_opus_bitrate_uses_stream_copy(self):
+        """Один VBR-поток Opus без номинального битрейта сохраняется в Auto."""
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            sources = (root / "one.opus", root / "two.opus")
+            sources = (root / "one.opus",)
             for source in sources:
                 source.write_bytes(b"audio")
             destination = root / "book.opus"
@@ -5408,7 +5409,7 @@ class SourceSynthesisRuntimeTests(unittest.TestCase):
             with mock.patch.object(
                 studio,
                 "_probe_audio_stream_profile",
-                side_effect=[dict(profile), dict(profile)],
+                return_value=profile,
             ), mock.patch.object(
                 studio.subprocess, "Popen", side_effect=fake_popen
             ) as popen:
@@ -5500,7 +5501,7 @@ class SourceSynthesisRuntimeTests(unittest.TestCase):
             ("pause", {}, {"pause_ms": 100}),
             ("speed_effect", {}, {"speed": 1.25}),
             ("cover", {}, {"cover": "cover.png"}),
-            ("single_source", {}, {"single": True}),
+            ("single_source_effect", {}, {"single": True, "speed": 1.25}),
         )
         for case_name, profile_options, call_options in cases:
             with self.subTest(case_name=case_name), tempfile.TemporaryDirectory() as tempdir:
@@ -5577,7 +5578,7 @@ class SourceSynthesisRuntimeTests(unittest.TestCase):
         """Несовместимость отдельных пакетов не должна делать оптимизацию фатальной."""
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
-            sources = (root / "one.mp3", root / "two.mp3")
+            sources = (root / "one.mp3",)
             for source in sources:
                 source.write_bytes(b"audio")
             destination = root / "book.mp3"
@@ -6538,6 +6539,56 @@ class SourceSynthesisRuntimeTests(unittest.TestCase):
             app.lbl_export_status, "Ожидание...", "info"
         )
 
+    def test_clear_export_project_clears_stale_item_editor_but_keeps_group_template(self):
+        app = object.__new__(studio.TTSApp)
+        app._export_running = False
+        app._export_lock = False
+        app.export_groups = {"group-1": {"name": "Том 1"}}
+        app.export_files = {"file-1": {"path": "/audio/one.mp3"}}
+        app.group_counter = 1
+        app.current_selected_export_item = "group-1"
+        app.export_tree = mock.Mock()
+        app.export_tree.get_children.return_value = ("group-1",)
+        app.export_tree.exists.return_value = True
+        app.export_progress = {}
+        app.lbl_export_status = mock.Mock()
+        app._ask_yes_no = mock.Mock(return_value=True)
+        app._disable_export_settings = mock.Mock()
+        app.update_total_export_duration = mock.Mock()
+        app._set_status_label = mock.Mock()
+        app._delete_export_project_session = mock.Mock()
+
+        class FakeVar:
+            def __init__(self, value):
+                self.value = value
+
+            def set(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        editor_vars = (
+            "grp_name_var", "grp_artist_var", "grp_album_var",
+            "grp_album_artist_var", "grp_genre_var", "grp_composer_var",
+            "grp_year_var", "grp_cover_var",
+        )
+        for name in editor_vars:
+            setattr(app, name, FakeVar("старое значение"))
+        app.grp_merge_var = FakeVar(False)
+        app.grp_subfolder_var = FakeVar(False)
+        app.grp_pause_var = FakeVar(1500)
+        app.settings_vars = {"default_group_name": FakeVar("Том {num}")}
+
+        app.clear_export_project()
+
+        for name in editor_vars:
+            self.assertEqual(getattr(app, name).get(), "")
+        self.assertTrue(app.grp_merge_var.get())
+        self.assertTrue(app.grp_subfolder_var.get())
+        self.assertEqual(app.grp_pause_var.get(), 1000)
+        self.assertEqual(app.settings_vars["default_group_name"].get(), "Том {num}")
+
     def test_split_works_without_preexisting_groups(self):
         groups = studio.split_export_file_ids(
             ["a", "b", "c"], {"a": 40, "b": 30, "c": 20}, 60
@@ -7170,7 +7221,7 @@ class TextNormalizationTests(unittest.TestCase):
         normalized = processor.process_sentence_text("-62-я температура.")
 
         self.assertNotIn("\ue001", normalized)
-        self.assertEqual(normalized, "минус шестьдесят вторая температура.")
+        self.assertEqual(normalized, "Минус шестьдесят вторая температура.")
 
     def test_synthesizable_text_accepts_supported_and_mixed_scripts(self):
         for text in ("Тест", "Test", "囧...... было такое лицо"):
@@ -13109,7 +13160,7 @@ class EmptySynthesisTests(unittest.TestCase):
                     for call in app_info.call_args_list
                 )
             )
-            # Первая пауза относится к реплике, оформленной регулярным выражением, вторая —
+            # Первая пауза относится к реплике, оформленной регулярным выражением, вторая относится
             # к самому разделителю. Важно, что ``***`` не был отброшен как
             # неподдерживаемый текст и сохранил настроенную длительность.
             self.assertEqual(pauses, [processor.cfg["pause_speech"], 1234])
@@ -13629,9 +13680,9 @@ class FfmpegSaveCommandTests(unittest.TestCase):
 
         def fake_run(command, **_kwargs):
             Path(command[-1]).write_bytes(b"encoded")
-            return _FakeCompletedProcess()
+            return b""
 
-        with mock.patch.object(studio.subprocess, "run", side_effect=fake_run):
+        with mock.patch.object(studio, "_run_ffmpeg_checked", side_effect=fake_run):
             processor._merge_save_and_notify(
                 [self.audio_file],
                 output_path,
@@ -13776,6 +13827,7 @@ class FfmpegSaveCommandTests(unittest.TestCase):
 
         self.assertEqual(self.values_after(command, "-c:a"), ["libvorbis"])
         self.assertNotIn("-b:a", command)
+        self.assertEqual(self.values_after(command, "-q:a"), ["4"])
         self.assertEqual(callbacks[-1][1], "success")
 
     def test_book_opus_auto_uses_speech_bitrate_and_layout(self):
@@ -13795,13 +13847,11 @@ class FfmpegSaveCommandTests(unittest.TestCase):
         self.assertEqual(self.values_after(command, "-ac"), ["1"])
         self.assertEqual(callbacks[-1][1], "success")
 
-    def test_book_opus_auto_stream_copies_uniform_cache_fragments(self):
-        # Для быстрого пути сборки книги также проверяется канальность заголовка Ogg/Opus:
+    def test_book_opus_auto_stream_copies_single_cache_fragment(self):
+        # Одиночный поток сохраняется без переноса pre-skip независимых файлов:
         # в идентификационном пакете поле каналов находится на смещении 9.
         canonical_header = b"OpusHead" + bytes([0, 1]) + b"\x00" * 9
         self.audio_file.write_bytes(fake_ogg_first_page(canonical_header))
-        second_audio = self.root / "second.ogg"
-        second_audio.write_bytes(fake_ogg_first_page(canonical_header))
         processor = self.make_processor(
             output_format="opus",
             output_bitrate="auto",
@@ -13821,15 +13871,15 @@ class FfmpegSaveCommandTests(unittest.TestCase):
 
         def fake_run(command, **_kwargs):
             Path(command[-1]).write_bytes(b"copied")
-            return _FakeCompletedProcess()
+            return b""
 
         with mock.patch.object(
             studio, "_probe_audio_stream_profile", return_value=profile
         ) as probe, mock.patch.object(
-            studio.subprocess, "run", side_effect=fake_run
+            studio, "_run_ffmpeg_checked", side_effect=fake_run
         ):
             processor._merge_save_and_notify(
-                [self.audio_file, second_audio],
+                [self.audio_file],
                 output,
                 output.name,
                 False,
@@ -13867,12 +13917,12 @@ class FfmpegSaveCommandTests(unittest.TestCase):
 
         def fake_run(command, **_kwargs):
             Path(command[-1]).write_bytes(b"encoded")
-            return _FakeCompletedProcess()
+            return b""
 
         with mock.patch.object(
             studio, "_probe_audio_stream_profile", return_value=profile
         ) as probe, mock.patch.object(
-            studio.subprocess, "run", side_effect=fake_run
+            studio, "_run_ffmpeg_checked", side_effect=fake_run
         ):
             processor._merge_save_and_notify(
                 [self.audio_file, second_audio],
@@ -13892,8 +13942,6 @@ class FfmpegSaveCommandTests(unittest.TestCase):
     def test_book_opus_retries_encoding_when_fast_copy_is_rejected(self):
         canonical_header = b"OpusHead" + bytes([0, 1]) + b"\x00" * 9
         self.audio_file.write_bytes(fake_ogg_first_page(canonical_header))
-        second_audio = self.root / "second.ogg"
-        second_audio.write_bytes(fake_ogg_first_page(canonical_header))
         processor = self.make_processor(
             output_format="opus",
             output_bitrate="auto",
@@ -13908,17 +13956,17 @@ class FfmpegSaveCommandTests(unittest.TestCase):
         def fake_run(command, **_kwargs):
             commands.append(command)
             if len(commands) == 1:
-                return mock.Mock(returncode=1, stderr=b"packet mismatch")
+                raise RuntimeError("packet mismatch")
             Path(command[-1]).write_bytes(b"encoded")
-            return _FakeCompletedProcess()
+            return b""
 
         with mock.patch.object(
             studio, "_probe_audio_stream_profile"
         ) as probe, mock.patch.object(
-            studio.subprocess, "run", side_effect=fake_run
+            studio, "_run_ffmpeg_checked", side_effect=fake_run
         ), self.assertLogs(level=logging.WARNING) as logs:
             processor._merge_save_and_notify(
-                [self.audio_file, second_audio],
+                [self.audio_file],
                 output,
                 output.name,
                 False,
@@ -13941,6 +13989,19 @@ class FfmpegSaveCommandTests(unittest.TestCase):
 
 
 class CacheBehaviorTests(unittest.TestCase):
+    @staticmethod
+    def complete_cached_opus():
+        # Настоящий 20-мс mono Opus: cache-hit теперь проверяет полноту Ogg,
+        # поэтому идентификационная страница без звука не имитирует готовый кэш.
+        import base64
+
+        return base64.b64decode(
+            "T2dnUwACAAAAAAAAAACPLSC4AAAAADal8MEBE09wdXNIZWFkAQE4AYC7AAAAAABP"
+            "Z2dTAAAAAAAAAAAAAI8tILgBAAAA+ygUwwE8T3B1c1RhZ3MMAAAATGF2ZjYzLjEu"
+            "MTAyAQAAABwAAABlbmNvZGVyPUxhdmM2My4xLjEwMiBsaWJvcHVzT2dnUwAE"
+            "+AQAAAAAAACPLSC4AgAAAB1NEJwCAwP4//74//4="
+        )
+
     class FakeResponse:
         status_code = 200
 
@@ -13984,6 +14045,11 @@ class CacheBehaviorTests(unittest.TestCase):
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
+        # These tests exercise the retained JSON dictionary and its write errors.
+        for name in ("cache", "shared-cache", "force-shared-cache", "guarded-cache", "guarded-ttl-cache"):
+            cache = self.root / name
+            cache.mkdir()
+            (cache / "sentence_cache.json").write_text("{}")
 
     def make_processor(self, *, use_cache):
         config = studio.DEFAULT_CONFIG.copy()
@@ -14014,7 +14080,7 @@ class CacheBehaviorTests(unittest.TestCase):
         text = "Фраза."
         text_hash = processor.get_hash(text)
         cache_file = processor.cache_audio_dir / f"{text_hash}.ogg"
-        cache_file.write_bytes(fake_ogg_first_page(b"OpusHead-cached"))
+        cache_file.write_bytes(self.complete_cached_opus())
         processor.cache[text_hash] = {
             "file_name": cache_file.name,
             "speaker": processor.cfg["speaker"],
@@ -14031,7 +14097,7 @@ class CacheBehaviorTests(unittest.TestCase):
         text = "Фраза."
         text_hash = processor.get_hash(text)
         cache_file = processor.cache_audio_dir / f"{text_hash}.ogg"
-        cache_file.write_bytes(fake_ogg_first_page(b"OpusHead-cached"))
+        cache_file.write_bytes(self.complete_cached_opus())
         processor.cache[text_hash] = {
             "file_name": cache_file.name,
             "speaker": processor.cfg["speaker"],
@@ -14719,6 +14785,228 @@ class CacheOpusMigrationTests(unittest.TestCase):
     "FFmpeg and FFprobe are required for the integration test",
 )
 class FfmpegIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _timing_opus_fixture(root, *, gapped=False):
+        """Создаёт короткую речь и при необходимости старую склейку с разрывами PTS."""
+        wav_path = root / "timing-source.wav"
+        source = root / "timing-source.ogg"
+        sample_count = 5760
+        with wave.open(str(wav_path), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(48000)
+            output.writeframes(b"".join(
+                struct.pack("<h", round(9000 * math.sin(2 * math.pi * 440 * index / 48000)))
+                for index in range(sample_count)
+            ))
+        subprocess.run(
+            [studio.get_ffmpeg_path(), "-y", "-v", "error", "-i", str(wav_path),
+             "-c:a", "libopus", "-b:a", "48k", str(source)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if not gapped:
+            return source, sample_count
+        manifest = root / "legacy-timing-concat.txt"
+        safe_source = source.resolve().as_posix().replace("'", "'\\''")
+        manifest.write_text(f"file '{safe_source}'\n" * 5, encoding="utf-8")
+        old_prepared = root / "legacy-prepared.ogg"
+        # This fixture intentionally preserves concat-demuxer timestamps to
+        # reproduce previously saved Opus with holes between independent packets.
+        subprocess.run(
+            [studio.get_ffmpeg_path(), "-y", "-v", "error", "-f", "concat", "-safe", "0",
+             "-i", str(manifest), "-ar", "48000", "-ac", "1", "-c:a", "libopus",
+             "-b:a", "48k", str(old_prepared)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        # The legacy encoder may also retain codec padding on its last packet.
+        # The sanitizing export must preserve the actual saved source PCM,
+        # measured independently, rather than assume its granule equals the WAV.
+        _, _, actual_samples = FfmpegIntegrationTests._timing_media_details(old_prepared)
+        return old_prepared, actual_samples
+
+    @staticmethod
+    def _timing_media_details(path):
+        probe = subprocess.run(
+            [studio.get_ffprobe_path(), "-v", "error", "-show_streams", "-show_chapters",
+             "-of", "json", str(path)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        data = json.loads(probe.stdout)
+        audio = next(stream for stream in data["streams"] if stream["codec_type"] == "audio")
+        decoded = subprocess.run(
+            [studio.get_ffmpeg_path(), "-v", "error", "-i", str(path), "-map", "0:a:0",
+             "-vn", "-sn", "-dn", "-c:a", "pcm_s16le", "-f", "s16le", "-"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if decoded.stderr:
+            raise AssertionError(decoded.stderr.decode(errors="replace"))
+        return audio, data.get("chapters", []), len(decoded.stdout) // (2 * int(audio["channels"]))
+
+    def test_repeated_opus_fragments_prepare_contiguous_sample_timeline(self):
+        """Подготовка TXT не переносит задержку Opus в презентационные разрывы."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source, samples = self._timing_opus_fixture(root)
+            processor = object.__new__(studio.TTSProcessor)
+            processor.is_stopped = False
+            with mock.patch.object(studio, "SESSION_TEMP_DIR", root):
+                prepared = processor._run_ffmpeg_concat((source,) * 9)
+            self.assertIsNotNone(prepared)
+            audio, _, decoded_samples = self._timing_media_details(prepared)
+            self.assertEqual(decoded_samples, samples * 9)
+            self.assertAlmostEqual(float(audio["start_time"]), 0.0, delta=1 / 48000)
+            _, _, header = studio._inspect_ogg_audio_header_details(prepared)
+            pre_skip = int.from_bytes(header[10:12], "little")
+            # Ogg's end granule includes the one stream's codec pre-skip;
+            # repeating nine sources must not add it eight more times.
+            self.assertLessEqual(abs(int(audio["duration_ts"]) - pre_skip - decoded_samples), 1)
+
+    def test_direct_m4b_from_legacy_gapped_opus_preserves_pcm_and_chapter_timeline(self):
+        """Метки и время воспроизведения короткого M4B следуют PCM даже со старым Opus."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source, samples = self._timing_opus_fixture(root, gapped=True)
+            source_audio, _, source_samples = self._timing_media_details(source)
+            self.assertEqual(source_samples, samples)
+            self.assertGreater(float(source_audio["duration"]), samples / 48000 + 0.01)
+            output = root / "book.m4b"
+            studio._export_m4b_ffmpeg(
+                (source, source), output,
+                chapters=({"title": "One"}, {"title": "Two"}),
+                bitrate="96k", sample_rate=48000, channels=1,
+            )
+            audio, chapters, decoded_samples = self._timing_media_details(output)
+            expected_seconds = 2 * samples / 48000
+            self.assertEqual(audio["profile"], "LC")
+            self.assertEqual(decoded_samples, 2 * samples)
+            self.assertEqual([chapter["tags"]["title"] for chapter in chapters], ["One", "Two"])
+            # Chapter metadata deliberately uses millisecond ticks, whereas the
+            # saved Opus can end halfway through a millisecond.
+            self.assertAlmostEqual(float(chapters[1]["start_time"]), samples / 48000, delta=0.0005 + 1 / 48000)
+            self.assertAlmostEqual(float(chapters[-1]["end_time"]), expected_seconds, delta=1 / 48000)
+            self.assertAlmostEqual(float(audio["duration"]), expected_seconds, delta=1 / 48000)
+
+    def test_batched_opus_pcm_preserves_all_source_counts_and_requested_pauses(self):
+        """Ограниченный PCM-конвейер сохраняет сорок границ и реальные паузы."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source, samples = self._timing_opus_fixture(root, gapped=True)
+            sources = (source,) * 40
+            self.assertGreater(len(studio._plan_ffmpeg_decode_batches(sources, (None,) * 40)), 1)
+            output = root / "bounded.m4a"
+            source_counts = []
+            studio._export_merged_audio_ffmpeg(
+                sources, output, output_format="m4a", bitrate="96k", bitrate_mode="96k",
+                sample_rate="48000", channels="mono", pause_ms=25,
+                _source_sample_counts=source_counts,
+            )
+            audio, _, decoded_samples = self._timing_media_details(output)
+            self.assertEqual(source_counts, [samples] * 40)
+            expected_samples = samples * 40 + 39 * 1200
+            self.assertEqual(decoded_samples, expected_samples)
+            self.assertAlmostEqual(float(audio["duration"]), expected_samples / 48000, delta=1 / 48000)
+
+    def test_independent_compressed_inputs_do_not_accumulate_encoder_padding(self):
+        """Склейка MP3/Opus/Vorbis учитывает PCM каждого независимого файла."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            self._timing_opus_fixture(root)
+            for fmt, codec in (("mp3", "libmp3lame"), ("opus", "libopus"), ("ogg", "libvorbis")):
+                with self.subTest(format=fmt):
+                    source = root / f"independent.{fmt}"
+                    subprocess.run(
+                        [studio.get_ffmpeg_path(), "-y", "-v", "error", "-i", str(root / "timing-source.wav"),
+                         "-c:a", codec, "-b:a", "128k" if fmt == "mp3" else "64k", str(source)],
+                        check=True, capture_output=True,
+                    )
+                    _, _, source_samples = self._timing_media_details(source)
+                    output = root / f"joined.{fmt}"
+                    counts = []
+                    studio._export_merged_audio_ffmpeg(
+                        (source,) * 9, output, output_format=fmt, bitrate_mode="auto",
+                        _source_sample_counts=counts,
+                    )
+                    _, _, output_samples = self._timing_media_details(output)
+                    self.assertEqual(counts, [source_samples] * 9)
+                    # Vorbis has one initial overlap window after re-encoding,
+                    # independently decoded MP3 and Opus are sample-exact here.
+                    self.assertAlmostEqual(output_samples, 9 * source_samples, delta=1024 if fmt == "ogg" else 1)
+
+    def test_single_compressed_remux_preserves_pcm_and_presentation(self):
+        """Одиночный remux сохраняет PCM и собственный padding MP3/Opus."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            self._timing_opus_fixture(root)
+            for fmt, codec in (("mp3", "libmp3lame"), ("opus", "libopus")):
+                with self.subTest(format=fmt):
+                    source = root / f"single.{fmt}"
+                    subprocess.run(
+                        [studio.get_ffmpeg_path(), "-y", "-v", "error", "-i", str(root / "timing-source.wav"),
+                         "-c:a", codec, "-b:a", "128k" if fmt == "mp3" else "64k", str(source)],
+                        check=True, capture_output=True,
+                    )
+                    output = root / f"remux.{fmt}"
+                    before, _, source_samples = self._timing_media_details(source)
+                    studio._run_ffmpeg_stream_copy_concat((source,), output)
+                    after, _, output_samples = self._timing_media_details(output)
+                    self.assertEqual(output_samples, source_samples)
+                    self.assertEqual(after["duration_ts"], before["duration_ts"])
+                    self.assertEqual(after["start_pts"], before["start_pts"])
+                    def pcm(path):
+                        return subprocess.run(
+                            [studio.get_ffmpeg_path(), "-v", "error", "-i", str(path),
+                             "-map", "0:a:0", "-f", "s16le", "-"],
+                            check=True, capture_output=True,
+                        ).stdout
+                    self.assertEqual(pcm(output), pcm(source))
+
+    def test_short_vorbis_auto_reencodes_without_granule_overflow(self):
+        """Auto не переносит переполнение granule короткого Vorbis при remux."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            for seconds in (0.12, 0.36):
+                with self.subTest(seconds=seconds):
+                    source = root / f"vorbis-{seconds}.ogg"
+                    subprocess.run(
+                        [studio.get_ffmpeg_path(), "-y", "-v", "error", "-f", "lavfi", "-i",
+                         f"sine=frequency=440:sample_rate=48000:duration={seconds}",
+                         "-c:a", "libvorbis", "-b:a", "64k", str(source)],
+                        check=True, capture_output=True,
+                    )
+                    _, _, source_samples = self._timing_media_details(source)
+                    output = root / f"safe-vorbis-{seconds}.ogg"
+                    counts = []
+                    with mock.patch.object(studio, "_run_ffmpeg_stream_copy_concat",
+                                           wraps=studio._run_ffmpeg_stream_copy_concat) as copy_audio:
+                        studio._export_merged_audio_ffmpeg(
+                            (source,), output, output_format="ogg", bitrate_mode="auto",
+                            _source_sample_counts=counts,
+                        )
+                    copy_audio.assert_not_called()
+                    audio, _, actual_samples = self._timing_media_details(output)
+                    self.assertEqual(counts, [source_samples])
+                    self.assertAlmostEqual(float(audio["duration"]), source_samples / 48000, delta=1 / 48000)
+                    self.assertAlmostEqual(actual_samples, source_samples, delta=1024)
+
+    def test_legacy_direct_aac_resets_independent_opus_timestamps(self):
+        """Прямой M4A не добавляет разрывы pre-skip при склейке предложений."""
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            source, samples = self._timing_opus_fixture(root)
+            processor = object.__new__(studio.TTSProcessor)
+            processor.cfg = {**studio.DEFAULT_CONFIG, "output_format": "m4a", "output_bitrate": "64k",
+                             "aac_encoder": "aac", "apply_output_tags": False, "tag_cover": "",
+                             "fx_speed": 1.0, "fx_pitch": 1.0, "fx_echo": False}
+            processor.is_stopped = False
+            processor.encode_semaphore = None
+            processor.cache_lock = threading.RLock()
+            processor.processing_statuses_ram = {}
+            output = root / "direct.m4a"
+            processor._merge_save_and_notify((source,) * 9, output, output.name, False, None)
+            audio, _, actual_samples = self._timing_media_details(output)
+            self.assertEqual(actual_samples, samples * 9)
+            self.assertAlmostEqual(float(audio["duration"]), actual_samples / 48000, delta=1 / 48000)
+
     def test_opus_cover_and_album_round_trip_through_ffmpeg(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
@@ -17280,8 +17568,8 @@ class OutputPlanningUnitTests(unittest.TestCase):
 
         self.assertEqual([item["path"].name for item in planned], ["Book.m4b"])
 
-    def test_export_m4b_current_template_overrides_stale_legacy_target_snapshot(self):
-        """Старый диапазон из снимка цели не должен побеждать новое поле."""
+    def test_export_m4b_empty_target_inherits_current_global_template(self):
+        """Пустой шаблон цели наследует актуальное общее поле экспорта."""
         group_id = "group"
         file_ids = ("chapter-1", "chapter-2")
         groups = {group_id: {"name": "Book", "merge": True, "pause": 0}}
@@ -17294,17 +17582,17 @@ class OutputPlanningUnitTests(unittest.TestCase):
             }
             for file_id in file_ids
         }
-        stale_target = studio.OutputTarget(
+        inherited_target = studio.OutputTarget(
             format="m4b",
             output_dir="/tmp/out",
-            filename_template=studio.DEFAULT_SOURCE_M4B_TEMPLATE,
+            filename_template="",
         )
         planned = studio.plan_export_target_paths(
             [group_id],
             children,
             groups,
             files,
-            [stale_target],
+            [inherited_target],
             "/tmp/out",
             m4b_template="{book}",
             auto_split_long_m4b=False,
@@ -19030,7 +19318,7 @@ class OutputPlanningUnitTests(unittest.TestCase):
 
     def test_source_m4b_template_runtime_alias_prefers_explicit_alias_and_falls_back_to_canonical(self):
         """Снимок запуска не должен возвращать исторический диапазон из-за пропущенного поля."""
-        # ``source_m4b_template`` — имя поля в снимке запуска. Оно имеет
+        # ``source_m4b_template`` обозначает имя поля в снимке запуска. Оно имеет
         # приоритет даже при явной пустой строке: пустота означает
         # сохранённый компактный вариант ``{book}``, а не отсутствие поля.
         self.assertEqual(
@@ -19249,7 +19537,7 @@ class OutputPlanningUnitTests(unittest.TestCase):
                         "parts": 3,
                         "group_name": f"Book Часть {number}",
                         "book": "Book",
-                        # Каждая запись — отдельный том, созданный вручную. Защитный проход
+                        # Каждая запись представляет отдельный том, созданный вручную. Защитный проход
                         # не должен объединять такие десятичасовые тома в 20 ч + 10 ч.
                         "file_ids": (file_id,),
                         "source_paths": (source,),
@@ -19543,8 +19831,8 @@ class OutputPlanningUnitTests(unittest.TestCase):
             )
             self.assertEqual([item["path"].name for item in compact], ["Книга.m4b"])
 
-    def test_source_synthesis_m4b_current_template_overrides_stale_target_snapshot(self):
-        """Старый снимок цели не должен возвращать диапазон после смены шаблона."""
+    def test_source_synthesis_m4b_empty_target_inherits_current_plan_template(self):
+        """Пустой шаблон цели наследует актуальное имя плана без старого диапазона."""
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "source"
             output = Path(tempdir) / "audio"
@@ -19555,18 +19843,18 @@ class OutputPlanningUnitTests(unittest.TestCase):
                 path.write_text(f"chapter {number}", encoding="utf-8")
                 files.append(path)
 
-            # Это снимок старого окна целей источника, созданный до того, как
-            # пользователь сменил поле шаблона плана на ``{book}``.
-            stale_target = studio.OutputTarget(
+            # Пустой шаблон цели хранит наследование: изменение шаблона плана
+            # сразу меняет имена автоматически подготовленных групп.
+            inherited_target = studio.OutputTarget(
                 format="m4b",
                 output_dir=str(output),
-                filename_template=studio.DEFAULT_SOURCE_M4B_TEMPLATE,
+                filename_template="",
             )
             planned = studio.plan_source_synthesis_target_paths(
                 root,
                 output,
                 files,
-                targets=[stale_target],
+                targets=[inherited_target],
                 source_m4b_groups=(),
                 book_name="Книга",
                 m4b_template="{book}",
@@ -19591,7 +19879,7 @@ class OutputPlanningUnitTests(unittest.TestCase):
                 root,
                 output,
                 files,
-                targets=[stale_target],
+                targets=[inherited_target],
                 source_m4b_groups=groups,
                 book_name="Книга",
                 m4b_template="{book}",
@@ -19615,7 +19903,7 @@ class OutputPlanningUnitTests(unittest.TestCase):
                         root,
                         output,
                         files,
-                        targets=[stale_target],
+                        targets=[inherited_target],
                         source_m4b_groups=groups,
                         book_name="Книга",
                         m4b_template=template,
@@ -19808,23 +20096,12 @@ class OutputPlanningUnitTests(unittest.TestCase):
         dialog_start = source.index("    def open_output_targets_dialog(self):")
         dialog_end = source.index("    def _choose_output_target_dir", dialog_start)
         dialog = source[dialog_start:dialog_end]
-        # Пустое значение — осознанный компактный вариант шаблона. Существующие
+        # Пустое значение задаёт осознанный компактный вариант шаблона. Существующие
         # строки сохраняют явный пустой снимок, а новые читают текущее поле без
         # общего резервного значения для необязательных параметров.
         self.assertIn('def _current_target_template():', dialog)
         self.assertIn('"filename_template" in old', dialog)
         self.assertIn('filename_template = _current_target_template()', dialog)
-
-    def test_source_launch_clears_legacy_m4b_target_filename_snapshot(self):
-        source = MODULE_PATH.read_text(encoding="utf-8")
-        start = source.index("    def start_processing(self, only_selected=False):")
-        end = source.find("\n    def ", start + 1)
-        if end < 0:
-            end = len(source)
-        launch = source[start:end]
-        self.assertIn("Имена M4B источника принадлежат шаблону виртуального плана источника", launch)
-        self.assertIn('dict(target, filename_template="")', launch)
-        self.assertIn('str(target.get("format", "")).strip().lower() == "m4b"', launch)
 
     def test_export_preflight_rejects_desynchronized_tree_items(self):
         source = MODULE_PATH.read_text(encoding="utf-8")

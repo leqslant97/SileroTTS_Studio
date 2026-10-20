@@ -1013,11 +1013,12 @@ class SourceOutputStatusTests(unittest.TestCase):
                 app.root = mock.Mock()
                 app._set_status_label = mock.Mock()
                 app._show_warning = mock.Mock()
+                app._show_task_notification = mock.Mock()
                 render_events = []
                 app.root.update_idletasks.side_effect = (
                     lambda: render_events.append("render")
                 )
-                app._show_warning.side_effect = (
+                app._show_task_notification.side_effect = (
                     lambda *_args: render_events.append("alert")
                 )
                 processor = mock.Mock(is_stopped=False)
@@ -1038,7 +1039,9 @@ class SourceOutputStatusTests(unittest.TestCase):
                 self.assertEqual(app.tree.item("failed", "tags"), ("error",))
                 if action == "hard_stop_processing":
                     app.root.update_idletasks.assert_called_once()
-                    app._show_warning.assert_called_once()
+                    app._show_task_notification.assert_called_once()
+                    self.assertEqual(app._show_task_notification.call_args.args[0], "warning")
+                    app._show_warning.assert_not_called()
                     self.assertEqual(render_events, ["render", "alert"])
 
                 app.update_file_status("waiting", "waiting")

@@ -106,6 +106,7 @@ class SourceGroupOutputPlanningTests(unittest.TestCase):
         app.config = {"tag_album": "Серия", "input_dir": str(self.source)}
         app._source_path_by_id = {str(path): path for path in self.files}
         app._source_plan_groups = {group["id"]: group for group in self.groups}
+        app._source_tree_file_ids = lambda: tuple(app._source_path_by_id)
         contexts = app._template_helper_source_preview_data()["contexts"]
         preview_data = {
             "file_contexts": [dict(item, format="mp3", ext="mp3") for item in contexts],

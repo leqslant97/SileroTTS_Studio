@@ -105,6 +105,7 @@ class SourceSessionTests(unittest.TestCase):
         app._show_info = mock.Mock()
         app._show_warning = mock.Mock()
         app._show_error = mock.Mock()
+        app._show_task_notification = mock.Mock()
         app._ask_yes_no = mock.Mock(return_value=True)
         for name in ("lbl_total_pct", "lbl_file_pct", "btn_go_current", "lbl_current_text"):
             setattr(app, name, mock.Mock())
@@ -233,7 +234,9 @@ class SourceSessionTests(unittest.TestCase):
 
         app._finish_m4b_source_plan((("03.txt", "01.txt", "02.txt"),), {}, template="Новое имя")
 
-        app._show_warning.assert_called_once()
+        app._show_task_notification.assert_called_once()
+        self.assertEqual(app._show_task_notification.call_args.args[:2], ("warning", "План устарел"))
+        app._show_warning.assert_not_called()
         self.assertIn(group_id, app._source_plan_groups)
         self.assertEqual(app._source_plan_groups[group_id]["name"], original["name"])
         self.assertEqual(app._source_plan_groups[group_id]["metadata_overrides"], original["metadata_overrides"])
@@ -849,6 +852,35 @@ class SourceSessionTests(unittest.TestCase):
         self.assertEqual(app._reuse_source_runtime_m4b_records(
             [partial], partial["file_ids"], app._source_path_by_id,
         ), (partial,))
+
+    def test_timecode_change_preserves_accepted_m4b_boundaries_after_restart(self):
+        app = self.app()
+        accepted = self.record(kind="m4b")
+        accepted["target"]["timecodes"] = studio.normalize_timecode_options({"enabled": True})
+        accepted = studio.plan_timecode_paths([accepted])[0]
+        app._remember_source_runtime_m4b_records([accepted])
+        app._source_plan_dirty = False
+        planned = copy.deepcopy(accepted)
+        planned.update(path=self.root / "Предварительный том.m4b", target_index=1)
+        planned["target"]["timecodes"].update(
+            line_template="{start:hms_ms} {index:03d}. {title}",
+            filename_template="{audio_stem}-метки", output_dir=str(self.root / "timecodes"),
+        )
+
+        def check(current):
+            reused = current._reuse_source_runtime_m4b_records(
+                [planned], accepted["file_ids"], current._source_path_by_id,
+            )
+            self.assertEqual(len(reused), 1)
+            self.assertEqual(reused[0]["path"], accepted["path"])
+            self.assertEqual(reused[0]["file_ids"], accepted["file_ids"])
+            self.assertEqual(reused[0]["target"]["timecodes"], planned["target"]["timecodes"])
+            self.assertEqual(reused[0]["timecode_path"], self.root / "timecodes" / "book-метки.txt")
+            self.assertEqual(current._source_m4b_rebuild_paths(reused), ())
+
+        check(app)
+        app._save_source_session()
+        check(self.app())
 
     def test_accepting_new_split_discards_overlapping_old_volume(self):
         app = self.app()
