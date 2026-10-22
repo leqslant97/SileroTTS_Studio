@@ -153,7 +153,7 @@ from collections import Counter, deque
 from collections.abc import Mapping
 from razdel import sentenize
 
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 # Нулевая третья компонента опускается только в публичном имени базового
 # релиза; у исправительных релизов сохраняются все три компонента.
 _APP_VERSION_PARTS = APP_VERSION.split(".")
@@ -308,9 +308,9 @@ CACHE_VARIANT_KEEP_LEGACY = "keep_legacy"
 CACHE_VARIANT_KEEP_LEGACY_CURRENT = "keep_legacy_current"
 CACHE_VARIANT_KEEP_CURRENT = "keep_current"
 
-# Официальный адрес HTTPS используется только как значение по умолчанию.
-# Любой непустой адрес из настроек передаётся без скрытого переписывания:
-# пользователь может указать собственный сервер, прокси или адрес HTTP.
+# Официальный адрес HTTPS используется по умолчанию; старый официальный HTTP
+# адрес мигрирует при загрузке настроек. Другие пользовательские адреса,
+# включая собственные HTTP-серверы и прокси, сохраняются как заданы.
 DEFAULT_API_URL = "https://iq3g.silero.ai/enhanced_voice"
 
 CACHE_OPERATION_LABELS = {
@@ -8814,14 +8814,14 @@ def _config_group_rules_data():
             "default_group_pause_start", "default_group_pause_end",
         },
         "cache": {
-            "auto_trim_silence", "auto_abbreviations", "auto_short_words",
+            "auto_trim_silence", "auto_plus", "auto_abbreviations", "auto_short_words",
             "silence_threshold", "use_cache", "cache_save_frequency",
             "enable_cache_lru", "enable_cache_ttl", "cache_max_entries",
             "cache_ttl_hours", "skip_existing",
         },
         "normalizer": {
             "normalizer_enabled", "normalizer_mode", "normalizer_options",
-            "glossary_enabled", "auto_abbreviations", "auto_short_words",
+            "glossary_enabled", "auto_plus", "auto_abbreviations", "auto_short_words",
             "normalizer_profiles", "default_normalizer_profile_id",
         },
         "effects": {
@@ -8980,7 +8980,14 @@ def normalize_normalizer_profile_entry(entry, *, legacy_index=0):
     # До введения библиотеки ``settings.json`` мог содержать переносимые профили
     # напрямую. Хэш повторяется между запусками, поэтому ссылки стабильны.
     profile = normalize_normalizer_profile(entry)
-    profile_id = _normalizer_custom_profile_id(profile)
+    identity_profile = profile
+    if entry["version"] in (1, 2) and profile["preprocessing"]["auto_plus"]:
+        # У старого формата дополнительная озвучка плюсов всегда работала.
+        # Сохраняем прежний id, чтобы не потерять выбранный профиль при чтении.
+        identity_profile = copy.deepcopy(profile)
+        identity_profile["version"] = 2
+        identity_profile["preprocessing"].pop("auto_plus")
+    profile_id = _normalizer_custom_profile_id(identity_profile)
     return {"id": profile_id, "profile": profile}
 
 
@@ -9001,6 +9008,7 @@ def _builtin_normalizer_profile(profile_id):
         "normalizer_mode": mode,
         "normalizer_options": normalizer_mode_defaults(mode),
         "glossary_enabled": True,
+        "auto_plus": True,
         "auto_abbreviations": True,
         "auto_short_words": True,
     }
@@ -16404,7 +16412,7 @@ except ImportError:
 
 
 NORMALIZER_PROFILE_SCHEMA = "silero-tts-studio-normalizer-profile"
-NORMALIZER_PROFILE_VERSION = 2
+NORMALIZER_PROFILE_VERSION = 3
 NORMALIZER_MODES = ("tts", "safe")
 NORMALIZER_BOOLEAN_OPTIONS = (
     "cleanup_malformed_punctuation",
@@ -16620,6 +16628,9 @@ def normalizer_settings_snapshot(config):
         "glossary_enabled": _config_bool(
             source.get("glossary_enabled", True), default=True
         ),
+        "auto_plus": _config_bool(
+            source.get("auto_plus", True), default=True
+        ),
         "auto_abbreviations": _config_bool(
             source.get("auto_abbreviations", True), default=True
         ),
@@ -16644,6 +16655,7 @@ def describe_normalizer_settings(config):
         changed_options == 0
         and state["normalizer_enabled"]
         and state["glossary_enabled"]
+        and state["auto_plus"]
         and state["auto_abbreviations"]
         and state["auto_short_words"]
     )
@@ -16675,6 +16687,8 @@ def describe_normalizer_settings(config):
             base_title if is_builtin else f"Пользовательский (база {base_short})"
         )
     studio_parts = []
+    if state["auto_plus"]:
+        studio_parts.append("озвучка плюсов")
     if state["auto_abbreviations"]:
         studio_parts.append("аббревиатуры")
     if state["auto_short_words"]:
@@ -16857,6 +16871,9 @@ def normalizer_profile_from_config(
             "options": options,
         },
         "preprocessing": {
+            "auto_plus": _config_bool(
+                config.get("auto_plus", True), default=True
+            ),
             "auto_abbreviations": _config_bool(
                 config.get("auto_abbreviations", True), default=True
             ),
@@ -16886,7 +16903,7 @@ def normalize_normalizer_profile(profile):
     version = profile["version"]
     if isinstance(version, bool) or not isinstance(version, int):
         raise ValueError("версия профиля нормализации должна быть целым числом")
-    if version not in (1, NORMALIZER_PROFILE_VERSION):
+    if version not in (1, 2, NORMALIZER_PROFILE_VERSION):
         raise ValueError(
             f"неподдерживаемая версия профиля нормализации: {version}"
         )
@@ -16916,9 +16933,13 @@ def normalize_normalizer_profile(profile):
     preprocessing = profile["preprocessing"]
     if not isinstance(preprocessing, dict):
         raise ValueError("секция preprocessing должна быть JSON-объектом")
+    if version in (1, 2):
+        preprocessing = dict(preprocessing)
+        preprocessing.setdefault("auto_plus", True)
     _strict_profile_keys(
         preprocessing,
         {
+            "auto_plus",
             "auto_abbreviations",
             "auto_short_words",
             "glossary_enabled",
@@ -16946,6 +16967,9 @@ def normalize_normalizer_profile(profile):
             "options": options,
         },
         "preprocessing": {
+            "auto_plus": _strict_profile_bool(
+                preprocessing, "auto_plus", "preprocessing"
+            ),
             "auto_abbreviations": _strict_profile_bool(
                 preprocessing, "auto_abbreviations", "preprocessing"
             ),
@@ -16974,6 +16998,7 @@ def apply_normalizer_profile(config, profile):
             "normalizer_enabled": section["enabled"],
             "normalizer_mode": section["mode"],
             "normalizer_options": options,
+            "auto_plus": preprocessing["auto_plus"],
             "auto_abbreviations": preprocessing["auto_abbreviations"],
             "auto_short_words": preprocessing["auto_short_words"],
             "glossary_enabled": preprocessing["glossary_enabled"],
@@ -17784,6 +17809,7 @@ DEFAULT_CONFIG = {
 
     "auto_trim_silence": True,
     "silence_threshold": -55.0,
+    "auto_plus": True,
     "auto_abbreviations": True,
     "auto_short_words": True,
     # Переносимый профиль ru-normalizr. Пустой словарь означает актуальные значения
@@ -17874,7 +17900,7 @@ def normalize_config(config):
 
     boolean_keys = (
         "api_steps_enabled", "cache_include_steps", "auto_trim_silence",
-        "auto_abbreviations", "auto_short_words", "use_cache",
+        "auto_plus", "auto_abbreviations", "auto_short_words", "use_cache",
         "normalizer_enabled", "glossary_enabled",
         "enable_cache_lru", "enable_cache_ttl", "fx_echo",
         "export_apply_fx", "export_fx_echo",
@@ -18209,6 +18235,9 @@ def normalize_config(config):
     ):
         value = normalized.get(key, DEFAULT_CONFIG.get(key, ""))
         normalized[key] = str(value) if value is not None else ""
+
+    if normalized["api_url"].strip() == "http://iq3g.silero.ai/enhanced_voice":
+        normalized["api_url"] = DEFAULT_API_URL
 
     # Ранние снимки уже могли хранить имя книги, но ещё не знали о привязке к
     # папке. Связываем такое значение с текущим каталогом один раз, чтобы после
@@ -19954,30 +19983,31 @@ class TTSProcessor:
         if m: term_punct = m.group(1)
 
         # 2. Умная замена плюсов (защита ручных ударений)
-        magic_token = "___PLUS_ACCENT_TOKEN___"
-        active_normalizer = getattr(self, "_normalizer", normalizer)
-        if "$" in text and getattr(
-            getattr(active_normalizer, "options", None),
-            "enable_math_normalization", False,
-        ):
-            # Слово «плюс» внутри $…$ мешает распознать формулу. Сохраняем
-            # знак до ru-normalizr; точные замены глоссария применяются ниже.
-            text = re.sub(
-                r"\$[^$\n]*\$",
-                lambda match: match.group(0).replace("+", magic_token), text,
-            )
-        # Плюсы, окруженные пробелами, или в начале строки с пробелом -> "плюс"
-        text = re.sub(r'(^|\s)\+(?=\s)', r'\g<1>плюс ', text)
-        # Плюсы между цифрами -> "плюс"
-        text = re.sub(r'(?<=\d)\s*\+\s*(?=\d)', ' плюс ', text)
-        # Маскируем плюсы внутри слов (з+амок).
-        text = re.sub(r'(?<=[а-яА-ЯёЁa-zA-Z])\+(?=[а-яА-ЯёЁa-zA-Z])', magic_token, text)
-        # Маскируем плюсы в начале слов (+аура).
-        text = re.sub(r'(?<![а-яА-ЯёЁa-zA-Z0-9])\+(?=[а-яА-ЯёЁa-zA-Z])', magic_token, text)
-        # Остальные плюсы меняем на слово "плюс"
-        text = text.replace("+", " плюс ")
-        # Возвращаем замаскированные ударения обратно
-        text = text.replace(magic_token, "+")
+        if _config_bool(self.cfg.get("auto_plus", True), default=True):
+            magic_token = "___PLUS_ACCENT_TOKEN___"
+            active_normalizer = getattr(self, "_normalizer", normalizer)
+            if "$" in text and getattr(
+                getattr(active_normalizer, "options", None),
+                "enable_math_normalization", False,
+            ):
+                # Слово «плюс» внутри $…$ мешает распознать формулу. Сохраняем
+                # знак до ru-normalizr; точные замены глоссария применяются ниже.
+                text = re.sub(
+                    r"\$[^$\n]*\$",
+                    lambda match: match.group(0).replace("+", magic_token), text,
+                )
+            # Плюсы, окруженные пробелами, или в начале строки с пробелом -> "плюс"
+            text = re.sub(r'(^|\s)\+(?=\s)', r'\g<1>плюс ', text)
+            # Плюсы между цифрами -> "плюс"
+            text = re.sub(r'(?<=\d)\s*\+\s*(?=\d)', ' плюс ', text)
+            # Маскируем плюсы внутри слов (з+амок).
+            text = re.sub(r'(?<=[а-яА-ЯёЁa-zA-Z])\+(?=[а-яА-ЯёЁa-zA-Z])', magic_token, text)
+            # Маскируем плюсы в начале слов (+аура).
+            text = re.sub(r'(?<![а-яА-ЯёЁa-zA-Z0-9])\+(?=[а-яА-ЯёЁa-zA-Z])', magic_token, text)
+            # Остальные плюсы меняем на слово "плюс"
+            text = text.replace("+", " плюс ")
+            # Возвращаем замаскированные ударения обратно
+            text = text.replace(magic_token, "+")
 
         # 3. Авто-аббревиатуры (И.И. -> И-И, к.п.д. -> к-п-д)
         if _config_bool(self.cfg.get("auto_abbreviations", True), default=True):
@@ -20006,7 +20036,7 @@ class TTSProcessor:
         # дефис реплики перед ``62-й`` заменяется на тире ещё до нормализации.
         text = text.replace("\ue001", "минус ")
 
-        # 7. Очистка спецсимволов (не трогаем +, так как он уже для ударений)
+        # 7. Очистка спецсимволов с сохранением +, в том числе ручных ударений
         text = re.sub(r'[*|\\/_\#~^()\[\]{}<>"\'«»„“”]', '', text)
         text = strip_dialogue_prefix(text)
         text = re.sub(r'\s+', ' ', text).strip()
@@ -22474,6 +22504,7 @@ def render_template_helper_preview(
             )
 
     if context_kind == "book_import":
+        single_file = bool(preview_data.get("single_file", single_file))
         raw_names = preview_data.get("book_names", book_names)
         names = [Path(str(name)).stem for name in raw_names if str(name).strip()]
         if not names:
@@ -22807,11 +22838,14 @@ def _template_helper_source_album_value(config, context, template):
     return str(tags.get("album") or "(тег не записывается)")
 
 
-def template_helper_full_preview_rows(context_kind, template, preview_data=None):
+def template_helper_full_preview_rows(
+    context_kind, template, preview_data=None, *, import_preview_cache=None,
+    cancel_event=None, progress_callback=None,
+):
     """Возвращает полный результат реального снимка без записи и применения.
 
-    Учебные данные не используются: без извлечённых глав или существующего
-    плана вызывающий интерфейс получает понятное объяснение ограничения.
+    Учебные данные не используются. Импорт читает реальные главы по запросу;
+    остальные контексты используют переданный снимок рабочего плана.
     """
     data = copy.deepcopy(dict(preview_data or {}))
     if data.get("full_preview_error"):
@@ -22836,9 +22870,19 @@ def template_helper_full_preview_rows(context_kind, template, preview_data=None)
         render_template_helper_preview(context_kind, template, preview_data=data)
         return ()
     if context_kind == "book_import":
-        raise TemplateError(
-            "Полный список имён доступен после извлечения реальных глав. "
-            "В помощнике импорта показаны примеры: заголовки и автор ещё не извлечены."
+        sources = tuple(data.get("book_names", ()))
+        if not data.get("actual_files") or not sources:
+            raise TemplateError("Добавьте книги в очередь, чтобы увидеть реальные главы и имена TXT.")
+        out_dir = str(data.get("out_dir") or "").strip()
+        if not out_dir:
+            raise TemplateError("Укажите папку для сохранения TXT перед полным просмотром.")
+        return BookExtractor.preview_files(
+            sources, out_dir, template,
+            regex_pattern=str(data.get("regex_pattern") or ""),
+            single_file=bool(data.get("single_file", False)),
+            progress_callback=progress_callback,
+            preview_cache=import_preview_cache,
+            cancel_event=cancel_event,
         )
     if context_kind == "group_sequence":
         raise TemplateError(
@@ -23189,6 +23233,93 @@ def can_move_book_import_paths(paths, selected_indices, direction):
     )
 
 
+class BookImportPreviewCache:
+    """Ограниченный кэш извлечённого текста для предпросмотра и импорта.
+
+    Лимит относится к оценке удерживаемых Python-объектов через
+    ``sys.getsizeof``, а не к RSS процесса или памяти анализатора книги.
+    Доступ и извлечение сериализованы; наружу возвращается отдельный список
+    неизменяемых пар, поэтому вызывающий код не может изменить запись кэша.
+    """
+
+    def __init__(self, max_bytes=64 * 1024 * 1024):
+        self._max_bytes = max(0, int(max_bytes))
+        self._entries = {}
+        self._retained_bytes = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _file_signature(path):
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Файл не найден: {path}") from None
+        return (
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+            info.st_ino, info.st_dev,
+        )
+
+    @staticmethod
+    def _entry_size(value):
+        seen = set()
+
+        def measure(item):
+            identity = id(item)
+            if identity in seen:
+                return 0
+            seen.add(identity)
+            size = sys.getsizeof(item)
+            if isinstance(item, tuple):
+                size += sum(measure(child) for child in item)
+            return size
+
+        return measure(value)
+
+    def get_or_extract(self, filepath, regex_pattern="", single_file=False, *, cache_miss=True):
+        """Читает книгу; ``cache_miss=False`` сохраняет кэш при длинном импорте."""
+        source_path = Path(filepath).expanduser()
+        path_key = os.path.normcase(os.path.abspath(str(source_path)))
+        # Шаблон разбиения применяется только к TXT в режиме отдельных глав.
+        effective_regex = (
+            regex_pattern
+            if source_path.suffix.lower() == ".txt" and not single_file
+            else ""
+        )
+        key = (path_key, effective_regex, bool(single_file))
+
+        with self._lock:
+            before = self._file_signature(source_path)
+            cached = self._entries.pop(key, None)
+            if cached is not None:
+                signature, chapters, author, size = cached
+                self._retained_bytes -= size
+                if signature == before:
+                    if self._file_signature(source_path) != before:
+                        raise OSError(f"Файл изменился во время чтения: {source_path}")
+                    self._entries[key] = cached
+                    self._retained_bytes += size
+                    return list(chapters), author
+
+            chapters, author = BookExtractor.extract_file(
+                source_path,
+                regex_pattern=regex_pattern,
+                single_file=single_file,
+            )
+            if self._file_signature(source_path) != before:
+                raise OSError(f"Файл изменился во время чтения: {source_path}")
+            chapters = tuple((str(title), str(content)) for title, content in chapters)
+            author = str(author or "")
+            if cache_miss and self._max_bytes:
+                size = self._entry_size((key, before, chapters, author, 0))
+                if size <= self._max_bytes:
+                    while self._entries and self._retained_bytes + size > self._max_bytes:
+                        oldest_key = next(iter(self._entries))
+                        self._retained_bytes -= self._entries.pop(oldest_key)[3]
+                    self._entries[key] = (before, chapters, author, size)
+                    self._retained_bytes += size
+            return list(chapters), author
+
+
 class BookExtractor:
     """Утилита для извлечения текста из различных форматов книг (EPUB, FB2, DOCX)."""
 
@@ -23522,6 +23653,8 @@ class BookExtractor:
         regex_pattern="",
         single_file=False,
         progress_callback=None,
+        *,
+        preview_cache=None,
     ):
         """Последовательно импортирует книги, не прерывая очередь из-за одной ошибки.
 
@@ -23554,11 +23687,21 @@ class BookExtractor:
         for book_index, source_path in enumerate(sources, 1):
             notify(book_index, source_path, "extract")
             try:
-                chapters, author = BookExtractor.extract_file(
-                    source_path,
-                    regex_pattern=regex_pattern,
-                    single_file=single_file,
-                )
+                if preview_cache is None:
+                    chapters, author = BookExtractor.extract_file(
+                        source_path,
+                        regex_pattern=regex_pattern,
+                        single_file=single_file,
+                    )
+                else:
+                    # Начало большой очереди не вытесняет ещё не прочитанный
+                    # хвост, оставшийся в кэше после полного предпросмотра.
+                    chapters, author = preview_cache.get_or_extract(
+                        source_path,
+                        regex_pattern=regex_pattern,
+                        single_file=single_file,
+                        cache_miss=False,
+                    )
                 if not chapters:
                     raise ValueError("Не удалось найти текст или главы в файле.")
 
@@ -23592,25 +23735,125 @@ class BookExtractor:
                 }
                 results.append(result)
                 notify(book_index, source_path, "error", result["error"])
+            finally:
+                chapters = None
 
         return results
 
     @staticmethod
-    def save_chapters(
-        chapters,
+    def preview_files(
+        filepaths,
         out_dir,
+        template,
+        regex_pattern="",
+        single_file=False,
+        progress_callback=None,
+        *,
+        preview_cache=None,
+        cancel_event=None,
+    ):
+        """Планирует все реальные главы без создания каталогов и файлов.
+
+        Ошибки отдельных книг возвращаются отдельными строками. При отмене
+        выбрасывается ``CancelledError`` без частичного результата; текущий
+        анализатор завершает чтение перед проверкой события отмены.
+        """
+        _parse_book_import_template(template)
+        sources = [Path(path).expanduser() for path in filepaths]
+        total_books = len(sources)
+        output_dir = Path(out_dir)
+        cache = preview_cache if preview_cache is not None else BookImportPreviewCache(0)
+        occupied_names = None
+        rows = []
+
+        def check_cancelled():
+            if cancel_event is not None and cancel_event.is_set():
+                raise concurrent.futures.CancelledError("Предпросмотр импорта отменён")
+
+        def notify(book_index, source_path, stage, value=None):
+            if progress_callback is not None:
+                try:
+                    progress_callback(book_index, total_books, source_path, stage, value)
+                except Exception:
+                    logging.exception("Не удалось обновить прогресс предпросмотра импорта")
+
+        check_cancelled()
+        for book_index, source_path in enumerate(sources, 1):
+            check_cancelled()
+            chapters = None
+            try:
+                notify(book_index, source_path, "extract")
+                check_cancelled()
+                chapters, author = cache.get_or_extract(
+                    source_path, regex_pattern=regex_pattern, single_file=single_file,
+                )
+                check_cancelled()
+                if not chapters:
+                    raise ValueError("Не удалось найти текст или главы в файле.")
+                if occupied_names is None:
+                    occupied_names = {
+                        _book_import_name_identity(path.name)
+                        for path in output_dir.iterdir()
+                        if path.is_file()
+                    } if output_dir.exists() else set()
+                notify(book_index, source_path, "plan", len(chapters))
+                check_cancelled()
+                filenames = BookExtractor._plan_chapter_filenames(
+                    chapters, source_path, template, author,
+                    book_index=book_index, book_count=total_books,
+                    occupied_names=occupied_names,
+                )
+                book_rows = []
+                for chapter_index, filename in enumerate(filenames, 1):
+                    title = chapters[chapter_index - 1][0]
+                    path = (output_dir / filename).absolute()
+                    detail = (
+                        f"Источник: {source_path}\nКнига: {book_index}/{total_books}"
+                        f"\nГлава: {chapter_index}/{len(chapters)}\nЗаголовок: {title}"
+                    )
+                    if author:
+                        detail += f"\nАвтор: {author}"
+                    book_rows.append({
+                        "source": str(title), "result": filename,
+                        "group": source_path.name, "path": str(path),
+                        "detail": detail + f"\nРезультат: {path}",
+                        "book_index": book_index, "error": None,
+                    })
+                check_cancelled()
+                occupied_names.update(_book_import_name_identity(name) for name in filenames)
+                rows.extend(book_rows)
+                notify(book_index, source_path, "complete", len(filenames))
+            except concurrent.futures.CancelledError:
+                raise
+            except Exception as exc:
+                logging.exception("Не удалось подготовить предпросмотр книги %s", source_path)
+                error = str(exc) or exc.__class__.__name__
+                rows.append({
+                    "source": source_path.name, "result": "Ошибка",
+                    "group": source_path.name, "path": "",
+                    "detail": f"Источник: {source_path}\nКнига: {book_index}/{total_books}\nОшибка: {error}",
+                    "book_index": book_index, "error": error,
+                })
+                notify(book_index, source_path, "error", error)
+            finally:
+                chapters = None
+            check_cancelled()
+        check_cancelled()
+        return tuple(rows)
+
+    @staticmethod
+    def _plan_chapter_filenames(
+        chapters,
         orig_filename,
         template,
         author="",
         *,
         book_index=1,
         book_count=1,
+        occupied_names=(),
     ):
+        """Рассчитывает имена одной книги без обращения к файловой системе."""
         total = len(chapters)
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        saved_files = []
         name_no_ext = Path(orig_filename).stem
         parsed_template, counter_starts = _parse_book_import_template(template)
         try:
@@ -23622,15 +23865,11 @@ class BookExtractor:
         except (TypeError, ValueError, OverflowError):
             queue_count = queue_index
 
-        occupied_names = {
-            _book_import_name_identity(path.name)
-            for path in out_dir.iterdir()
-            if path.is_file()
-        }
+        occupied_names = set(occupied_names)
         planned_files = []
         next_duplicate_indexes = {}
 
-        for idx, (title, content) in enumerate(chapters, 0):
+        for idx, (title, _content) in enumerate(chapters, 0):
             filename = _render_book_import_filename(
                 parsed_template,
                 counter_starts,
@@ -23651,11 +23890,39 @@ class BookExtractor:
                 duplicate_index += 1
             next_duplicate_indexes[base_filename] = duplicate_index
             occupied_names.add(_book_import_name_identity(filename))
-            planned_files.append((idx, filename, content))
+            planned_files.append(filename)
+        return tuple(planned_files)
 
+    @staticmethod
+    def save_chapters(
+        chapters,
+        out_dir,
+        orig_filename,
+        template,
+        author="",
+        *,
+        book_index=1,
+        book_count=1,
+    ):
+        total = len(chapters)
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        occupied_names = (
+            _book_import_name_identity(path.name)
+            for path in out_dir.iterdir()
+            if path.is_file()
+        )
+        planned_files = BookExtractor._plan_chapter_filenames(
+            chapters, orig_filename, template, author,
+            book_index=book_index, book_count=book_count,
+            occupied_names=occupied_names,
+        )
+
+        saved_files = []
         created_paths = []
         try:
-            for idx, filename, content in planned_files:
+            for idx, filename in enumerate(planned_files):
+                content = chapters[idx][1]
                 out_path = out_dir / filename
                 _write_text_atomic(out_path, content)
                 created_paths.append(out_path)
@@ -24154,6 +24421,7 @@ class TTSApp:
         parent = options.get("parent") or self.root
         if not parent.winfo_exists():
             parent = self.root
+        previous_focus = parent.focus_get()
         popup = tk.Toplevel(parent)
         popup.withdraw()
         popup.title(title)
@@ -24187,8 +24455,35 @@ class TTSApp:
         text.insert("1.0", message)
         text.configure(state=tk.DISABLED)
 
+        def restore_focus():
+            if getattr(self, "_is_closing", False):
+                return
+            try:
+                if not parent.winfo_exists():
+                    return
+                # Открытый после уведомления редактор сохраняет свой ввод.
+                current = parent.focus_get()
+                grab = parent.grab_current()
+                if any(
+                    widget is not None and widget.winfo_toplevel() is not parent
+                    for widget in (current, grab)
+                ):
+                    return
+                target = previous_focus
+                if target is None or not target.winfo_exists():
+                    target = parent
+                target.focus_set()
+            except tk.TclError:
+                pass
+
         def close(_event=None):
+            # Tk 9/macOS иногда оставляет окно без фокуса даже после клика
+            # по Entry. Восстанавливаем его после обработки закрытия окна.
+            current = parent.focus_get()
+            restore = current is None or current.winfo_toplevel() is popup
             popup.destroy()
+            if restore:
+                parent.after_idle(restore_focus)
             return "break"
 
         def forget(event):
@@ -24304,7 +24599,7 @@ class TTSApp:
         """Отделяет временную речь разных книг и настроек подготовки текста."""
         keys = (
             "synthesis_mode", "normalizer_enabled", "normalizer_mode",
-            "normalizer_options", "glossary_enabled", "auto_abbreviations",
+            "normalizer_options", "glossary_enabled", "auto_plus", "auto_abbreviations",
             "auto_short_words", "separator_symbols",
         )
         preparation = {
@@ -25543,6 +25838,40 @@ class TTSApp:
         snapshot["chapter_groups"] = list(_template_helper_visible_records(chapter_groups, snapshot))
         return snapshot
 
+    def _template_helper_import_preview_data(self):
+        """Снимает очередь и черновики импорта без чтения самих книг."""
+        variables = getattr(self, "settings_vars", {})
+        config = getattr(self, "config", {})
+
+        def current(key, default=""):
+            variable = variables.get(key)
+            return variable.get() if variable is not None else config.get(key, default)
+
+        paths = tuple(getattr(self, "import_filepaths", ()))
+        if not paths:
+            legacy = getattr(self, "import_filepath_var", None)
+            path = str(legacy.get() if legacy is not None else "").strip()
+            paths = (path,) if path else ()
+        return {
+            "book_names": paths,
+            "actual_files": True,
+            "single_file": bool(current("import_single_file", False)),
+            "regex_pattern": str(current("import_regex")),
+            "out_dir": str(current("import_outdir")).strip(),
+            "preview_notice": (
+                "Просмотр читает все выбранные книги, не создавая TXT. "
+                "Большая очередь может занять время. Имена учитывают файлы, "
+                "которые уже есть в выходной папке."
+            ),
+        }
+
+    def _get_book_import_preview_cache(self):
+        """Создаёт ограниченный кэш разбора после явного запроса просмотра."""
+        cache = getattr(self, "_book_import_preview_cache", None)
+        if cache is None:
+            cache = self._book_import_preview_cache = BookImportPreviewCache()
+        return cache
+
     def _open_template_helper(
         self,
         target_var,
@@ -26152,8 +26481,8 @@ class TTSApp:
             self._set_status_label(
                 status_label,
                 (
-                    "Шаблон корректен. Это пример: фактические названия глав "
-                    "и суффиксы совпадений зависят от исходных файлов."
+                    "Это примеры имён. «Все результаты…» прочитает выбранные "
+                    "книги; большая очередь может занять время."
                     if context_kind == "book_import"
                     else (
                         "Шаблон корректен. " + str(data.get("preview_notice"))
@@ -26258,6 +26587,10 @@ class TTSApp:
         """Открывает весь read-only результат текущего черновика шаблона."""
         owner = owner or self.root
         snapshot = copy.deepcopy(dict(preview_data or {}))
+        import_cache = (
+            self._get_book_import_preview_cache()
+            if context_kind == "book_import" else None
+        )
         previous_grab = self.root.grab_current()
         window = tk.Toplevel(owner)
         window.withdraw()
@@ -26316,7 +26649,8 @@ class TTSApp:
         count = ttk.Label(footer, text="Расчёт полного результата…")
         count.pack(side=tk.LEFT)
         state = {"closed": False, "rows": (), "visible": (), "generation": 0, "calculation": 0,
-                 "search_after": None, "after_ids": set(), "worker_running": False, "pending_request": None}
+                 "search_after": None, "after_ids": set(), "worker_running": False,
+                 "pending_request": None, "cancel_event": None}
 
         def cancel_callbacks():
             for identifier in tuple(state["after_ids"]):
@@ -26342,6 +26676,8 @@ class TTSApp:
                 return
             state["closed"] = True
             state["pending_request"] = None
+            if state["cancel_event"] is not None:
+                state["cancel_event"].set()
             cancel_callbacks()
             getattr(self, "_appearance_popup_windows", set()).discard(window)
             self._close_popup_safely(window)
@@ -26371,11 +26707,18 @@ class TTSApp:
         def fill_batch(generation, offset=0):
             if state["closed"] or generation != state["generation"]:
                 return
-            end = min(offset + 200, len(state["visible"]))
-            for position in range(offset, end):
-                index = state["visible"][position]
+            # Реже перерисовываем большие списки, но ограничиваем время
+            # вставки, чтобы Tk получал управление и на медленных машинах.
+            limit = min(offset + 1000, len(state["visible"]))
+            deadline = time.monotonic() + 0.008
+            end = offset
+            while end < limit:
+                index = state["visible"][end]
                 row = state["rows"][index]
                 table.insert("", tk.END, iid=str(index), values=tuple(row[key] for key in columns))
+                end += 1
+                if time.monotonic() >= deadline:
+                    break
             count.configure(text=f"Показано: {end}/{len(state['visible'])} · всего: {len(state['rows'])}")
             if end < len(state["visible"]):
                 later(1, fill_batch, generation, end)
@@ -26431,11 +26774,36 @@ class TTSApp:
                 count.configure(text="Полный результат недоступен")
                 return
             state["rows"] = rows
+            failed_books = sum(bool(row.get("error")) for row in rows)
+            if context_kind == "book_import" and failed_books:
+                notice.configure(
+                    text=f"Не удалось прочитать книг: {failed_books}. Подробности — в строках с ошибкой.",
+                    foreground=self.get_status_color("warning"),
+                )
+                getattr(self, "_palette_widget_kinds", {})[notice] = "warning"
             filter_rows()
 
-        def worker(current_snapshot, calculation):
+        def import_progress(book_index, total_books, source_path, stage, value, calculation):
+            if state["closed"] or calculation != state["calculation"]:
+                return
+            action = "Чтение" if stage == "extract" else "Расчёт имён"
+            if stage == "error":
+                action = "Ошибка чтения"
+            count.configure(text=f"{action}: книга {book_index}/{total_books} · {source_path.name}")
+
+        def worker(current_snapshot, calculation, cancel_event):
             try:
-                rows = template_helper_full_preview_rows(context_kind, template, current_snapshot)
+                if context_kind == "book_import":
+                    rows = template_helper_full_preview_rows(
+                        context_kind, template, current_snapshot,
+                        import_preview_cache=import_cache,
+                        cancel_event=cancel_event,
+                        progress_callback=lambda *args: self._post_to_ui(
+                            import_progress, *args, calculation
+                        ),
+                    )
+                else:
+                    rows = template_helper_full_preview_rows(context_kind, template, current_snapshot)
                 error = None
             except Exception as exc:
                 rows, error = (), exc
@@ -26470,8 +26838,12 @@ class TTSApp:
         def calculate():
             if state["closed"]:
                 return
+            if state["cancel_event"] is not None:
+                state["cancel_event"].set()
             state["calculation"] += 1
             calculation = state["calculation"]
+            cancel_event = threading.Event() if context_kind == "book_import" else None
+            state["cancel_event"] = cancel_event
             state["pending_request"] = None
             cancel_callbacks()
             state["search_after"] = None
@@ -26494,7 +26866,7 @@ class TTSApp:
                 getattr(self, "_palette_widget_kinds", {})[notice] = "muted"
                 # Один расчёт и последний ожидающий снимок ограничивают работу
                 # при повторных нажатиях «Обновить» в большом дереве.
-                state["pending_request"] = (current_snapshot, calculation)
+                state["pending_request"] = (current_snapshot, calculation, cancel_event)
                 start_pending_worker()
             except Exception as exc:
                 publish((), exc, calculation)
@@ -26506,6 +26878,8 @@ class TTSApp:
             if event.widget == window:
                 state["closed"] = True
                 state["pending_request"] = None
+                if state["cancel_event"] is not None:
+                    state["cancel_event"].set()
                 cancel_callbacks()
                 getattr(self, "_appearance_popup_windows", set()).discard(window)
                 getattr(self, "_palette_widget_kinds", {}).pop(notice, None)
@@ -29852,6 +30226,7 @@ class TTSApp:
                 self._source_plan_dirty = True
                 self._invalidate_source_runtime_m4b_plan()
             self._refresh_source_settings_summary()
+            self._refresh_source_output_targets_summary()
             close_dialog()
             if (
                 current_groups
@@ -30480,10 +30855,7 @@ class TTSApp:
                 title="Помощник шаблона импорта",
                 book_names=tuple(self.import_filepaths),
                 single_file=bool(self.settings_vars["import_single_file"].get()),
-                preview_data={
-                    "book_names": tuple(self.import_filepaths),
-                    "actual_files": True,
-                },
+                preview_data_provider=self._template_helper_import_preview_data,
             ),
         ).grid(row=1, column=2, padx=(0, 2), sticky=tk.E)
 
@@ -30850,6 +31222,7 @@ class TTSApp:
         out_dir = str(self.config.get("import_outdir", "")).strip()
         regex_pattern = self.settings_vars["import_regex"].get()
         single_file = self.settings_vars["import_single_file"].get()
+        preview_cache = getattr(self, "_book_import_preview_cache", None)
         if not out_dir:
             self._show_error("Ошибка", "Укажите папку для сохранения TXT.")
             return
@@ -30883,6 +31256,7 @@ class TTSApp:
                     regex_pattern=regex_pattern,
                     single_file=single_file,
                     progress_callback=report_progress,
+                    preview_cache=preview_cache,
                 )
                 successful = [result for result in results if not result["error"]]
                 failed = [result for result in results if result["error"]]
@@ -40043,6 +40417,26 @@ class TTSApp:
             "auto_short_words",
             1,
         )
+        add_check(
+            studio_normalizer_frame,
+            "Озвучивать знаки + (с сохранением ручных ударений)",
+            "auto_plus",
+            2,
+        )
+        self._register_palette_widget(
+            ttk.Label(
+                studio_normalizer_frame,
+                text=(
+                    "Флажок управляет дополнительной обработкой Studio. "
+                    "ru-normalizr может озвучивать + в числах и формулах "
+                    "при выключенном флажке."
+                ),
+                wraplength=680,
+                justify=tk.LEFT,
+                foreground=self.get_status_color("muted"),
+            ),
+            "muted",
+        ).grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(2, 4))
         self._refresh_global_normalizer_settings_summary()
 
         # 6. Эффекты
@@ -41106,6 +41500,14 @@ class TTSApp:
             text="Короткие сокращения Studio",
             variable=self.normalizer_preview_short_words_var,
             command=self._normalizer_option_changed,
+        ).pack(side=tk.LEFT, padx=4)
+
+        self.normalizer_preview_auto_plus_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            option_controls,
+            text="Плюсы Studio",
+            variable=self.normalizer_preview_auto_plus_var,
+            command=self._normalizer_option_changed,
         ).pack(side=tk.LEFT, padx=(4, 0))
 
         actions = ttk.Frame(toolbar)
@@ -41147,7 +41549,12 @@ class TTSApp:
 
         def layout_normalizer_toolbar(event=None):
             width = event.width if event is not None else toolbar.winfo_width()
-            compact = width < 980
+            compact_width = max(
+                980,
+                profile_controls.winfo_reqwidth()
+                + option_controls.winfo_reqwidth() + 12,
+            )
+            compact = width < compact_width
             if toolbar_layout_state["compact"] == compact:
                 self.lbl_normalizer_scope_status.configure(
                     wraplength=max(320, width - 8)
@@ -41678,6 +42085,9 @@ class TTSApp:
             self.normalizer_preview_glossary_var.set(
                 _config_bool(normalized.get("glossary_enabled", True), default=True)
             )
+            self.normalizer_preview_auto_plus_var.set(
+                _config_bool(normalized.get("auto_plus", True), default=True)
+            )
             self.normalizer_preview_auto_abbr_var.set(
                 _config_bool(normalized.get("auto_abbreviations", True), default=True)
             )
@@ -41752,6 +42162,7 @@ class TTSApp:
                 "normalizer_mode": mode,
                 "normalizer_options": options,
                 "glossary_enabled": self.normalizer_preview_glossary_var.get(),
+                "auto_plus": self.normalizer_preview_auto_plus_var.get(),
                 "auto_abbreviations": self.normalizer_preview_auto_abbr_var.get(),
                 "auto_short_words": self.normalizer_preview_short_words_var.get(),
             }
@@ -42314,6 +42725,7 @@ class TTSApp:
             "normalizer_mode",
             "normalizer_options",
             "glossary_enabled",
+            "auto_plus",
             "auto_abbreviations",
             "auto_short_words",
         ):
@@ -42350,7 +42762,7 @@ class TTSApp:
         previous_update_state = getattr(self, "_is_updating_ui", False)
         self._is_updating_ui = True
         try:
-            for key in ("auto_abbreviations", "auto_short_words"):
+            for key in ("auto_plus", "auto_abbreviations", "auto_short_words"):
                 variable = self.settings_vars.get(key)
                 if variable is not None:
                     variable.set(self.config[key])
@@ -42908,10 +43320,16 @@ class TTSApp:
     # Переносимые аудиопрофили
     def _audio_profile_from_current_ui(self, target, name="Новый профиль"):
         if target == "export":
+            output_format = str(self.export_fmt_var.get()).strip().lower()
+            bitrate = self.export_bitrate_var.get()
+            if output_format == "m4b":
+                # M4B использует профиль M4A/AAC и отдельный битрейт сборки.
+                output_format = "m4a"
+                bitrate = self.export_m4b_bitrate_var.get()
             return make_audio_profile(
                 name,
-                output_format=self.export_fmt_var.get(),
-                bitrate=self.export_bitrate_var.get(),
+                output_format=output_format,
+                bitrate=bitrate,
                 sample_rate=self.export_sample_rate_var.get(),
                 channels=self.export_channels_var.get(),
                 effects_enabled=self.export_apply_fx_var.get(),
@@ -47170,7 +47588,7 @@ class TTSApp:
 
         self.help_text_widget.config(yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.help_text_widget.yview)
-        help_text = r"""Silero TTS Studio v1.6.2
+        help_text = r"""Silero TTS Studio v1.6.3
 
 Silero TTS Studio озвучивает текст через Silero, собирает аудиокниги, объединяет и конвертирует аудиофайлы. Полученную речь можно повторно использовать из кэша.
 
@@ -47241,6 +47659,7 @@ API Token нужен для создания новых речевых фраг�
 • Профили TTS/Safe и пользовательские профили задают наборы правил. Пользовательский профиль можно добавить, изменить, удалить, импортировать или экспортировать.
 • Используется ru-normalizr 1.3.0. Этапы «Исправлять пунктуацию» и «Математические выражения» включены в TTS и выключены в Safe. «Гласные при чтении букв» влияет на инициалы и буквенные сокращения. При импорте прежнего профиля новые этапы получают значения его режима, остальные параметры сохраняются. Изменение итогового текста может потребовать нового синтеза; совпадающие записи кэша используются повторно.
 • В формулах $…$ разделяйте операторы пробелами: $2 + 3 = 5$. Слитное $2+3=5$ ru-normalizr 1.3.0 может прочитать как суммы в долларах. Проверьте результат в песочнице; обычное 1+1=2 без знаков доллара обрабатывается как арифметика.
+• «Плюсы Studio» (новое в 1.6.3) включает дополнительную замену знака + словом «плюс» до ru-normalizr. По умолчанию флажок включён, как в прежних версиях. Выключите его, чтобы проверить собственную обработку плюсов библиотекой, например в телефонах. ru-normalizr может озвучивать + в числах и формулах и при выключенном флажке. Обычные ручные ударения сохраняются в обоих режимах; точные замены verbatim защищены отдельно.
 • Нажмите «Применить глобально», чтобы перенести локальные изменения в общие настройки. Сводка в «Настройки → Нормализация» показывает этапы для новых запусков синтеза без флажка «Текст уже подготовлен». Строка состояния показывает сохранённые настройки. Кнопка «Вернуть глобальные» отменяет локальные изменения.
 • Изменения библиотеки профилей записываются после подтверждения. Если отменить удаление профиля, его выбор в песочнице сохраняется.
 • Размер шрифта исходного и подготовленного текста меняется в нижней панели.
@@ -47459,6 +47878,10 @@ API Token нужен для создания новых речевых фраг�
         if legacy_targets:
             keys.update({"synthesis_targets", "source_output_targets"})
         values = {key: config.get(key, DEFAULT_CONFIG.get(key)) for key in sorted(keys)}
+        # В старых сеансах дополнительная озвучка плюсов всегда включена.
+        # Для этого состояния сохраняем прежнюю подпись готовых результатов.
+        if not _config_bool(config.get("auto_plus", True), default=True):
+            values["auto_plus"] = False
         # Изменение самого глоссария тоже меняет речь. Его содержимое и ключ API
         # в снимок дерева не попадают.
         if values.get("glossary_enabled"):
