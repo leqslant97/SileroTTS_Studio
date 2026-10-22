@@ -820,19 +820,38 @@ class ConfigurationValidationTests(unittest.TestCase):
         )
         self.assertEqual(config["api_url"], studio.DEFAULT_API_URL)
 
-    def test_official_http_api_url_is_preserved_verbatim(self):
-        user_url = "http://iq3g.silero.ai/enhanced_voice"
+    def test_official_http_api_url_migrates_to_https(self):
+        legacy_url = "http://iq3g.silero.ai/enhanced_voice"
 
-        config = studio.normalize_config({"api_url": user_url})
+        config = studio.normalize_config({"api_url": legacy_url})
 
-        self.assertEqual(config["api_url"], user_url)
+        self.assertEqual(config["api_url"], studio.DEFAULT_API_URL)
 
     def test_custom_http_api_url_is_preserved_verbatim(self):
-        custom_url = "http://127.0.0.1:8000/enhanced_voice"
+        custom_urls = (
+            "http://127.0.0.1:8000/enhanced_voice",
+            "http://localhost:8000/enhanced_voice",
+            "http://tts.internal/enhanced_voice",
+        )
+        for custom_url in custom_urls:
+            with self.subTest(custom_url=custom_url):
+                config = studio.normalize_config({"api_url": custom_url})
+                self.assertEqual(config["api_url"], custom_url)
 
-        config = studio.normalize_config({"api_url": custom_url})
+    def test_legacy_official_http_api_url_migrates_when_loading_settings(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            settings = Path(tempdir) / "settings.json"
+            settings.write_text(
+                json.dumps({"api_url": "http://iq3g.silero.ai/enhanced_voice"}),
+                encoding="utf-8",
+            )
+            app = object.__new__(studio.TTSApp)
+            with mock.patch.object(
+                studio, "ensure_config_directories", return_value=(None, [])
+            ):
+                config = app.load_settings(settings)
 
-        self.assertEqual(config["api_url"], custom_url)
+        self.assertEqual(config["api_url"], studio.DEFAULT_API_URL)
 
     def test_invalid_numeric_values_fall_back_without_losing_unknown_keys(self):
         with self.assertLogs(level=logging.WARNING):
@@ -7947,6 +7966,7 @@ class NormalizerProfileAndGlossaryV15Tests(unittest.TestCase):
             "normalizer_mode": "tts",
             "normalizer_options": {},
             "glossary_enabled": True,
+            "auto_plus": True,
             "auto_abbreviations": True,
             "auto_short_words": True,
         }
@@ -7961,6 +7981,7 @@ class NormalizerProfileAndGlossaryV15Tests(unittest.TestCase):
                 "normalizer_mode": "safe",
                 "normalizer_options": {},
                 "glossary_enabled": False,
+                "auto_plus": False,
                 "auto_abbreviations": False,
                 "auto_short_words": False,
             }

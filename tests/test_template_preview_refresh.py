@@ -1,9 +1,11 @@
 """Предпросмотр читает актуальные данные и отбрасывает устаревшие расчёты."""
 
 import queue
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from test_regressions import studio
@@ -396,6 +398,195 @@ class TemplatePreviewRefreshTests(unittest.TestCase):
         self.assertEqual(target.get(), "{name}-{part}-{parts}")
         self.close(full)
         self.close(helper)
+
+    def test_import_full_preview_reads_ui_drafts_without_writing_and_reuses_extraction(self):
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        base = Path(temporary)
+        source = base / "Книга.txt"
+        source.write_text("Глава первая\nПервый текст.\nГлава вторая\nВторой текст.\n", encoding="utf-8")
+        output = base / "Черновик"
+        self.app.config.update(import_outdir=str(base / "Сохранённое"), import_regex="^Другой текст$", import_single_file=True)
+        saved_config = dict(self.app.config)
+        self.app.import_filepaths = [str(source)]
+        self.app.settings_vars = {
+            "import_outdir": studio.tk.StringVar(master=self.root, value=f" {output} "),
+            "import_regex": studio.tk.StringVar(master=self.root, value=r"^Глава .+$"),
+            "import_single_file": studio.tk.BooleanVar(master=self.root, value=False),
+        }
+        reads = []
+
+        def provider():
+            reads.append(threading.get_ident())
+            self.assertEqual(reads[-1], self.ui_thread)
+            return self.app._template_helper_import_preview_data()
+
+        extract = self.enterContext(mock.patch.object(studio.BookExtractor, "extract_file", wraps=studio.BookExtractor.extract_file))
+        save = self.enterContext(mock.patch.object(studio.BookExtractor, "save_chapters", side_effect=AssertionError("preview must not save TXT")))
+        self.enterContext(mock.patch.object(studio.requests.Session, "request", side_effect=AssertionError("unexpected API")))
+        snapshot = provider()
+        self.assertEqual(
+            {key: snapshot[key] for key in ("book_names", "actual_files", "single_file", "regex_pattern", "out_dir")},
+            {"book_names": (str(source),), "actual_files": True, "single_file": False,
+             "regex_pattern": r"^Глава .+$", "out_dir": str(output)},
+        )
+        target = studio.tk.StringVar(master=self.root, value="{book}-{num}-{title}")
+        self.app._open_template_helper(target, "book_import", preview_data_provider=provider)
+        helper = next(child for child in self.root.winfo_children() if isinstance(child, studio.tk.Toplevel))
+        self.assertEqual(extract.call_count, 0)
+        self.assertFalse(hasattr(self.app, "_book_import_preview_cache"))
+        self.button(helper, "Все результаты…").invoke()
+        full = self.full_window()
+        table = self.widget(full, studio.ttk.Treeview)
+        self.pump(lambda: len(table.get_children()) == 2)
+        self.assertEqual(self.table_results(table), ("Книга-1-Глава первая.txt", "Книга-2-Глава вторая.txt"))
+        self.assertEqual(tuple(table.item(item, "values")[3] for item in table.get_children()),
+                         tuple(str(output / name) for name in self.table_results(table)))
+        cache = self.app._book_import_preview_cache
+        self.close(full)
+        entry = next(widget for widget in self.descendants(helper) if widget.winfo_class() == "TEntry")
+        entry.delete(0, studio.tk.END)
+        entry.insert(0, "Новое-{num}-{title}")
+        examples = self.widget(helper, studio.tk.Listbox)
+        self.pump(lambda: examples.get(0).startswith("1. Новое-"))
+        self.button(helper, "Все результаты…").invoke()
+        full = self.full_window()
+        table = self.widget(full, studio.ttk.Treeview)
+        self.pump(lambda: len(table.get_children()) == 2)
+        self.assertEqual(self.table_results(table), ("Новое-1-Глава первая.txt", "Новое-2-Глава вторая.txt"))
+        self.assertEqual(extract.call_count, 1, "changing only the template must reuse extracted text")
+        self.assertIs(self.app._book_import_preview_cache, cache)
+
+        single_output = base / "Одна книга"
+        self.app.settings_vars["import_single_file"].set(True)
+        self.app.settings_vars["import_regex"].set("[")
+        self.app.settings_vars["import_outdir"].set(str(single_output))
+        self.button(full, "Обновить").invoke()
+        self.pump(lambda: self.table_results(table) == ("Новое-1-Книга.txt",))
+        self.assertEqual(table.item("0", "values")[3], str(single_output / "Новое-1-Книга.txt"))
+        self.assertEqual(extract.call_count, 2)
+        self.assertEqual(reads, [self.ui_thread] * len(reads))
+        self.assertEqual(target.get(), "{book}-{num}-{title}")
+        self.assertEqual(self.app.config, saved_config)
+        self.assertFalse(output.exists())
+        self.assertFalse(single_output.exists())
+        save.assert_not_called()
+        self.close(full)
+        self.close(helper)
+
+    def test_import_refresh_cancels_old_queue_and_close_stops_later_books(self):
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        base = Path(temporary)
+        paths = {name: base / f"{name}.txt" for name in ("old", "old_later", "skipped", "latest", "closing", "closing_later")}
+        for path in paths.values():
+            path.write_text("Текст книги", encoding="utf-8")
+        self.app.import_filepaths = [str(paths["old"]), str(paths["old_later"])]
+        self.app.settings_vars = {"import_outdir": studio.tk.StringVar(master=self.root, value=str(base / "output"))}
+        entered = {name: threading.Event() for name in ("old", "closing")}
+        release = {name: threading.Event() for name in entered}
+        for event in release.values():
+            self.addCleanup(event.set)
+        started, requests = [], []
+        real_preview = studio.BookExtractor.preview_files
+
+        def extract(path, **_kwargs):
+            self.assertNotEqual(threading.get_ident(), self.ui_thread)
+            started.append(path.stem)
+            if path.stem in entered:
+                entered[path.stem].set()
+                if not release[path.stem].wait(3):
+                    raise AssertionError("test did not release extraction")
+            return [("Глава", "Текст книги")], ""
+
+        def preview(filepaths, *args, **kwargs):
+            requests.append((tuple(filepaths), kwargs["preview_cache"], kwargs["cancel_event"]))
+            return real_preview(filepaths, *args, **kwargs)
+
+        def provider():
+            self.assertEqual(threading.get_ident(), self.ui_thread)
+            return self.app._template_helper_import_preview_data()
+
+        self.enterContext(mock.patch.object(studio.BookExtractor, "extract_file", side_effect=extract))
+        self.enterContext(mock.patch.object(studio.BookExtractor, "preview_files", side_effect=preview))
+        self.enterContext(mock.patch.object(studio.requests.Session, "request", side_effect=AssertionError("unexpected API")))
+        window = self.app._open_template_full_preview("book_import", "{book}-{title}", {}, preview_data_provider=provider)
+        table = self.widget(window, studio.ttk.Treeview)
+        self.assertTrue(entered["old"].wait(1))
+        old_cancel = requests[0][2]
+        self.assertFalse(old_cancel.is_set())
+        self.app.import_filepaths[:] = [str(paths["skipped"])]
+        self.button(window, "Обновить").invoke()
+        self.assertTrue(old_cancel.is_set())
+        self.app.import_filepaths[:] = [str(paths["latest"])]
+        self.button(window, "Обновить").invoke()
+        release["old"].set()
+        self.pump(lambda: self.table_results(table) == ("latest-Глава.txt",))
+        self.assertEqual(started, ["old", "latest"])
+        self.assertEqual(tuple(request[0] for request in requests),
+                         ((str(paths["old"]), str(paths["old_later"])), (str(paths["latest"]),)))
+
+        self.app.import_filepaths[:] = [str(paths["closing"]), str(paths["closing_later"])]
+        self.button(window, "Обновить").invoke()
+        self.assertTrue(entered["closing"].wait(1))
+        closing_cancel = requests[-1][2]
+        self.assertFalse(closing_cancel.is_set())
+        self.close(window)
+        self.assertTrue(closing_cancel.is_set())
+        posted_before = len(self.posted)
+        release["closing"].set()
+        self.pump(lambda: len(self.posted) > posted_before and self.pending.empty())
+        self.assertEqual(started, ["old", "latest", "closing"])
+        self.assertTrue(all(request[1] is self.app._book_import_preview_cache for request in requests))
+        self.assertEqual(len({id(request[2]) for request in requests}), 3)
+        self.assertFalse(window.winfo_exists())
+        self.assertNotIn(window, self.app._appearance_popup_windows)
+        self.assertFalse((base / "output").exists())
+
+    def test_import_error_is_visible_without_fake_txt_and_refresh_recovers(self):
+        temporary = self.enterContext(tempfile.TemporaryDirectory())
+        base = Path(temporary)
+        missing, good = base / "Потеряна.txt", base / "Успешная.txt"
+        good.write_text("Текст доступной книги", encoding="utf-8")
+        self.app.import_filepaths = [str(missing), str(good)]
+        self.app.settings_vars = {
+            "import_outdir": studio.tk.StringVar(master=self.root, value=str(base / "output")),
+            "import_single_file": studio.tk.BooleanVar(master=self.root, value=True),
+        }
+        self.enterContext(mock.patch.object(studio.requests.Session, "request", side_effect=AssertionError("unexpected API")))
+        window = self.app._open_template_full_preview(
+            "book_import", "{book_index}-{book}-{title}", {},
+            preview_data_provider=self.app._template_helper_import_preview_data,
+        )
+        table = self.widget(window, studio.ttk.Treeview)
+        detail = self.widget(window, studio.tk.Text)
+        copy_button = self.button(window, "Копировать список")
+        self.pump(lambda: len(table.get_children()) == 2)
+        self.assertEqual(self.table_results(table), ("Ошибка", "2-Успешная-Книга.txt"))
+        self.assertEqual(table.item("0", "values")[3], "")
+        self.assertTrue(any(
+            isinstance(widget, studio.ttk.Label) and "Не удалось прочитать книг: 1" in str(widget.cget("text"))
+            for widget in self.descendants(window)
+        ))
+        table.selection_set("0")
+        table.event_generate("<<TreeviewSelect>>")
+        self.pump(lambda: "Файл не найден" in detail.get("1.0", studio.tk.END))
+        self.assertIn(str(missing), detail.get("1.0", studio.tk.END))
+        self.assertEqual(str(copy_button.cget("state")), str(studio.tk.NORMAL))
+        copy_button.invoke()
+        self.assertIn("Потеряна.txt\tОшибка\tПотеряна.txt\t", window.clipboard_get())
+        search = self.widget(window, studio.ttk.Entry)
+        search.insert(0, "Успешная")
+        self.pump(lambda: self.table_results(table) == ("2-Успешная-Книга.txt",))
+        self.assertEqual(detail.get("1.0", studio.tk.END).strip(), "")
+        search.delete(0, studio.tk.END)
+        missing.write_text("Восстановленный текст", encoding="utf-8")
+        self.button(window, "Обновить").invoke()
+        self.pump(lambda: self.table_results(table) == ("1-Потеряна-Книга.txt", "2-Успешная-Книга.txt"))
+        self.assertFalse(any(
+            isinstance(widget, studio.ttk.Label) and "Не удалось прочитать книг" in str(widget.cget("text"))
+            for widget in self.descendants(window)
+        ))
+        self.assertFalse((base / "output").exists())
+        self.close(window)
 
 
 if __name__ == "__main__":

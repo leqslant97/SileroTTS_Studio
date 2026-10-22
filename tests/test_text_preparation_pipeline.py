@@ -1,4 +1,4 @@
-"""Одинаковая подготовка вставленного текста с LF, CRLF и CR."""
+"""Проверки предварительной обработки и line ending вариантов текста."""
 
 import importlib.util
 import sys
@@ -21,12 +21,21 @@ else:
 
 
 class TextLineEndingPipelineTests(unittest.TestCase):
-    def context(self, *, prepared=False, mode="sentence"):
+    def context(
+        self,
+        *,
+        prepared=False,
+        mode="sentence",
+        normalizer_enabled=False,
+        auto_abbreviations=False,
+        auto_short_words=False,
+        glossary_enabled=False,
+    ):
         return studio.TTSProcessor.normalization_context({
-            "normalizer_enabled": False,
-            "glossary_enabled": False,
-            "auto_abbreviations": False,
-            "auto_short_words": False,
+            "normalizer_enabled": normalizer_enabled,
+            "glossary_enabled": glossary_enabled,
+            "auto_abbreviations": auto_abbreviations,
+            "auto_short_words": auto_short_words,
             "text_is_prepared": prepared,
             "synthesis_mode": mode,
             "separator_symbols": "---",
@@ -38,6 +47,115 @@ class TextLineEndingPipelineTests(unittest.TestCase):
             "pause_colon": 29,
             "pause_separator": 47,
         })
+
+    def test_disabling_both_custom_abbreviation_stages_uses_library_results(self):
+        context = self.context(
+            normalizer_enabled=True,
+            auto_abbreviations=False,
+            auto_short_words=False,
+        )
+        self.assertIsNotNone(context._normalizer)
+
+        for text in (
+            "И.И. и к.п.д. работают.",
+            "г. Москва, ул. Ленина.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    context.process_sentence_text(text),
+                    context._normalizer.normalize(text),
+                )
+
+    def test_custom_abbreviation_flags_have_independent_overlapping_effects(self):
+        initials_context = self.context(
+            normalizer_enabled=True,
+            auto_abbreviations=False,
+            auto_short_words=True,
+        )
+        initials = "И.И. и к.п.д. работают."
+        self.assertEqual(
+            initials_context.process_sentence_text(initials),
+            "ИИ и кпд работают.",
+        )
+        self.assertNotEqual(
+            initials_context.process_sentence_text(initials),
+            initials_context._normalizer.normalize(initials),
+        )
+
+        short_words_context = self.context(
+            normalizer_enabled=True,
+            auto_abbreviations=True,
+            auto_short_words=False,
+        )
+        short_words = "г. Москва, ул. Ленина."
+        self.assertEqual(
+            short_words_context.process_sentence_text(short_words),
+            short_words_context._normalizer.normalize(short_words),
+        )
+        self.assertEqual(
+            short_words_context.process_sentence_text(short_words),
+            "город Москва, улица Ленина.",
+        )
+
+    def test_custom_abbreviation_stages_still_run_when_normalizer_is_off(self):
+        context = self.context(
+            normalizer_enabled=False,
+            auto_abbreviations=True,
+            auto_short_words=True,
+        )
+        self.assertIsNone(context._normalizer)
+        self.assertEqual(
+            context.process_sentence_text("И.И. и к.п.д. работают."),
+            "И-И и к-п-д работают.",
+        )
+        self.assertEqual(
+            context.process_sentence_text("г. Москва, ул. Ленина."),
+            "г Москва, ул Ленина.",
+        )
+
+    def test_prepared_text_bypasses_custom_abbreviation_stages(self):
+        context = self.context(
+            prepared=True,
+            normalizer_enabled=True,
+            auto_abbreviations=True,
+            auto_short_words=True,
+        )
+        self.assertIsNone(context._normalizer)
+        self.assertEqual(
+            context.process_sentence_text("— И.И. и г. Москва"),
+            "И.И. и г. Москва",
+        )
+
+    def test_final_cleanup_belongs_to_studio_with_or_without_the_library(self):
+        for enabled in (True, False):
+            context = self.context(normalizer_enabled=enabled)
+            with self.subTest(normalizer_enabled=enabled):
+                self.assertEqual(context.process_sentence_text("«Слово!»"), "Слово!")
+                self.assertEqual(context.process_sentence_text("путь_имени."), "путьимени.")
+                if enabled:
+                    self.assertIn("_", context._normalizer.normalize("путь_имени."))
+                    self.assertNotEqual(
+                        context._normalizer.normalize("«Слово!»"), "Слово!"
+                    )
+                prepared = self.context(prepared=True, normalizer_enabled=enabled)
+                self.assertEqual(
+                    prepared.process_sentence_text("«путь_имени!»"), "«путь_имени!»"
+                )
+
+    def test_studio_adds_missing_terminal_punctuation_and_keeps_existing_marks(self):
+        for enabled in (True, False):
+            context = self.context(normalizer_enabled=enabled)
+            with self.subTest(normalizer_enabled=enabled):
+                self.assertEqual(context.process_sentence_text("Слово"), "Слово.")
+                if enabled:
+                    self.assertEqual(context._normalizer.normalize("Слово"), "Слово")
+                for ending in (".", "!", "?", "?!", "…"):
+                    self.assertEqual(
+                        context.process_sentence_text("Слово" + ending), "Слово" + ending
+                    )
+                self.assertEqual(
+                    self.context(prepared=True).process_sentence_text("Слово"), "Слово"
+                )
 
     def collecting_context(self, directory, *, prepared=False, mode="full"):
         context = self.context(prepared=prepared, mode=mode)

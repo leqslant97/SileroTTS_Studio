@@ -256,6 +256,63 @@ class TemplatePreviewDraftTests(unittest.TestCase):
         with self.assertRaises(studio.TemplateError):
             studio.render_template_helper_preview("m4b_album", "{book}", preview_data=snapshot)
 
+    def test_source_settings_apply_refreshes_m4b_policy_without_reapplying_outputs(self):
+        self.app.lbl_source_output_targets_summary = studio.ttk.Label(self.root)
+        self.app.synthesis_targets = [{"format": "m4b"}]
+        self.app.config.update(
+            source_m4b_auto_split_long=True,
+            synthesis_m4b_reflow_actual_duration=False,
+        )
+        self.app._persist_settings_snapshot = mock.Mock()
+        self.app._refresh_source_output_targets_summary()
+        errors = []
+        self.root.report_callback_exception = lambda *args: errors.append(str(args[1]))
+
+        for reflow, auto_split, policy in (
+            (True, True, "глобальное перестроение после всей книги"),
+            (False, True, "AAC в фоне, проверка частей после книги"),
+            (False, False, "фиксированные части собираются в фоне"),
+            (False, True, "AAC в фоне, проверка частей после книги"),
+        ):
+            with self.subTest(reflow=reflow, auto_split=auto_split):
+                label = self.app.lbl_source_output_targets_summary
+                before = label._compact_full_text
+                self.app.open_source_synthesis_settings_dialog()
+                dialog = self.app._source_settings_dialog
+                staged = self.app._source_settings_stage_vars
+                staged["reflow"].set(reflow)
+                staged["auto_split_long"].set(auto_split)
+                self.assertEqual(label._compact_full_text, before)
+                apply_button = next(
+                    widget for widget in self.descendants(dialog)
+                    if isinstance(widget, studio.ttk.Button)
+                    and str(widget.cget("text")) == "Применить"
+                )
+                apply_button.invoke()
+                self.assertFalse(dialog.winfo_exists())
+                self.assertFalse(errors)
+                self.assertEqual(self.app.config["synthesis_m4b_reflow_actual_duration"], reflow)
+                self.assertEqual(self.app.synthesis_m4b_reflow_actual_var.get(), reflow)
+                self.assertEqual(self.app.config["source_m4b_auto_split_long"], auto_split)
+                self.assertIn(policy, label._compact_full_text)
+
+        before_config = copy.deepcopy(self.app.config)
+        before_label = label._compact_full_text
+        self.app._persist_settings_snapshot.reset_mock()
+        self.app.open_source_synthesis_settings_dialog()
+        dialog = self.app._source_settings_dialog
+        self.app._source_settings_stage_vars["reflow"].set(True)
+        cancel = next(
+            widget for widget in self.descendants(dialog)
+            if isinstance(widget, studio.ttk.Button)
+            and str(widget.cget("text")) == "Отмена"
+        )
+        cancel.invoke()
+        self.assertFalse(dialog.winfo_exists())
+        self.assertEqual(self.app.config, before_config)
+        self.assertEqual(label._compact_full_text, before_label)
+        self.app._persist_settings_snapshot.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

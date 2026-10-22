@@ -76,7 +76,179 @@ class TaskNotificationSchedulingTests(unittest.TestCase):
         self.assertEqual(app._messagebox_depth, 0)
 
 
+class TaskNotificationFocusTests(unittest.TestCase):
+    def make_notice(self):
+        app = object.__new__(studio.TTSApp)
+        app.root = root = mock.Mock()
+        root.winfo_exists.return_value = True
+        root.winfo_width.return_value = 900
+        root.winfo_height.return_value = 600
+        root.winfo_rootx.return_value = 0
+        root.winfo_rooty.return_value = 0
+        root.grab_current.return_value = None
+        previous = mock.Mock()
+        previous.winfo_exists.return_value = True
+        root.focus_get.return_value = previous
+        idle = []
+        root.after_idle.side_effect = idle.append
+        app._is_dark_appearance = False
+        app._detect_dark_appearance = mock.Mock(return_value=False)
+        app._sync_task_notification_appearance = mock.Mock()
+        app._register_palette_widget = mock.Mock()
+        app.get_status_color = mock.Mock(return_value="black")
+        popup = mock.Mock()
+        popup.winfo_screenwidth.return_value = 1600
+        popup.winfo_screenheight.return_value = 1000
+        with mock.patch.object(studio.tk, "Toplevel", return_value=popup), \
+                mock.patch.object(studio.tk, "Text"), \
+                mock.patch.object(studio.ttk, "Frame"), \
+                mock.patch.object(studio.ttk, "Label"), \
+                mock.patch.object(studio.ttk, "Scrollbar"), \
+                mock.patch.object(studio.ttk, "Button") as button:
+            app._create_task_notification("warning", "Остановлено", "Сборка прервана")
+        close = button.call_args.kwargs["command"]
+        focused = mock.Mock()
+        focused.winfo_toplevel.return_value = popup
+        root.focus_get.return_value = focused
+        popup.destroy.side_effect = lambda: setattr(root.focus_get, "return_value", None)
+        return app, previous, popup, close, idle
+
+    def test_closing_result_recovers_input_when_window_manager_leaves_no_focus(self):
+        app, previous, _popup, close, idle = self.make_notice()
+        close()
+        for callback in idle:
+            callback()
+        previous.focus_set.assert_called_once_with()
+        app.root.grab_set.assert_not_called()
+
+    def test_closing_background_result_keeps_the_current_input(self):
+        app, previous, _popup, close, idle = self.make_notice()
+        current = mock.Mock()
+        current.winfo_toplevel.return_value = app.root
+        app.root.focus_get.return_value = current
+        close()
+        for callback in idle:
+            callback()
+        previous.focus_set.assert_not_called()
+
+    def test_deferred_restore_preserves_new_editor_and_handles_closed_owner(self):
+        for state in ("editor", "closed_owner", "closing"):
+            with self.subTest(state=state):
+                app, previous, _popup, close, idle = self.make_notice()
+                close()
+                if state == "editor":
+                    editor = mock.Mock()
+                    editor.winfo_toplevel.return_value = editor
+                    app.root.grab_current.return_value = editor
+                elif state == "closed_owner":
+                    app.root.winfo_exists.return_value = False
+                else:
+                    app._is_closing = True
+                for callback in idle:
+                    callback()
+                previous.focus_set.assert_not_called()
+
+
 class TaskNotificationTkTests(unittest.TestCase):
+    def test_closing_result_restores_input_and_preserves_a_new_editor_focus(self):
+        script = textwrap.dedent('''
+            import importlib.util
+            import json
+            import logging
+            import os
+            import shutil
+            import sys
+            import tempfile
+            import time
+            from pathlib import Path
+
+            original_directory = Path.cwd()
+            with tempfile.TemporaryDirectory(prefix="silero_notification_focus_") as directory:
+                path = Path(directory) / "SileroTTS_Studio.py"
+                shutil.copy2(sys.argv[1], path)
+                spec = importlib.util.spec_from_file_location("notification_focus_test", path)
+                studio = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = studio
+                spec.loader.exec_module(studio)
+                try:
+                    root = studio.tk.Tk()
+                except studio.tk.TclError as exc:
+                    print("TK_UNAVAILABLE", exc)
+                    sys.exit(77)
+                app = object.__new__(studio.TTSApp)
+                app.root = root
+                app._palette_widget_kinds = {}
+                app._status_label_kinds = {}
+                app._is_dark_appearance = False
+                root.geometry("600x300+40+40")
+                entry = studio.ttk.Entry(root)
+                entry.pack()
+                other = studio.ttk.Entry(root)
+                other.pack()
+
+                def pump():
+                    end = time.monotonic() + .12
+                    while time.monotonic() < end:
+                        root.update()
+                        time.sleep(.005)
+
+                def close(window):
+                    root.tk.call(window.protocol("WM_DELETE_WINDOW"))
+
+                try:
+                    root.update()
+                    entry.focus_force()
+                    pump()
+                    notice = app._create_task_notification("warning", "Остановлено", "Сборка прервана")
+                    pump()
+                    notice.focus_force()
+                    pump()
+                    close(notice)
+                    pump()
+                    assert root.focus_get() is entry, str(root.focus_get())
+                    assert root.grab_current() is None
+
+                    notice = app._create_task_notification("info", "Готово", "Результат")
+                    pump()
+                    other.focus_force()
+                    pump()
+                    close(notice)
+                    pump()
+                    assert root.focus_get() is other
+
+                    entry.focus_force()
+                    pump()
+                    notice = app._create_task_notification("warning", "Остановлено", "Результат")
+                    pump()
+                    notice.focus_force()
+                    pump()
+                    close(notice)
+                    editor = studio.tk.Toplevel(root)
+                    editor_input = studio.ttk.Entry(editor)
+                    editor_input.pack()
+                    editor.update_idletasks()
+                    editor.grab_set()
+                    editor_input.focus_force()
+                    pump()
+                    assert root.grab_current() is editor
+                    assert root.focus_get() is editor_input
+                    editor.grab_release()
+                    editor.destroy()
+                    print(json.dumps({"focus_restored": True, "new_focus_preserved": True, "editor_grab_preserved": True}))
+                finally:
+                    root.destroy()
+                    logging.shutdown()
+                    os.chdir(original_directory)
+        ''')
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(Path(studio.__file__))],
+            capture_output=True, text=True, timeout=20,
+        )
+        if result.returncode == 77:
+            self.skipTest(result.stdout)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(json.loads(result.stdout.splitlines()[-1])["focus_restored"])
+
     def test_open_results_allow_queue_updates_clicks_and_long_message_scrolling(self):
         script = textwrap.dedent('''
             import importlib.util

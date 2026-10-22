@@ -85,6 +85,7 @@ class SessionAudioLifecycleTests(unittest.TestCase):
             {"speaker": "другой голос"},
             {"api_steps_enabled": True, "api_steps": 16},
             {"normalizer_enabled": not self.app.config["normalizer_enabled"]},
+            {"auto_plus": False},
         ):
             with self.subTest(updates=updates):
                 path, _key, scope = self.publish()

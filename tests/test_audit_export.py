@@ -10,6 +10,62 @@ from unittest import mock
 from test_regressions import studio
 
 
+class ExportAudioProfileCaptureTests(unittest.TestCase):
+    @staticmethod
+    def make_app(output_format):
+        app = object.__new__(studio.TTSApp)
+        for name, value in {
+            "export_fmt_var": output_format,
+            "export_bitrate_var": "128k",
+            "export_m4b_bitrate_var": "96k",
+            "export_sample_rate_var": "48000",
+            "export_channels_var": "mono",
+            "export_apply_fx_var": True,
+            "exp_speed_var": 1.2,
+            "exp_pitch_var": 0.9,
+            "exp_echo_var": True,
+            "exp_delay_var": 420,
+            "exp_decay_var": 0.4,
+        }.items():
+            setattr(app, name, mock.Mock(get=mock.Mock(return_value=value)))
+        return app
+
+    def test_m4b_capture_preserves_aac_settings_and_original_container(self):
+        app = self.make_app("m4b")
+
+        profile = app._audio_profile_from_current_ui("export", "Текущий экспорт")
+
+        self.assertEqual(profile["audio"], {
+            "format": "m4a", "bitrate": "96k", "sample_rate": "48000",
+            "channels": "mono", "effects": {
+                "enabled": True, "speed": 1.2, "pitch": 0.9, "echo": True,
+                "echo_delay": 420, "echo_decay": 0.4,
+            },
+        })
+        self.assertEqual(
+            studio.normalize_audio_profile(
+                json.loads(json.dumps(profile)), require_envelope=True,
+            ),
+            profile,
+        )
+        self.assertEqual(app.export_fmt_var.get(), "m4b")
+        self.assertEqual(app.export_bitrate_var.get(), "128k")
+        for name, variable in vars(app).items():
+            if name.endswith("_var"):
+                variable.set.assert_not_called()
+
+    def test_other_containers_keep_their_own_format_and_bitrate(self):
+        for output_format in ("mp3", "wav", "ogg", "opus", "m4a"):
+            with self.subTest(output_format=output_format):
+                app = self.make_app(output_format)
+                profile = app._audio_profile_from_current_ui("export")
+                self.assertEqual(profile["audio"]["format"], output_format)
+                self.assertEqual(
+                    profile["audio"]["bitrate"],
+                    "auto" if output_format == "wav" else "128k",
+                )
+
+
 class ExportCancellationTests(unittest.TestCase):
     def test_cancelled_remux_does_not_start_ffmpeg(self):
         process = mock.Mock(returncode=0, stderr=io.BytesIO())
